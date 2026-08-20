@@ -48,13 +48,13 @@ pub struct Params {
     /// Depth ratio above which a ridge-against-ridge edge is stroked. Set very
     /// high to stroke only true terrain-against-sky skylines.
     pub edge_ratio: f64,
-    /// Suppress silhouette strokes nearer than this, in metres.
+    /// Hidden extent, in metres, at which a silhouette reaches full strength.
     ///
     /// Foreground slopes are full of real but trivial occlusions -- the ray
     /// clearing a terrace lip and suddenly seeing far. They are genuine
-    /// silhouettes, so no threshold on depth can remove them; they simply are
-    /// not worth drawing. A near cutoff is the honest filter.
-    pub min_edge_dist: f64,
+    /// silhouettes, so no threshold on depth can remove them; what separates
+    /// them from a range hiding forty kilometres is how much they conceal.
+    pub edge_hidden_ref: f64,
     /// Draw the eye-level line at 0 degrees.
     pub eye_level: bool,
 }
@@ -395,33 +395,47 @@ pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
         d.is_finite().then(|| d.ln())
     };
 
-    let edge = |row: usize, col: usize| -> bool {
+    // Continuous strength rather than a binary test. A hard threshold makes
+    // edges dash in and out wherever the measure hovers around it, and forces
+    // a choice between drawing trivial edges and dropping real ones.
+    //
+    // Strength is the *hidden extent* -- how much terrain the silhouette
+    // conceals -- gated by the discontinuity measure. Depth ratio alone is the
+    // wrong driver: a terrace lip at 300 m revealing 2 km is a bigger relative
+    // jump (1.9 in log space) than a ridge at 20 km revealing 60 km (1.1), so
+    // ranking by ratio promotes exactly the edges worth suppressing. Absolute
+    // hidden extent ranks them the way the eye does: 1.7 km against 40 km.
+    let edge_strength = |row: usize, col: usize| -> f64 {
         let Some(here) = log_d(row, col) else {
-            return false;
+            return 0.0;
         };
         if row == 0 {
-            return true;
+            return 1.0;
         }
         let Some(above) = log_d(row - 1, col) else {
-            return true; // sky above terrain: the skyline itself
+            return 1.0; // sky above terrain: the skyline itself
         };
-        // Trivial near-field occlusions are real but not worth drawing.
-        if here.exp() < p.min_edge_dist {
-            return false;
-        }
         let step_up = above - here;
         if step_up <= 0.0 {
-            return false;
+            return 0.0;
         }
-        // Compare with the step below; on a continuous surface the two match
-        // however steep it is, whereas an occlusion edge spikes.
+        // On a continuous surface the step above matches the step below
+        // however steep it is; an occlusion spikes.
         let below = if row + 1 < buf.height {
             log_d(row + 1, col)
         } else {
             None
         };
         let step_down = below.map_or(0.0, |b| here - b).max(0.0);
-        step_up - step_down > spike
+        let discontinuity = ((step_up - step_down) / spike).clamp(0.0, 1.0);
+
+        let near = here.exp();
+        let hidden = near * step_up.exp_m1();
+        // Square root so a modest nearby ridge still registers against a
+        // distant range that hides ten times more.
+        let extent = (hidden / p.edge_hidden_ref).clamp(0.0, 1.0).sqrt();
+
+        discontinuity * extent
     };
 
     for row in 0..buf.height {
@@ -445,10 +459,12 @@ pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
                 (f64::from(s.0), f64::from(s.1), f64::from(s.2))
             };
 
-            // Depth-discontinuity stroke, darkened in proportion to how close
-            // the ridge is, so near silhouettes read strongest.
-            let px = if edge(row, col) {
-                let k = 0.45 + 0.4 * (1.0 - (-d / haze).exp());
+            // Silhouette stroke, opacity proportional to how much terrain the
+            // edge hides, then faded with haze so distant detail stays quiet.
+            let s = edge_strength(row, col);
+            let px = if s > 0.0 {
+                let depth_fade = 0.45 + 0.4 * (1.0 - (-d / haze).exp());
+                let k = 1.0 - s * (1.0 - depth_fade);
                 (px.0 * k, px.1 * k, px.2 * k)
             } else {
                 px

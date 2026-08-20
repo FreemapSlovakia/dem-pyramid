@@ -104,9 +104,9 @@ enum Command {
         /// A huge value strokes only terrain-against-sky skylines.
         #[arg(long, default_value_t = 1.35)]
         edge_ratio: f64,
-        /// Suppress silhouette strokes nearer than this, metres.
-        #[arg(long, default_value_t = 2000.0)]
-        min_edge_dist: f64,
+        /// Hidden extent, metres, at which a silhouette reaches full strength.
+        #[arg(long, default_value_t = 20_000.0)]
+        edge_hidden_ref: f64,
         /// Draw the eye-level line at 0 degrees.
         #[arg(long, default_value_t = false)]
         eye_level: bool,
@@ -239,7 +239,7 @@ fn main() -> Result<()> {
             step,
             range,
             edge_ratio,
-            min_edge_dist,
+            edge_hidden_ref,
             eye_level,
         } => {
             let p = panorama::Params {
@@ -253,7 +253,7 @@ fn main() -> Result<()> {
                 step_deg: step,
                 max_range: range,
                 edge_ratio,
-                min_edge_dist,
+                edge_hidden_ref,
                 eye_level,
             };
             let t0 = std::time::Instant::now();
