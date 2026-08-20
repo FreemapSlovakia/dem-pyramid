@@ -58,6 +58,12 @@ enum Command {
     /// Tiles a source's bbox intersects.
     Cover {
         id: String,
+        /// Override the source's own bbox: lon0,lat0,lon1,lat1.
+        ///
+        /// Chiefly for the global fallback, which is better materialised once
+        /// over a generous region than in buffers around each country.
+        #[arg(long)]
+        bbox: Option<String>,
     },
     /// Shell-sourceable build variables for one (source, tile).
     WarpEnv {
@@ -224,9 +230,21 @@ fn main() -> Result<()> {
             println!("extent   {x0:.4} {y0:.4} {x1:.4} {y1:.4}");
             println!("lonlat   {lon0:.5} {lat0:.5} {lon1:.5} {lat1:.5}");
         }
-        Command::Cover { id } => {
+        Command::Cover { id, bbox } => {
             let s = find(&doc, &id)?;
-            let tiles = grid::cover(&doc.grid, s.bbox);
+            let area = match bbox {
+                Some(spec) => {
+                    let v: Vec<f64> = spec
+                        .split(',')
+                        .map(|t| t.trim().parse::<f64>())
+                        .collect::<Result<_, _>>()
+                        .context("--bbox wants lon0,lat0,lon1,lat1")?;
+                    anyhow::ensure!(v.len() == 4, "--bbox wants four numbers");
+                    [v[0], v[1], v[2], v[3]]
+                }
+                None => s.bbox,
+            };
+            let tiles = grid::cover(&doc.grid, area);
             println!("{} tiles for {id}", tiles.len());
             for (tx, ty) in tiles {
                 println!("{tx} {ty}");
