@@ -57,6 +57,12 @@ pub struct Params {
     pub edge_hidden_ref: f64,
     /// Draw the eye-level line at 0 degrees.
     pub eye_level: bool,
+    /// Samples per output pixel per axis.
+    ///
+    /// Stroke width is expressed in *output* pixels, so it has to know the
+    /// factor: a line one buffer-pixel wide at 3x becomes a third of a pixel
+    /// once averaged down, and comes out at a third of its intended weight.
+    pub supersample: f64,
 }
 
 /// One pyramid level, with a block cache over its GTI index.
@@ -516,7 +522,7 @@ pub fn render_image(buf: &Buffer, p: &Params) -> image::RgbImage {
     // The ink applies to whatever the line covers, sky included -- a dark
     // outline drawn over the horizon does darken the sky above it, and
     // withholding that half is what stopped the stroke influencing two rows.
-    const STROKE_HALF_WIDTH: f64 = 0.5;
+    let stroke_half_width = 0.5 * p.supersample;
     let mut ink = vec![0f64; buf.width * buf.height];
 
     for row in 0..buf.height {
@@ -533,8 +539,8 @@ pub fn render_image(buf: &Buffer, p: &Params) -> image::RgbImage {
             // cell covered `c` by its band has that edge at `row + (1 - c)`.
             let c = f64::from(buf.cover[row * buf.width + col]);
             let edge_pos = row as f64 + (1.0 - c);
-            let lo = edge_pos - STROKE_HALF_WIDTH;
-            let hi = edge_pos + STROKE_HALF_WIDTH;
+            let lo = edge_pos - stroke_half_width;
+            let hi = edge_pos + stroke_half_width;
 
             let first = lo.floor().max(0.0) as usize;
             let last = (hi.ceil() as usize).min(buf.height);

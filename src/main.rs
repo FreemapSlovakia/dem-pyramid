@@ -264,6 +264,7 @@ fn main() -> Result<()> {
                 edge_ratio,
                 edge_hidden_ref,
                 eye_level,
+                supersample: f64::from(ss),
             };
             let t0 = std::time::Instant::now();
             let buf = panorama::march(&cli.root, &doc, &p)?;
