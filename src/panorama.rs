@@ -429,17 +429,10 @@ pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
             return 0.0;
         };
         if row == 0 {
-            return 0.0;
+            return 1.0;
         }
-        // No stroke where terrain meets sky. That edge is already the highest
-        // contrast in the frame and the antialiased composite defines it
-        // exactly; stroking it means painting a dark line into pixels that are
-        // mostly sky, which at the far horizon -- where a boundary pixel may
-        // be a tenth terrain -- turns them near-black and litters the skyline
-        // with soot. Strokes are for ridges whose fills differ by a level or
-        // two and would otherwise be invisible.
         let Some(above) = log_d(row - 1, col) else {
-            return 0.0;
+            return 1.0; // sky above terrain: the skyline itself
         };
         let step_up = above - here;
         if step_up <= 0.0 {
@@ -461,29 +454,7 @@ pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
         // distant range that hides ten times more.
         let extent = (hidden / p.edge_hidden_ref).clamp(0.0, 1.0).sqrt();
 
-        // On the row under a skyline, the pixel above is mostly sky, so the
-        // "depth jump" being stroked is terrain-against-sky displaced one row
-        // -- which leaves a chunky dark rim tracing the horizon. Weight it
-        // down by that pixel's coverage.
-        //
-        // But only there: deeper in a ridge stack a partially covered pixel's
-        // remainder is the *next band back*, still terrain, and weighting by
-        // coverage would erase the internal strokes that are the whole point.
-        // What separates the two cases is whether sky lies beyond it.
-        let above_backed_by_sky =
-            row < 2 || !buf.dist[(row - 2) * buf.width + col].is_finite();
-        let rim_weight = if above_backed_by_sky {
-            f64::from(buf.cover[(row - 1) * buf.width + col])
-        } else {
-            1.0
-        };
-
-        // Square root as a perceptual curve. Raw strengths cluster low -- a
-        // typical mid-distance ridge lands near 0.15 -- and once the fills
-        // either side of it differ by a single level, a stroke that faint is
-        // lost to rounding. This lifts weak-but-real edges into visibility
-        // while preserving their ordering against strong ones.
-        (discontinuity * extent).sqrt() * rim_weight
+        discontinuity * extent
     };
 
     // Colour of whatever surface a cell holds, ignoring coverage.
@@ -506,15 +477,15 @@ pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
         }
     };
 
-    // Strokes accumulate into their own buffer, because a line lying at a
-    // fractional row straddles two pixels. Darkening only the pixel that
-    // happens to contain the edge leaves the stroke aliased even when the fill
-    // behind it is smooth -- so each is splatted across the rows it really
-    // covers, weighted by overlap.
-    // One pixel wide. Wider spreads the same ink over more pixels, and since
-    // the stroke is already only a few levels darker than the fill, dilution
-    // puts it below the quantisation floor and the line breaks into patches.
-    const STROKE_HALF_WIDTH: f64 = 0.5;
+    // The fill is antialiased; the strokes deliberately are not.
+    //
+    // A one-pixel line centred at an arbitrary sub-pixel height necessarily
+    // straddles two rows, and because a band's edge sits at
+    // `row + (1 - coverage)`, thin bands put that centre near the bottom of
+    // their pixel -- so the lower row takes the larger share almost every
+    // time. The result is a two-pixel line with a consistent bias, which reads
+    // worse than a crisp one. Each stroke stays in the cell that holds its
+    // edge.
     let mut ink = vec![0f64; buf.width * buf.height];
 
     for row in 0..buf.height {
@@ -524,26 +495,8 @@ pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
                 continue;
             }
             let d = buf.dist[row * buf.width + col];
-            // The fill washes out with distance, but the outlines must not:
-            // they are what keeps nested ridges legible once the fills between
-            // them differ by a level or two.
-            let amount = s * (0.55 - 0.15 * (1.0 - (-d / haze).exp()));
-
-            // Coverage encodes where the band's top edge actually falls.
-            let c = f64::from(buf.cover[row * buf.width + col]);
-            let edge_pos = row as f64 + (1.0 - c);
-            let lo = edge_pos - STROKE_HALF_WIDTH;
-            let hi = edge_pos + STROKE_HALF_WIDTH;
-
-            let first = lo.floor().max(0.0) as usize;
-            let last = (hi.ceil() as usize).min(buf.height);
-            for y in first..last {
-                let overlap = hi.min((y + 1) as f64) - lo.max(y as f64);
-                if overlap > 0.0 {
-                    ink[y * buf.width + col] +=
-                        amount * overlap / (2.0 * STROKE_HALF_WIDTH);
-                }
-            }
+            let depth_fade = 0.45 + 0.4 * (1.0 - (-d / haze).exp());
+            ink[row * buf.width + col] = s * (1.0 - depth_fade);
         }
     }
 
@@ -575,7 +528,16 @@ pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
                 front
             };
 
-            let k = 1.0 - ink[idx].clamp(0.0, 1.0);
+            // Ink belongs to the terrain in a cell, not the whole cell. Where
+            // sky lies above, a boundary cell that is a tenth terrain must
+            // take a tenth of the stroke -- darkening the full composite is
+            // what turned the far skyline into soot, with stroke pixels
+            // reading darker than the terrain beneath them. Deeper in a ridge
+            // stack the remainder is another band, so the cell is all terrain
+            // and takes the stroke in full.
+            let sky_above = row == 0 || !buf.dist[(row - 1) * buf.width + col].is_finite();
+            let share = if sky_above { c.min(1.0) } else { 1.0 };
+            let k = 1.0 - (ink[idx] * share).clamp(0.0, 1.0);
             let px = (px.0 * k, px.1 * k, px.2 * k);
 
             // Faint eye-level line at 0 deg.
