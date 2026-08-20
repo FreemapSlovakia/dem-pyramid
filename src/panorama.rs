@@ -390,7 +390,39 @@ fn march_columns(
 
 /// Haze-shaded render. Colour comes from the distance value alone -- the
 /// nested-ridge look is emergent, not segmented.
-pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
+/// Box-downsample by an integer factor.
+///
+/// Supersampling is what makes the strokes look right, and it removes the need
+/// for per-pixel rules about which cell a line belongs in. Averaging several
+/// rays per output column also gives horizontal antialiasing, which one ray
+/// per column cannot: where adjacent rays hit nearly the same DEM cells the
+/// edge height is quantised, and a line that should drift smoothly instead
+/// jumps in whole steps.
+pub fn downsample(img: &image::RgbImage, factor: u32) -> image::RgbImage {
+    if factor <= 1 {
+        return img.clone();
+    }
+    let (w, h) = (img.width() / factor, img.height() / factor);
+    let mut out = image::RgbImage::new(w, h);
+    let n = f64::from(factor * factor);
+    for y in 0..h {
+        for x in 0..w {
+            let (mut r, mut g, mut b) = (0.0, 0.0, 0.0);
+            for dy in 0..factor {
+                for dx in 0..factor {
+                    let px = img.get_pixel(x * factor + dx, y * factor + dy);
+                    r += f64::from(px[0]);
+                    g += f64::from(px[1]);
+                    b += f64::from(px[2]);
+                }
+            }
+            out.put_pixel(x, y, image::Rgb([clamp(r / n), clamp(g / n), clamp(b / n)]));
+        }
+    }
+    out
+}
+
+pub fn render_image(buf: &Buffer, p: &Params) -> image::RgbImage {
     let mut img = image::RgbImage::new(buf.width as u32, buf.height as u32);
     let haze = 45_000.0_f64; // e-folding distance for the atmospheric blend
 
@@ -477,15 +509,14 @@ pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
         }
     };
 
-    // The fill is antialiased; the strokes deliberately are not.
+    // A one-pixel-wide line centred on the edge's true sub-pixel height,
+    // distributed by overlap: an edge at 20.75 puts 25% into row 20 and 75%
+    // into row 21, and an edge landing exactly on 20.5 lands wholly in row 20.
     //
-    // A one-pixel line centred at an arbitrary sub-pixel height necessarily
-    // straddles two rows, and because a band's edge sits at
-    // `row + (1 - coverage)`, thin bands put that centre near the bottom of
-    // their pixel -- so the lower row takes the larger share almost every
-    // time. The result is a two-pixel line with a consistent bias, which reads
-    // worse than a crisp one. Each stroke stays in the cell that holds its
-    // edge.
+    // The ink applies to whatever the line covers, sky included -- a dark
+    // outline drawn over the horizon does darken the sky above it, and
+    // withholding that half is what stopped the stroke influencing two rows.
+    const STROKE_HALF_WIDTH: f64 = 0.5;
     let mut ink = vec![0f64; buf.width * buf.height];
 
     for row in 0..buf.height {
@@ -496,7 +527,23 @@ pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
             }
             let d = buf.dist[row * buf.width + col];
             let depth_fade = 0.45 + 0.4 * (1.0 - (-d / haze).exp());
-            ink[row * buf.width + col] = s * (1.0 - depth_fade);
+            let amount = s * (1.0 - depth_fade);
+
+            // Coverage encodes where the band's top edge actually falls: a
+            // cell covered `c` by its band has that edge at `row + (1 - c)`.
+            let c = f64::from(buf.cover[row * buf.width + col]);
+            let edge_pos = row as f64 + (1.0 - c);
+            let lo = edge_pos - STROKE_HALF_WIDTH;
+            let hi = edge_pos + STROKE_HALF_WIDTH;
+
+            let first = lo.floor().max(0.0) as usize;
+            let last = (hi.ceil() as usize).min(buf.height);
+            for y in first..last {
+                let overlap = hi.min((y + 1) as f64) - lo.max(y as f64);
+                if overlap > 0.0 {
+                    ink[y * buf.width + col] += amount * overlap;
+                }
+            }
         }
     }
 
@@ -528,16 +575,7 @@ pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
                 front
             };
 
-            // Ink belongs to the terrain in a cell, not the whole cell. Where
-            // sky lies above, a boundary cell that is a tenth terrain must
-            // take a tenth of the stroke -- darkening the full composite is
-            // what turned the far skyline into soot, with stroke pixels
-            // reading darker than the terrain beneath them. Deeper in a ridge
-            // stack the remainder is another band, so the cell is all terrain
-            // and takes the stroke in full.
-            let sky_above = row == 0 || !buf.dist[(row - 1) * buf.width + col].is_finite();
-            let share = if sky_above { c.min(1.0) } else { 1.0 };
-            let k = 1.0 - (ink[idx] * share).clamp(0.0, 1.0);
+            let k = 1.0 - ink[idx].clamp(0.0, 1.0);
             let px = (px.0 * k, px.1 * k, px.2 * k);
 
             // Faint eye-level line at 0 deg.
@@ -556,8 +594,7 @@ pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
         }
     }
 
-    img.save(out).with_context(|| format!("writing {}", out.display()))?;
-    Ok(())
+    img
 }
 
 fn sky_colour(alt: f64) -> (u8, u8, u8) {

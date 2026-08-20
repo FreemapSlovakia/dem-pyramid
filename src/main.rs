@@ -110,6 +110,9 @@ enum Command {
         /// Draw the eye-level line at 0 degrees.
         #[arg(long, default_value_t = false)]
         eye_level: bool,
+        /// Render this many samples per output pixel per axis, then average.
+        #[arg(long, default_value_t = 3)]
+        supersample: u32,
     },
 }
 
@@ -241,7 +244,13 @@ fn main() -> Result<()> {
             edge_ratio,
             edge_hidden_ref,
             eye_level,
+            supersample,
         } => {
+            let ss = supersample.max(1);
+            // March and shade at ss times the output resolution, then average
+            // down. Both axes: vertical fixes the stroke placement, horizontal
+            // is the only way to antialias across columns, since one ray per
+            // output pixel has no sub-pixel coverage to work with.
             let p = panorama::Params {
                 lon,
                 lat,
@@ -250,7 +259,7 @@ fn main() -> Result<()> {
                 az_span: fov,
                 alt_min,
                 alt_max,
-                step_deg: step,
+                step_deg: step / f64::from(ss),
                 max_range: range,
                 edge_ratio,
                 edge_hidden_ref,
@@ -259,7 +268,10 @@ fn main() -> Result<()> {
             let t0 = std::time::Instant::now();
             let buf = panorama::march(&cli.root, &doc, &p)?;
             let marched = t0.elapsed();
-            panorama::render(&buf, &p, &out)?;
+            let hi = panorama::render_image(&buf, &p);
+            let img = panorama::downsample(&hi, ss);
+            img.save(&out)
+                .with_context(|| format!("writing {}", out.display()))?;
 
             let sky = buf.dist.iter().filter(|d| d.is_infinite()).count();
             println!(
