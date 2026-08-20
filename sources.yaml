@@ -121,16 +121,18 @@ sources:
     priority: 195
     native_res: 1.0
     crs: EPSG:3794
-    nodata: -9999
-    rebuild_vrt: true
+    nodata: declared # -9999, set 2026-08-20 -- see note
     bbox: [13.346758, 45.407588, 16.613883, 46.894504]
     note: >-
-      NO nodata declared on the VRT or on the underlying tiles, so the VRT
-      returns 0 over every uncovered part of its bbox -- which reaches into
-      Italy, Austria and Croatia. Used as-is it would flatten real terrain in
-      three neighbouring countries to sea level. rebuild_vrt regenerates the
-      mosaic over the same tiles with `gdalbuildvrt -vrtnodata -9999`, so gaps
-      become a real sentinel and the genuine 0 m Adriatic coast survives.
+      Originally declared NO nodata, on the VRT or on the underlying tiles, so
+      it returned 0 over every uncovered part of its bbox -- which reaches into
+      Italy, Austria and Croatia, and outranks both (195 > at 180 > it 165).
+      That flattened real terrain in two neighbouring countries to sea level,
+      and reached the elevation API's premium path, which has no way to tell a
+      spurious 0 from a real one. Fixed upstream with
+      `gdal_edit.py -a_nodata -9999 /fm/storage1/dtm/sl/sl.vrt`; the original
+      is backed up at /fm/storage2/dem/backup/sl.vrt.orig. `dem-tool check` now
+      guards it: if the VRT is ever regenerated without nodata, it fails.
 
   - id: es_29
     api_name: es
