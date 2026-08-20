@@ -429,10 +429,17 @@ pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
             return 0.0;
         };
         if row == 0 {
-            return 1.0;
+            return 0.0;
         }
+        // No stroke where terrain meets sky. That edge is already the highest
+        // contrast in the frame and the antialiased composite defines it
+        // exactly; stroking it means painting a dark line into pixels that are
+        // mostly sky, which at the far horizon -- where a boundary pixel may
+        // be a tenth terrain -- turns them near-black and litters the skyline
+        // with soot. Strokes are for ridges whose fills differ by a level or
+        // two and would otherwise be invisible.
         let Some(above) = log_d(row - 1, col) else {
-            return 1.0; // sky above terrain: the skyline itself
+            return 0.0;
         };
         let step_up = above - here;
         if step_up <= 0.0 {
@@ -454,12 +461,29 @@ pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
         // distant range that hides ten times more.
         let extent = (hidden / p.edge_hidden_ref).clamp(0.0, 1.0).sqrt();
 
+        // On the row under a skyline, the pixel above is mostly sky, so the
+        // "depth jump" being stroked is terrain-against-sky displaced one row
+        // -- which leaves a chunky dark rim tracing the horizon. Weight it
+        // down by that pixel's coverage.
+        //
+        // But only there: deeper in a ridge stack a partially covered pixel's
+        // remainder is the *next band back*, still terrain, and weighting by
+        // coverage would erase the internal strokes that are the whole point.
+        // What separates the two cases is whether sky lies beyond it.
+        let above_backed_by_sky =
+            row < 2 || !buf.dist[(row - 2) * buf.width + col].is_finite();
+        let rim_weight = if above_backed_by_sky {
+            f64::from(buf.cover[(row - 1) * buf.width + col])
+        } else {
+            1.0
+        };
+
         // Square root as a perceptual curve. Raw strengths cluster low -- a
         // typical mid-distance ridge lands near 0.15 -- and once the fills
         // either side of it differ by a single level, a stroke that faint is
         // lost to rounding. This lifts weak-but-real edges into visibility
         // while preserving their ordering against strong ones.
-        (discontinuity * extent).sqrt()
+        (discontinuity * extent).sqrt() * rim_weight
     };
 
     // Colour of whatever surface a cell holds, ignoring coverage.
