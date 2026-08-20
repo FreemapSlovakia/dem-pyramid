@@ -19,6 +19,7 @@
 
 use anyhow::{Context, Result};
 use gdal::Dataset;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -47,6 +48,15 @@ pub struct Params {
     /// Depth ratio above which a ridge-against-ridge edge is stroked. Set very
     /// high to stroke only true terrain-against-sky skylines.
     pub edge_ratio: f64,
+    /// Suppress silhouette strokes nearer than this, in metres.
+    ///
+    /// Foreground slopes are full of real but trivial occlusions -- the ray
+    /// clearing a terrace lip and suddenly seeing far. They are genuine
+    /// silhouettes, so no threshold on depth can remove them; they simply are
+    /// not worth drawing. A near cutoff is the honest filter.
+    pub min_edge_dist: f64,
+    /// Draw the eye-level line at 0 degrees.
+    pub eye_level: bool,
 }
 
 /// One pyramid level, with a block cache over its GTI index.
@@ -243,22 +253,76 @@ pub struct Buffer {
 }
 
 pub fn march(root: &Path, doc: &Doc, p: &Params) -> Result<Buffer> {
-    let mut pyr = Pyramid::open(root, doc)?;
     let (coarsest, finest) = (doc.grid.coarsest_level, doc.grid.finest_level);
 
     let (ex, ey) = lonlat_to_merc(p.lon, p.lat);
-    let ground = pyr
-        .sample_finest(ex, ey)
-        .context("viewpoint has no elevation data")?;
-    let eye = ground + p.eye_height;
+    let eye = {
+        let mut pyr = Pyramid::open(root, doc)?;
+        pyr.sample_finest(ex, ey)
+            .context("viewpoint has no elevation data")?
+            + p.eye_height
+    };
 
     let width = (p.az_span / p.step_deg).round() as usize;
     let height = ((p.alt_max - p.alt_min) / p.step_deg).round() as usize;
+
+    // Columns are independent, so the only shared state is the block cache.
+    // Rather than lock one, give each worker its own pyramid handle: the whole
+    // cache is well under 100 MB, so a handful of copies is cheaper than
+    // contention.
+    let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+    let chunk = width.div_ceil(threads).max(1);
+
+    let parts: Vec<(usize, usize, Vec<f64>, usize, usize)> = (0..width)
+        .step_by(chunk)
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|start| march_columns(root, doc, p, eye, start, chunk.min(width - start), height, coarsest, finest))
+        .collect::<Result<Vec<_>>>()?;
+
     let mut dist = vec![f64::INFINITY; width * height];
     let mut samples = 0usize;
+    let mut blocks = 0usize;
+    for (start, cols, local, n, b) in parts {
+        samples += n;
+        blocks += b;
+        for row in 0..height {
+            dist[row * width + start..row * width + start + cols]
+                .copy_from_slice(&local[row * cols..row * cols + cols]);
+        }
+    }
 
-    for col in 0..width {
-        let az = p.az_start + (col as f64 + 0.5) * p.step_deg;
+    Ok(Buffer {
+        width,
+        height,
+        dist,
+        eye_elevation: eye,
+        samples,
+        blocks,
+    })
+}
+
+/// March one contiguous band of columns, returning its slice of the buffer.
+#[allow(clippy::too_many_arguments)]
+fn march_columns(
+    root: &Path,
+    doc: &Doc,
+    p: &Params,
+    eye: f64,
+    start: usize,
+    cols: usize,
+    height: usize,
+    coarsest: u32,
+    finest: u32,
+) -> Result<(usize, usize, Vec<f64>, usize, usize)> {
+    let mut pyr = Pyramid::open(root, doc)?;
+    let mut dist = vec![f64::INFINITY; cols * height];
+    let mut samples = 0usize;
+    let width = cols;
+
+    for local_col in 0..cols {
+        let col = local_col;
+        let az = p.az_start + ((start + local_col) as f64 + 0.5) * p.step_deg;
         let mut max_alpha = f64::NEG_INFINITY;
         // Row 0 is the top of the frame (alt_max), so a larger angle means a
         // smaller row index. `filled_from` is the topmost row already written;
@@ -302,14 +366,7 @@ pub fn march(root: &Path, doc: &Doc, p: &Params) -> Result<Buffer> {
     }
 
     let blocks = pyr.cached_blocks();
-    Ok(Buffer {
-        width,
-        height,
-        dist,
-        eye_elevation: eye,
-        samples,
-        blocks,
-    })
+    Ok((start, cols, dist, samples, blocks))
 }
 
 /// Haze-shaded render. Colour comes from the distance value alone -- the
@@ -348,6 +405,10 @@ pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
         let Some(above) = log_d(row - 1, col) else {
             return true; // sky above terrain: the skyline itself
         };
+        // Trivial near-field occlusions are real but not worth drawing.
+        if here.exp() < p.min_edge_dist {
+            return false;
+        }
         let step_up = above - here;
         if step_up <= 0.0 {
             return false;
@@ -394,7 +455,7 @@ pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
             };
 
             // Faint eye-level line at 0 deg.
-            let on_eye_level = alt.abs() < p.step_deg * 0.5;
+            let on_eye_level = p.eye_level && alt.abs() < p.step_deg * 0.5;
             let (r, g, b) = if on_eye_level {
                 (px.0 * 0.75 + 60.0, px.1 * 0.75 + 60.0, px.2 * 0.75 + 60.0)
             } else {
