@@ -100,6 +100,10 @@ enum Command {
         /// Maximum range, metres.
         #[arg(long, default_value_t = 300_000.0)]
         range: f64,
+        /// Depth ratio above which ridge-against-ridge edges are stroked.
+        /// A huge value strokes only terrain-against-sky skylines.
+        #[arg(long, default_value_t = 1.35)]
+        edge_ratio: f64,
     },
 }
 
@@ -228,6 +232,7 @@ fn main() -> Result<()> {
             alt_max,
             step,
             range,
+            edge_ratio,
         } => {
             let p = panorama::Params {
                 lon,
@@ -239,6 +244,7 @@ fn main() -> Result<()> {
                 alt_max,
                 step_deg: step,
                 max_range: range,
+                edge_ratio,
             };
             let t0 = std::time::Instant::now();
             let buf = panorama::march(&cli.root, &doc, &p)?;

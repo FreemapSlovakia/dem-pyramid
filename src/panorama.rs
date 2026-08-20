@@ -44,6 +44,9 @@ pub struct Params {
     pub alt_max: f64,
     pub step_deg: f64,
     pub max_range: f64,
+    /// Depth ratio above which a ridge-against-ridge edge is stroked. Set very
+    /// high to stroke only true terrain-against-sky skylines.
+    pub edge_ratio: f64,
 }
 
 /// One pyramid level, with a block cache over its GTI index.
@@ -319,18 +322,45 @@ pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
     // seen against something farther away. Stroking those edges is what makes
     // nested ridges legible; without it the near field reads as one flat mass.
     // No ridge segmentation is involved -- it falls out of the buffer.
-    let edge = |row: usize, col: usize| -> bool {
+    // A raw depth ratio is the wrong test. Terrain receding at grazing
+    // incidence -- any foreground slope -- changes distance enormously per row
+    // while staying perfectly continuous, so a first-difference test paints
+    // false contours across it. Meanwhile genuine ridges at similar ranges (40
+    // km against 48 km) fall under the same threshold and get nothing.
+    //
+    // What marks a silhouette is a *discontinuity*: the jump at this row is far
+    // larger than the jumps just above and below it. Comparing against the
+    // local gradient rather than against a constant separates a step from a
+    // steep-but-smooth surface, and works at any range.
+    let spike = p.edge_ratio.max(1.001).ln();
+    let log_d = |row: usize, col: usize| -> Option<f64> {
         let d = buf.dist[row * buf.width + col];
-        if !d.is_finite() {
+        d.is_finite().then(|| d.ln())
+    };
+
+    let edge = |row: usize, col: usize| -> bool {
+        let Some(here) = log_d(row, col) else {
             return false;
-        }
+        };
         if row == 0 {
             return true;
         }
-        let above = buf.dist[(row - 1) * buf.width + col];
-        // Sky above terrain is the skyline itself; otherwise stroke where the
-        // jump in depth is large relative to the nearer surface.
-        !above.is_finite() || above / d > 1.35
+        let Some(above) = log_d(row - 1, col) else {
+            return true; // sky above terrain: the skyline itself
+        };
+        let step_up = above - here;
+        if step_up <= 0.0 {
+            return false;
+        }
+        // Compare with the step below; on a continuous surface the two match
+        // however steep it is, whereas an occlusion edge spikes.
+        let below = if row + 1 < buf.height {
+            log_d(row + 1, col)
+        } else {
+            None
+        };
+        let step_down = below.map_or(0.0, |b| here - b).max(0.0);
+        step_up - step_down > spike
     };
 
     for row in 0..buf.height {
