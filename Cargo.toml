@@ -11,6 +11,12 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+# The marcher reads the GTI indexes directly, so it gets priority resolution,
+# nodata fall-through and overview selection from GDAL rather than
+# reimplementing them. Swappable later for the pure-Rust `tiff` crate, which
+# does handle our ZSTD + predictor COGs -- verified.
+gdal = "0.19"
+image = { version = "0.25", default-features = false, features = ["png"] }
 clap = { version = "4", features = ["derive", "env"] }
 quick-xml = "0.37"
 serde = { version = "1", features = ["derive"] }

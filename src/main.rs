@@ -13,6 +13,7 @@ mod config;
 mod footprints;
 mod gdal_cli;
 mod grid;
+mod panorama;
 
 #[derive(Parser)]
 #[command(about, version)]
@@ -71,6 +72,34 @@ enum Command {
     /// What contributes to one pyramid level, for the index builder.
     IndexPlan {
         level: u32,
+    },
+    /// Render a panorama from a viewpoint.
+    Panorama {
+        #[arg(long)]
+        lon: f64,
+        #[arg(long)]
+        lat: f64,
+        #[arg(long, default_value = "panorama.png")]
+        out: PathBuf,
+        /// Eye height above ground, metres.
+        #[arg(long, default_value_t = 1.7)]
+        eye: f64,
+        /// Leftmost azimuth, degrees clockwise from north.
+        #[arg(long, default_value_t = 0.0)]
+        az: f64,
+        /// Horizontal field of view, degrees.
+        #[arg(long, default_value_t = 360.0)]
+        fov: f64,
+        #[arg(long, default_value_t = -8.0)]
+        alt_min: f64,
+        #[arg(long, default_value_t = 12.0)]
+        alt_max: f64,
+        /// Degrees per pixel.
+        #[arg(long, default_value_t = 0.05)]
+        step: f64,
+        /// Maximum range, metres.
+        #[arg(long, default_value_t = 300_000.0)]
+        range: f64,
     },
 }
 
@@ -187,6 +216,61 @@ fn main() -> Result<()> {
             for f in vrt.files {
                 println!("{f}");
             }
+        }
+        Command::Panorama {
+            lon,
+            lat,
+            out,
+            eye,
+            az,
+            fov,
+            alt_min,
+            alt_max,
+            step,
+            range,
+        } => {
+            let p = panorama::Params {
+                lon,
+                lat,
+                eye_height: eye,
+                az_start: az,
+                az_span: fov,
+                alt_min,
+                alt_max,
+                step_deg: step,
+                max_range: range,
+            };
+            let t0 = std::time::Instant::now();
+            let buf = panorama::march(&cli.root, &doc, &p)?;
+            let marched = t0.elapsed();
+            panorama::render(&buf, &p, &out)?;
+
+            let sky = buf.dist.iter().filter(|d| d.is_infinite()).count();
+            println!(
+                "viewpoint  {lon:.5} {lat:.5}  ground {:.1} m  eye {:.1} m",
+                buf.eye_elevation - eye,
+                buf.eye_elevation
+            );
+            println!(
+                "buffer     {}x{} px  {:.0} deg from {:.0} ({})",
+                buf.width,
+                buf.height,
+                fov,
+                az,
+                panorama::compass(az)
+            );
+            println!(
+                "marched    {} samples, {} blocks cached, {:.2} s",
+                buf.samples,
+                buf.blocks,
+                marched.as_secs_f64()
+            );
+            println!(
+                "terrain    {:.1}% of the frame ({:.1}% sky)",
+                100.0 * (buf.dist.len() - sky) as f64 / buf.dist.len() as f64,
+                100.0 * sky as f64 / buf.dist.len() as f64
+            );
+            println!("wrote      {}", out.display());
         }
         Command::IndexPlan { level } => {
             let root = cli.root.to_str().context("non-utf8 root")?;

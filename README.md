@@ -114,6 +114,37 @@ Morava floodplain, whose paleochannel microrelief saturates a hillshade long
 before a 13 cm step becomes visible. Natural exaggeration showed no gross
 artefacts. A mountainous border (SK/PL Tatras) would be the better test.
 
+## Panorama
+
+```sh
+./target/release/dem-tool panorama --lon 18.64 --lat 48.63 \
+    --az 20 --fov 90 --alt-min=-4 --alt-max=5 --out view.png
+```
+
+Note `--alt-min=-4` with the `=`: clap reads a bare `-4` as a flag.
+
+Casts one ray per azimuth over the pyramid and builds a **distance buffer** --
+distance to visible terrain per (azimuth, elevation-angle) cell, infinity for
+sky. The render is derived from that buffer alone; skyline, haze and
+silhouettes are not computed separately.
+
+Marching runs near → far keeping a running maximum elevation angle: a sample is
+visible exactly when its angle beats every nearer one, and the band of angles
+between the old maximum and the new one is terrain at that distance. Each
+column fills top-down in one pass, and a column that fills completely stops
+early.
+
+Level is chosen per sample -- the coarsest whose ground cell still resolves the
+angular step at that distance -- which is what keeps cost logarithmic in range.
+A full 360° at 0.05°/px marches ~52 M samples in ~15 s, touching ~400 cached
+blocks (well under 100 MB).
+
+Sampling is bilinear. With nearest-neighbour, adjacent rays at 2 km are 1.75 m
+apart against 6.27 m cells, so many rays return the same cell and the skyline
+comes out as a staircase.
+
+Not yet done: SVG output, peak labels, sun path.
+
 ## Known source hazards
 
 Re-measured 2026-08-20, all 23 sources.
