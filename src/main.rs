@@ -1,0 +1,213 @@
+//! Tooling for the Freemap elevation pyramid.
+//!
+//! Orchestration lives in bash calling the GDAL command line tools; this binary
+//! holds the parts that are actual logic -- config validation, drift checking
+//! against the real files, and footprint extraction.
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+mod check;
+mod config;
+mod footprints;
+mod gdal_cli;
+mod grid;
+
+#[derive(Parser)]
+#[command(about, version)]
+struct Cli {
+    /// Path to sources.yaml (defaults to the one next to the binary's repo).
+    #[arg(long, global = true)]
+    sources: Option<PathBuf>,
+
+    /// Data root on the build host.
+    #[arg(long, global = true, env = "DEM_ROOT", default_value = "/fm/storage2/dem")]
+    root: PathBuf,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Tabular overview of every source.
+    List,
+    /// Machine-readable dump with defaults resolved.
+    Json,
+    /// Re-measure every source with GDAL and fail on drift.
+    Check,
+    /// Regenerate the ELEVATION_SOURCES value for freemap.conf.
+    ElevationSources,
+    /// Build a coverage footprint per source.
+    Footprints {
+        /// Comma-separated source ids; default is all.
+        #[arg(long)]
+        only: Option<String>,
+    },
+    /// Print the tile grid constants.
+    GridInfo,
+    /// Extent and pixel size of one tile.
+    Tile {
+        tx: u32,
+        ty: u32,
+        #[arg(long)]
+        level: Option<u32>,
+    },
+    /// Tiles a source's bbox intersects.
+    Cover {
+        id: String,
+    },
+    /// Shell-sourceable build variables for one (source, tile).
+    WarpEnv {
+        id: String,
+        tx: u32,
+        ty: u32,
+    },
+    /// Leaf files referenced by a source's VRT, one per line.
+    VrtSources {
+        id: String,
+    },
+    /// What contributes to one pyramid level, for the index builder.
+    IndexPlan {
+        level: u32,
+    },
+}
+
+fn find<'a>(doc: &'a config::Doc, id: &str) -> anyhow::Result<&'a config::Source> {
+    doc.sources
+        .iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| anyhow::anyhow!("unknown source id: {id}"))
+}
+
+fn default_sources() -> PathBuf {
+    // Alongside the executable's repo root when run from the build dir, else
+    // the current directory.
+    let cwd = std::env::current_dir().unwrap_or_default().join("sources.yaml");
+    if cwd.exists() {
+        return cwd;
+    }
+    PathBuf::from("sources.yaml")
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let path = cli.sources.unwrap_or_else(default_sources);
+    let doc = config::load(&path)?;
+
+    match cli.command {
+        Command::List => {
+            println!(
+                "{:14} {:>5} {:>6} {:>6} {:>12}  {:5} path",
+                "id", "prio", "res", "finest", "nodata", "fp"
+            );
+            println!("{}", "-".repeat(96));
+            for s in &doc.sources {
+                println!(
+                    "{:14} {:>5} {:>6} {:>6} {:>12}  {:5} {}",
+                    s.id,
+                    s.priority,
+                    s.native_res,
+                    s.finest_level,
+                    s.nodata.to_string(),
+                    match s.footprint {
+                        config::FootprintMode::Tiles => "tiles",
+                        config::FootprintMode::Bbox => "bbox",
+                    },
+                    s.path
+                );
+            }
+        }
+        Command::Json => {
+            serde_json::to_writer_pretty(std::io::stdout(), &doc)?;
+            println!();
+        }
+        Command::Check => check::run(&doc)?,
+        Command::ElevationSources => {
+            // freemap-v3-api is FIRST wins, so walk priority descending -- the
+            // opposite of gdalbuildvrt's LAST wins.
+            let lines: Vec<String> = doc
+                .sources
+                .iter()
+                .map(|s| {
+                    let [a, b, c, d] = s.bbox;
+                    format!("{}:{}:{a},{b},{c},{d}", s.api_name, s.path)
+                })
+                .collect();
+            println!("ELEVATION_SOURCES=\"{}\"", lines.join(";\n"));
+        }
+        Command::Footprints { only } => {
+            footprints::run(&doc, &cli.root, only.as_deref())?;
+        }
+        Command::GridInfo => {
+            let g = &doc.grid;
+            println!("crs             {}", g.crs);
+            println!("levels          z{}..z{}", g.coarsest_level, g.finest_level);
+            println!("tile            {} px at z{}", g.tile_px, g.finest_level);
+            println!("block           {} px", g.block_px);
+            println!("tile span       {:.4} m (projected)", grid::tile_span(g));
+            println!("world           {0}x{0} tiles", grid::tiles_across(g));
+            for z in (g.coarsest_level..=g.finest_level).rev() {
+                println!(
+                    "  z{z:<3} {:>6} px/tile  {:>10.4} m projected  {:>8.2} m ground @49N",
+                    grid::tile_px_at(g, z)?,
+                    config::level_res(z),
+                    config::ground_res(z, 49.0)
+                );
+            }
+        }
+        Command::Tile { tx, ty, level } => {
+            let g = &doc.grid;
+            let level = level.unwrap_or(g.finest_level);
+            let [x0, y0, x1, y1] = grid::tile_extent(g, tx, ty);
+            let (lon0, lat0) = grid::merc_to_lonlat(x0, y0);
+            let (lon1, lat1) = grid::merc_to_lonlat(x1, y1);
+            println!("tile     {tx}_{ty} at z{level}");
+            println!("size     {0}x{0} px", grid::tile_px_at(g, level)?);
+            println!("extent   {x0:.4} {y0:.4} {x1:.4} {y1:.4}");
+            println!("lonlat   {lon0:.5} {lat0:.5} {lon1:.5} {lat1:.5}");
+        }
+        Command::Cover { id } => {
+            let s = find(&doc, &id)?;
+            let tiles = grid::cover(&doc.grid, s.bbox);
+            println!("{} tiles for {id}", tiles.len());
+            for (tx, ty) in tiles {
+                println!("{tx} {ty}");
+            }
+        }
+        Command::WarpEnv { id, tx, ty } => {
+            let s = find(&doc, &id)?;
+            let root = cli.root.to_str().context("non-utf8 root")?;
+            print!("{}", grid::warp_env(&doc.grid, s, tx, ty, root)?);
+        }
+        Command::VrtSources { id } => {
+            let s = find(&doc, &id)?;
+            let vrt = footprints::parse_vrt(&s.path)?;
+            for f in vrt.files {
+                println!("{f}");
+            }
+        }
+        Command::IndexPlan { level } => {
+            let root = cli.root.to_str().context("non-utf8 root")?;
+            println!("RES\t{}", config::level_res(level));
+            println!("PX\t{}", grid::tile_px_at(&doc.grid, level)?);
+            for s in &doc.sources {
+                // A source contributes to every level at or coarser than the
+                // one it was materialised at, via its overview chain. Finer
+                // levels are simply absent -- the marcher falls back.
+                if s.finest_level < level {
+                    continue;
+                }
+                // -1 means the base image rather than an overview.
+                let ovr = s.finest_level as i64 - level as i64 - 1;
+                println!(
+                    "SRC\t{}\t{}\t{ovr}\t{root}/norm/{}/{}",
+                    s.id, s.priority, s.id, s.finest_level
+                );
+            }
+        }
+    }
+
+    Ok(())
+}

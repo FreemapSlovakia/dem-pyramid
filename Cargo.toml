@@ -1,0 +1,21 @@
+[package]
+name = "dem-tool"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Deliberately no `gdal` crate: this tool only ever shells out to the GDAL CLI
+# (gdalinfo -json, gdalsrsinfo, ogr2ogr) and parses their output. That keeps it
+# free of a C++ build and of any coupling to the GDAL version installed on the
+# machine that happens to run it.
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+quick-xml = "0.37"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+
+[profile.release]
+opt-level = 2

@@ -1,0 +1,274 @@
+# Single source of truth for every DTM source feeding the elevation pyramid.
+#
+# Adding a source = one entry here + `bin/sources.py check` + a Layer A build
+# for that id alone. Nothing else is rebuilt.
+#
+# Derived from /etc/freemap.conf ELEVATION_SOURCES on fm6 (2026-08-20), with
+# every value re-measured with gdalinfo rather than copied. `bin/sources.py
+# check` re-verifies against the files and fails on drift.
+#
+# priority: higher wins in the mosaic. NOTE the two opposite conventions:
+#   - freemap-v3-api ELEVATION_SOURCES is FIRST wins  -> emit in priority DESC
+#   - gdalbuildvrt is LAST wins                       -> emit in priority ASC
+#   `bin/sources.py elevation-sources` handles the reversal; do not hand-edit.
+#
+# native_res: metres, from the source geotransform (informational; drives
+#   finest_level). Web-Mercator ground resolution at 49N is 102700 / 2^z, so
+#   z14 = 6.27 m and every national source downsamples into it.
+#
+# finest_level: the finest pyramid level this source is materialised at. A
+#   source is never upsampled into a level finer than its own resolution --
+#   that is what keeps z14/z13 sparse and avoids a 25x upsample of GEDTM30.
+#
+# nodata: `declared` means the dataset declares a usable value and gdalwarp
+#   will pick it up on its own. A number here is passed as -srcnodata.
+#
+# footprint: `tiles` = union of the VRT's source rectangles (exact, cheap).
+#            `bbox`  = the declared lon/lat box (conservative; fine for
+#                      single-file sources that declare correct nodata).
+
+grid:
+  # EPSG:3857, standard XYZ resolutions. Projected pixel size at level z is
+  # 156543.03392804097 / 2^z -- PROJECTED metres, not ground metres.
+  crs: EPSG:3857
+  tile_px: 32768 # 2^15 -> 313.086 km at z14; overview chain reaches z8 in-file
+  block_px: 512
+  finest_level: 14
+  coarsest_level: 8
+
+defaults:
+  resampling: average # downsampling: never max, never nearest
+  finest_level: 14
+  nodata: declared
+  footprint: tiles
+
+sources:
+  - id: sk
+    api_name: sk
+    path: /fm/storage1/dtm/dmr5_jtsk03.tif
+    priority: 230
+    native_res: 1.0
+    crs: EPSG:8353 # S-JTSK [JTSK03] / Krovak East North
+    nodata: declared # 3.4e38 float-max sentinel
+    footprint: bbox
+    bbox: [16.8, 47.7, 22.6, 49.7]
+
+  - id: cz
+    api_name: cz
+    path: /fm/storage1/dtm/cz_dem.tif
+    priority: 225
+    native_res: 1.0
+    crs: EPSG:5514
+    nodata: declared # -9999
+    footprint: bbox
+    bbox: [11.905673, 48.198833, 18.999296, 51.387301]
+
+  - id: pl
+    api_name: pl
+    path: /fm/storage1/dtm/pl/poland_dtm.vrt
+    priority: 220
+    native_res: 1.0
+    crs: EPSG:2180
+    nodata: declared # 0.0 -- see fill_nodata_md
+    fill_nodata_md: 5
+    bbox: [13.169196, 49.268522, 23.378659, 55.638533]
+    note: >-
+      GUGiK uses 0 for out-of-coverage, which collides with genuine 0.00 m
+      coastal terrain (Zulawy): those pixels would be read as nodata and fall
+      through to a lower-priority source. gdal_fillnodata -md 5 interpolates
+      the resulting speckle from its neighbours while leaving large
+      out-of-coverage regions as nodata, so they still fall through properly.
+
+  - id: se
+    api_name: se
+    path: /fm/storage1/dtm/se/se.vrt
+    priority: 215
+    native_res: 1.0
+    crs: EPSG:5845 # SWEREF99 TM + RH2000 height (compound)
+    nodata: declared # -9999
+    bbox: [9.08, 55.1381, 25.5503, 69.1826]
+
+  - id: fi
+    api_name: fi
+    path: /fm/storage1/dtm/fi/tiles/fi.vrt
+    priority: 210
+    native_res: 2.0
+    crs: EPSG:3067
+    nodata: declared # -9999
+    bbox: [19.0, 59.6, 31.7, 70.2]
+
+  - id: "no"
+    api_name: "no"
+    path: /fm/storage2/dtm/no/no.vrt
+    priority: 205
+    native_res: 1.0
+    crs: EPSG:25833 # ETRS89 / UTM zone 33N -- WKT carries no authority code
+    nodata: declared # -32767
+    bbox: [-1.25714949, 57.68671807, 32.06906526, 71.70479169]
+
+  - id: hr
+    api_name: hr
+    path: /fm/storage1/dtm/hr/hr.vrt
+    priority: 200
+    native_res: 1.0
+    crs: EPSG:3765
+    nodata: declared # -9999
+    bbox: [13.418853, 42.335307, 19.174984, 46.561638]
+
+  - id: si
+    api_name: si
+    path: /fm/storage1/dtm/sl/sl.vrt
+    priority: 195
+    native_res: 1.0
+    crs: EPSG:3794
+    nodata: -9999
+    rebuild_vrt: true
+    bbox: [13.346758, 45.407588, 16.613883, 46.894504]
+    note: >-
+      NO nodata declared on the VRT or on the underlying tiles, so the VRT
+      returns 0 over every uncovered part of its bbox -- which reaches into
+      Italy, Austria and Croatia. Used as-is it would flatten real terrain in
+      three neighbouring countries to sea level. rebuild_vrt regenerates the
+      mosaic over the same tiles with `gdalbuildvrt -vrtnodata -9999`, so gaps
+      become a real sentinel and the genuine 0 m Adriatic coast survives.
+
+  - id: es_29
+    api_name: es
+    path: /fm/storage1/dtm/es/es_29.vrt
+    priority: 190
+    native_res: 2.0
+    crs: EPSG:25829
+    nodata: declared # -32767 -- NOT -9999 like es_30
+    bbox: [-9.380774, 36.058592, -5.458629, 43.863392]
+
+  - id: es_30
+    api_name: es
+    path: /fm/storage1/dtm/es/es_30.vrt
+    priority: 189
+    native_res: 2.0
+    crs: EPSG:25830
+    nodata: declared # -9999 -- differs from es_29/es_31
+    bbox: [-6.926858, 35.180057, 0.24331, 43.736066]
+
+  - id: es_31
+    api_name: es
+    path: /fm/storage1/dtm/es/es_31.vrt
+    priority: 188
+    native_res: 2.0
+    crs: EPSG:25831
+    nodata: declared # -32767
+    bbox: [-0.425846, 38.475068, 4.572183, 42.979119]
+
+  - id: ch
+    api_name: ch
+    path: /fm/storage1/dtm/ch/merged.vrt
+    priority: 185
+    native_res: 0.5
+    crs: EPSG:2056
+    nodata: declared # -9999
+    bbox: [5.9029416, 45.6873932, 10.5621216, 47.832507]
+
+  - id: at
+    api_name: at
+    path: /fm/storage1/dtm/at/austria_dtm_2025_1m.tif
+    priority: 180
+    native_res: 1.0
+    crs: EPSG:3035 # LAEA Europe -- northing-first axis order
+    nodata: declared # -9999
+    footprint: bbox
+    bbox: [9.0258054, 45.8016631, 17.9173921, 49.2130487]
+
+  - id: fr
+    api_name: fr
+    path: /fm/storage1/dtm/fr/fr1-LAMB93-IGN69.vrt
+    priority: 175
+    native_res: 1.0
+    crs: EPSG:2154
+    nodata: declared # -99999
+    bbox: [-5.539817, 41.269923, 10.708437, 51.094491]
+
+  - id: fr_guyane
+    api_name: fr
+    path: /fm/storage1/dtm/fr/fr1-drom-2972.vrt
+    priority: 174
+    native_res: 1.0
+    crs: EPSG:2972
+    nodata: declared # -99999
+    bbox: [-54.646638, 2.076677, -51.6025, 5.789765]
+
+  - id: fr_reunion
+    api_name: fr
+    path: /fm/storage1/dtm/fr/fr1-drom-2975.vrt
+    priority: 173
+    native_res: 1.0
+    crs: EPSG:2975
+    nodata: declared # -99999
+    bbox: [55.205864, -21.392225, 55.846426, -20.862821]
+
+  - id: fr_martinique
+    api_name: fr
+    path: /fm/storage1/dtm/fr/fr1-drom-32620.vrt
+    priority: 172
+    native_res: 1.0
+    crs: EPSG:32620
+    nodata: declared # -99999
+    bbox: [-61.822046, 14.381067, -60.77959, 16.521529]
+
+  - id: fr_spm
+    api_name: fr
+    path: /fm/storage1/dtm/fr/fr1-drom-4467.vrt
+    priority: 171
+    native_res: 1.0
+    crs: EPSG:4467
+    nodata: declared # -99999
+    bbox: [-56.528714, 46.742888, -56.076712, 47.150521]
+
+  - id: fr_mayotte
+    api_name: fr
+    path: /fm/storage1/dtm/fr/fr1-drom-4471.vrt
+    priority: 170
+    native_res: 1.0
+    crs: EPSG:4471
+    nodata: declared # -99999
+    bbox: [44.97233, -13.007811, 45.304315, -12.627839]
+
+  - id: fr_guadeloupe
+    api_name: fr
+    path: /fm/storage1/dtm/fr/fr1-drom-5490.vrt
+    priority: 169
+    native_res: 1.0
+    crs: EPSG:5490
+    nodata: declared # -99999
+    bbox: [-63.160712, 17.862626, -62.782578, 18.133906]
+
+  - id: it
+    api_name: it
+    path: /fm/storage1/dtm/it/it.tif
+    priority: 165
+    native_res: 5.0
+    crs: EPSG:6875
+    nodata: declared # -9999
+    footprint: bbox
+    bbox: [6.44, 35.33, 19.3, 47.1]
+
+  - id: en
+    api_name: en
+    path: /fm/storage2/dtm/en/en.vrt
+    priority: 160
+    native_res: 1.0
+    crs: EPSG:27700 # OSGB36 -- datum shift matters, keep the authority code
+    nodata: declared # -9999
+    bbox: [-7.104776, 49.850604, 2.084283, 55.878158]
+
+  - id: gedtm30
+    api_name: gedtm30
+    path: /fm/storage1/dtm/gedtm_rf_m_30m_s_20060101_20151231_go_epsg.4326.3855_v1.2.tif
+    priority: 0
+    native_res: 30.0
+    crs: EPSG:4326 # + EGM2008 (EPSG:3855) orthometric heights
+    nodata: declared # 3.4028235e38
+    finest_level: 12 # 30 m native; z12 is 25 m ground at 49N
+    resampling: bilinear # near-1:1 at z12; cubicspline would overshoot ridges
+    footprint: bbox
+    bbox: [-180.00125, -65.00125, 180.00125, 85.00125]
+    note: Global fallback. Lowest priority; every national source outranks it.
