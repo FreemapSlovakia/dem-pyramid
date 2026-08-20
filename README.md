@@ -162,14 +162,25 @@ Disk I/O does not change at all (same 396 blocks at every setting) — the extra
 work is arithmetic over data already cached. Buffer memory is the *product* of
 the two, which is the real limit.
 
+Below 9 the far skyline visibly degrades.
+
+Rendering **streams one output column at a time**: an output column depends
+only on its own sub-columns, and shading is column-local (edge detection looks
+only at the rows above and below within a column), so each column is marched,
+shaded, averaged and discarded. Materialising the whole supersampled buffer
+instead cost 6.7 GB for a 360° frame at 9×9; streaming it costs 848 MB, for
+the same rays and the same time.
+
 | view | rays | time | peak RSS |
 |---|---|---|---|
-| 90°, 9×9 | 117M | 5.8 s | ~1 GB |
-| 360°, 9×9 | 465M | 21.3 s | 6.7 GB |
+| 90°, 9×9 | 117M | 5.8 s | ~250 MB |
+| 360°, 9×9 | 465M | 20.3 s | 848 MB |
 
-Below 9 the far skyline visibly degrades. Two easy reductions if memory ever
-binds: distances are `f64` where `f32` gives 0.03 m at 300 km, and the
-full-resolution RGB buffer could be averaged row-by-row instead of built whole.
+A further ~37% of ray cost is available by supersampling only beyond 7.2 km.
+That distance is not a tuned guess: below it the level rule pins the finest
+level, so the DEM is finer than the ray spacing and adjacent rays land in the
+same cell; above it the chosen cell size equals the ray spacing by
+construction, so neighbouring rays sample different cells and need averaging.
 
 Not yet done: SVG output, peak labels, sun path.
 

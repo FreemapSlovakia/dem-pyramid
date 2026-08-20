@@ -43,8 +43,9 @@ pub struct Params {
     pub az_span: f64,
     pub alt_min: f64,
     pub alt_max: f64,
-    pub az_step_deg: f64,
-    pub alt_step_deg: f64,
+    /// Output degrees per pixel. Sub-steps are this divided by the
+    /// supersampling factors.
+    pub step_deg: f64,
     pub max_range: f64,
     /// Depth ratio above which a ridge-against-ridge edge is stroked. Set very
     /// high to stroke only true terrain-against-sky skylines.
@@ -58,12 +59,20 @@ pub struct Params {
     pub edge_hidden_ref: f64,
     /// Draw the eye-level line at 0 degrees.
     pub eye_level: bool,
-    /// Vertical supersampling factor.
+    /// Rays per output pixel horizontally.
     ///
-    /// Stroke width is expressed in *output* pixels, so it has to know this: a
-    /// line one buffer-row wide at 3x becomes a third of a pixel once averaged
-    /// down, and comes out at a third of its intended weight.
-    pub supersample_y: f64,
+    /// At long range several DEM cells fall inside one pixel's angular
+    /// footprint and a single ray picks an arbitrary one of them.
+    pub supersample_x: u32,
+    /// Sub-rows per output pixel vertically.
+    ///
+    /// Sub-pixel placement is analytic, but only for *one* edge per cell: the
+    /// column holds a single surface per row, so where several ridge bands
+    /// fall inside one output pixel all but the nearest are discarded and
+    /// never stroked. Extra rows give each band a row to occupy.
+    ///
+    /// Stroke width is expressed in output pixels, so it scales with this.
+    pub supersample_y: u32,
 }
 
 /// One pyramid level, with a block cache over its GTI index.
@@ -249,246 +258,154 @@ fn destination(lon: f64, lat: f64, az_deg: f64, d: f64) -> (f64, f64) {
     (lon2.to_degrees(), lat2.to_degrees())
 }
 
-pub struct Buffer {
+/// What a render cost, for the summary line.
+pub struct Stats {
     pub width: usize,
     pub height: usize,
-    /// Distance to visible terrain per cell; f64::INFINITY for sky.
-    pub dist: Vec<f64>,
-    /// Fraction of the cell covered by that surface, 0..1. Less than 1 only on
-    /// a band's top edge, which is what makes the horizon smooth.
-    pub cover: Vec<f32>,
     pub eye_elevation: f64,
     pub samples: usize,
     pub blocks: usize,
+    pub sky_fraction: f64,
 }
 
-pub fn march(root: &Path, doc: &Doc, p: &Params) -> Result<Buffer> {
-    let (coarsest, finest) = (doc.grid.coarsest_level, doc.grid.finest_level);
+/// One ray's column: distance to visible terrain per sub-row, and how much of
+/// each sub-row that surface covers.
+struct Column {
+    dist: Vec<f64>,
+    cover: Vec<f32>,
+}
 
-    let (ex, ey) = lonlat_to_merc(p.lon, p.lat);
-    let eye = {
-        let mut pyr = Pyramid::open(root, doc)?;
-        pyr.sample_finest(ex, ey)
-            .context("viewpoint has no elevation data")?
-            + p.eye_height
-    };
-
-    let width = (p.az_span / p.az_step_deg).round() as usize;
-    let height = ((p.alt_max - p.alt_min) / p.alt_step_deg).round() as usize;
-
-    // Columns are independent, so the only shared state is the block cache.
-    // Rather than lock one, give each worker its own pyramid handle: the whole
-    // cache is well under 100 MB, so a handful of copies is cheaper than
-    // contention.
-    let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
-    let chunk = width.div_ceil(threads).max(1);
-
-    let parts: Vec<(usize, usize, Vec<f64>, Vec<f32>, usize, usize)> = (0..width)
-        .step_by(chunk)
-        .collect::<Vec<_>>()
-        .into_par_iter()
-        .map(|start| march_columns(root, doc, p, eye, start, chunk.min(width - start), height, coarsest, finest))
-        .collect::<Result<Vec<_>>>()?;
-
-    let mut dist = vec![f64::INFINITY; width * height];
-    let mut cover = vec![0f32; width * height];
-    let mut samples = 0usize;
-    let mut blocks = 0usize;
-    for (start, cols, local_d, local_c, n, b) in parts {
-        samples += n;
-        blocks += b;
-        for row in 0..height {
-            dist[row * width + start..row * width + start + cols]
-                .copy_from_slice(&local_d[row * cols..row * cols + cols]);
-            cover[row * width + start..row * width + start + cols]
-                .copy_from_slice(&local_c[row * cols..row * cols + cols]);
+impl Column {
+    fn new(h: usize) -> Self {
+        Self {
+            dist: vec![f64::INFINITY; h],
+            cover: vec![0f32; h],
         }
     }
-
-    Ok(Buffer {
-        width,
-        height,
-        dist,
-        cover,
-        eye_elevation: eye,
-        samples,
-        blocks,
-    })
 }
 
-/// March one contiguous band of columns, returning its slice of the buffer.
+/// March one ray and fill its column.
 #[allow(clippy::too_many_arguments)]
-fn march_columns(
-    root: &Path,
-    doc: &Doc,
+fn march_ray(
+    pyr: &mut Pyramid,
     p: &Params,
     eye: f64,
-    start: usize,
-    cols: usize,
+    az: f64,
+    alt_step: f64,
     height: usize,
     coarsest: u32,
     finest: u32,
-) -> Result<(usize, usize, Vec<f64>, Vec<f32>, usize, usize)> {
-    let mut pyr = Pyramid::open(root, doc)?;
-    let mut dist = vec![f64::INFINITY; cols * height];
-    let mut cover = vec![0f32; cols * height];
+    col: &mut Column,
+) -> usize {
     let mut samples = 0usize;
-    let width = cols;
+    let mut max_alpha = f64::NEG_INFINITY;
+    // Row 0 is the top of the frame, so a larger angle means a smaller row
+    // index. `filled_from` is the topmost row already written; a new maximum
+    // fills the band [row_new, filled_from) and moves the boundary up.
+    let mut filled_from = height;
 
-    for local_col in 0..cols {
-        let col = local_col;
-        let az = p.az_start + ((start + local_col) as f64 + 0.5) * p.az_step_deg;
-        let mut max_alpha = f64::NEG_INFINITY;
-        // Row 0 is the top of the frame (alt_max), so a larger angle means a
-        // smaller row index. `filled_from` is the topmost row already written;
-        // a new maximum angle fills the band [row_new, filled_from) and moves
-        // the boundary up. Rows are written exactly once, nearest-first.
-        let mut filled_from = height;
+    let mut d = ground_res(finest, p.lat);
+    while d < p.max_range {
+        let z = level_for(d, p.lat, coarsest, finest);
+        let step = ground_res(z, p.lat);
 
-        let mut d = ground_res(finest, p.lat);
-        while d < p.max_range {
-            let z = level_for(d, p.lat, coarsest, finest);
-            let step = ground_res(z, p.lat);
+        let (lon, lat) = destination(p.lon, p.lat, az, d);
+        let (sx, sy) = lonlat_to_merc(lon, lat);
 
-            let (lon, lat) = destination(p.lon, p.lat, az, d);
-            let (sx, sy) = lonlat_to_merc(lon, lat);
+        if let Some(h) = pyr.sample(z, sx, sy) {
+            samples += 1;
+            let drop = d * d * (1.0 - REFRACTION_K) / (2.0 * EARTH_R);
+            let alpha = ((h - eye - drop) / d).atan().to_degrees();
 
-            if let Some(h) = pyr.sample(z, sx, sy) {
-                samples += 1;
-                let drop = d * d * (1.0 - REFRACTION_K) / (2.0 * EARTH_R);
-                let alpha = ((h - eye - drop) / d).atan().to_degrees();
-
-                if alpha > max_alpha {
-                    max_alpha = alpha;
-                    // Everything between the old maximum and this angle is
-                    // terrain first seen at this distance. The band's top edge
-                    // lands at a fractional row -- keeping that fraction as
-                    // coverage is what antialiases the horizon, and it costs
-                    // nothing since alpha is already a float.
-                    let f = ((p.alt_max - alpha) / p.alt_step_deg).max(0.0);
-                    if f < filled_from as f64 {
-                        let full_start = f.ceil() as usize;
-                        for row in full_start..filled_from {
-                            dist[row * width + col] = d;
-                            cover[row * width + col] = 1.0;
-                        }
-                        let partial = f.floor() as usize;
-                        if partial < full_start {
-                            dist[partial * width + col] = d;
-                            cover[partial * width + col] = (full_start as f64 - f) as f32;
-                            filled_from = partial;
-                        } else {
-                            filled_from = full_start;
-                        }
+            if alpha > max_alpha {
+                max_alpha = alpha;
+                // The band's top edge lands at a fractional row; keeping that
+                // fraction as coverage is what antialiases the horizon, and it
+                // costs nothing since alpha is already a float.
+                let f = ((p.alt_max - alpha) / alt_step).max(0.0);
+                if f < filled_from as f64 {
+                    let full_start = f.ceil() as usize;
+                    for row in full_start..filled_from {
+                        col.dist[row] = d;
+                        col.cover[row] = 1.0;
                     }
-                    // Once the column is full, no farther sample can add to it.
-                    if filled_from == 0 {
-                        break;
+                    let partial = f.floor() as usize;
+                    if partial < full_start {
+                        col.dist[partial] = d;
+                        col.cover[partial] = (full_start as f64 - f) as f32;
+                        filled_from = partial;
+                    } else {
+                        filled_from = full_start;
                     }
                 }
+                // Once the column is full, no farther sample can add to it.
+                if filled_from == 0 {
+                    break;
+                }
             }
-            d += step;
         }
+        d += step;
     }
-
-    let blocks = pyr.cached_blocks();
-    Ok((start, cols, dist, cover, samples, blocks))
+    samples
 }
 
-/// Haze-shaded render. Colour comes from the distance value alone -- the
-/// nested-ridge look is emergent, not segmented.
-/// Box-downsample by an integer factor.
+/// Shade one column into RGB per sub-row.
 ///
-/// Supersampling is what makes the strokes look right, and it removes the need
-/// for per-pixel rules about which cell a line belongs in. Averaging several
-/// rays per output column also gives horizontal antialiasing, which one ray
-/// per column cannot: where adjacent rays hit nearly the same DEM cells the
-/// edge height is quantised, and a line that should drift smoothly instead
-/// jumps in whole steps.
-pub fn downsample(img: &image::RgbImage, fx: u32, fy: u32) -> image::RgbImage {
-    if fx <= 1 && fy <= 1 {
-        return img.clone();
-    }
-    let (w, h) = (img.width() / fx, img.height() / fy);
-    let mut out = image::RgbImage::new(w, h);
-    let n = f64::from(fx * fy);
-    for y in 0..h {
-        for x in 0..w {
-            let (mut r, mut g, mut b) = (0.0, 0.0, 0.0);
-            for dy in 0..fy {
-                for dx in 0..fx {
-                    let px = img.get_pixel(x * fx + dx, y * fy + dy);
-                    r += f64::from(px[0]);
-                    g += f64::from(px[1]);
-                    b += f64::from(px[2]);
-                }
-            }
-            out.put_pixel(x, y, image::Rgb([clamp(r / n), clamp(g / n), clamp(b / n)]));
-        }
-    }
-    out
-}
-
-pub fn render_image(buf: &Buffer, p: &Params) -> image::RgbImage {
-    let mut img = image::RgbImage::new(buf.width as u32, buf.height as u32);
+/// Everything here is column-local -- edge detection looks only at the rows
+/// above and below within the same column -- which is what lets the whole
+/// render stream one output column at a time instead of materialising the
+/// full supersampled buffer.
+fn shade_column(col: &Column, p: &Params, alt_step: f64, height: usize) -> Vec<(f64, f64, f64)> {
     let haze = 45_000.0_f64; // e-folding distance for the atmospheric blend
 
-    // Silhouette pass: a depth discontinuity in the distance buffer is a ridge
-    // seen against something farther away. Stroking those edges is what makes
-    // nested ridges legible; without it the near field reads as one flat mass.
-    // No ridge segmentation is involved -- it falls out of the buffer.
-    // A raw depth ratio is the wrong test. Terrain receding at grazing
-    // incidence -- any foreground slope -- changes distance enormously per row
-    // while staying perfectly continuous, so a first-difference test paints
-    // false contours across it. Meanwhile genuine ridges at similar ranges (40
-    // km against 48 km) fall under the same threshold and get nothing.
+    // A raw depth ratio is the wrong test for a silhouette. Terrain receding at
+    // grazing incidence -- any foreground slope -- changes distance enormously
+    // per row while staying perfectly continuous, so a first-difference test
+    // paints false contours across it. Meanwhile genuine ridges at similar
+    // ranges (40 km against 48 km) fall under the same threshold and get
+    // nothing.
     //
     // What marks a silhouette is a *discontinuity*: the jump at this row is far
     // larger than the jumps just above and below it. Comparing against the
-    // local gradient rather than against a constant separates a step from a
+    // local gradient rather than a constant separates a step from a
     // steep-but-smooth surface, and works at any range.
     let spike = p.edge_ratio.max(1.001).ln();
-    let log_d = |row: usize, col: usize| -> Option<f64> {
-        let d = buf.dist[row * buf.width + col];
-        d.is_finite().then(|| d.ln())
-    };
+    let log_d = |row: usize| -> Option<f64> { col.dist[row].is_finite().then(|| col.dist[row].ln()) };
 
     // Continuous strength rather than a binary test. A hard threshold makes
-    // edges dash in and out wherever the measure hovers around it, and forces
-    // a choice between drawing trivial edges and dropping real ones.
+    // edges dash in and out wherever the measure hovers around it, and forces a
+    // choice between drawing trivial edges and dropping real ones.
     //
     // Strength is the *hidden extent* -- how much terrain the silhouette
     // conceals -- gated by the discontinuity measure. Depth ratio alone is the
     // wrong driver: a terrace lip at 300 m revealing 2 km is a bigger relative
     // jump (1.9 in log space) than a ridge at 20 km revealing 60 km (1.1), so
     // ranking by ratio promotes exactly the edges worth suppressing. Absolute
-    // hidden extent ranks them the way the eye does: 1.7 km against 40 km.
-    let edge_strength = |row: usize, col: usize| -> f64 {
-        let Some(here) = log_d(row, col) else {
+    // hidden extent ranks them as the eye does: 1.7 km against 40 km.
+    let edge_strength = |row: usize| -> f64 {
+        let Some(here) = log_d(row) else {
             return 0.0;
         };
         if row == 0 {
             return 1.0;
         }
-        let Some(above) = log_d(row - 1, col) else {
+        let Some(above) = log_d(row - 1) else {
             return 1.0; // sky above terrain: the skyline itself
         };
         let step_up = above - here;
         if step_up <= 0.0 {
             return 0.0;
         }
-        // On a continuous surface the step above matches the step below
-        // however steep it is; an occlusion spikes.
-        let below = if row + 1 < buf.height {
-            log_d(row + 1, col)
+        // On a continuous surface the step above matches the step below however
+        // steep it is; an occlusion spikes.
+        let step_down = if row + 1 < height {
+            log_d(row + 1).map_or(0.0, |b| here - b).max(0.0)
         } else {
-            None
+            0.0
         };
-        let step_down = below.map_or(0.0, |b| here - b).max(0.0);
         let discontinuity = ((step_up - step_down) / spike).clamp(0.0, 1.0);
 
-        let near = here.exp();
-        let hidden = near * step_up.exp_m1();
+        let hidden = here.exp() * step_up.exp_m1();
         // Square root so a modest nearby ridge still registers against a
         // distant range that hides ten times more.
         let extent = (hidden / p.edge_hidden_ref).clamp(0.0, 1.0).sqrt();
@@ -496,11 +413,11 @@ pub fn render_image(buf: &Buffer, p: &Params) -> image::RgbImage {
         discontinuity * extent
     };
 
-    // Colour of whatever surface a cell holds, ignoring coverage.
-    let surface = |row: usize, col: usize| -> (f64, f64, f64) {
-        let alt = p.alt_max - (row as f64 + 0.5) * p.alt_step_deg;
-        let d = buf.dist[row * buf.width + col];
+    // Colour of whatever surface a row holds, ignoring coverage.
+    let surface = |row: usize| -> (f64, f64, f64) {
+        let alt = p.alt_max - (row as f64 + 0.5) * alt_step;
         let sky = sky_colour(alt);
+        let d = col.dist[row];
         if d.is_finite() {
             // Near terrain is dark and saturated, far terrain washes out
             // towards the sky colour.
@@ -518,57 +435,51 @@ pub fn render_image(buf: &Buffer, p: &Params) -> image::RgbImage {
 
     // A one-pixel-wide line centred on the edge's true sub-pixel height,
     // distributed by overlap: an edge at 20.75 puts 25% into row 20 and 75%
-    // into row 21, and an edge landing exactly on 20.5 lands wholly in row 20.
+    // into row 21, and one landing exactly on 20.5 lands wholly in row 20.
     //
     // The ink applies to whatever the line covers, sky included -- a dark
-    // outline drawn over the horizon does darken the sky above it, and
-    // withholding that half is what stopped the stroke influencing two rows.
-    let stroke_half_width = 0.5 * p.supersample_y;
-    let mut ink = vec![0f64; buf.width * buf.height];
+    // outline over the horizon does darken the sky above it.
+    let stroke_half_width = 0.5 * f64::from(p.supersample_y);
+    let mut ink = vec![0f64; height];
 
-    for row in 0..buf.height {
-        for col in 0..buf.width {
-            let s = edge_strength(row, col);
-            if s <= 0.0 {
-                continue;
-            }
-            let d = buf.dist[row * buf.width + col];
-            let depth_fade = 0.45 + 0.4 * (1.0 - (-d / haze).exp());
-            let amount = s * (1.0 - depth_fade);
+    for row in 0..height {
+        let s = edge_strength(row);
+        if s <= 0.0 {
+            continue;
+        }
+        let depth_fade = 0.45 + 0.4 * (1.0 - (-col.dist[row] / haze).exp());
+        let amount = s * (1.0 - depth_fade);
 
-            // Coverage encodes where the band's top edge actually falls: a
-            // cell covered `c` by its band has that edge at `row + (1 - c)`.
-            let c = f64::from(buf.cover[row * buf.width + col]);
-            let edge_pos = row as f64 + (1.0 - c);
-            let lo = edge_pos - stroke_half_width;
-            let hi = edge_pos + stroke_half_width;
+        // Coverage encodes where the band's top edge actually falls: a row
+        // covered `c` by its band has that edge at `row + (1 - c)`.
+        let c = f64::from(col.cover[row]);
+        let edge_pos = row as f64 + (1.0 - c);
+        let lo = edge_pos - stroke_half_width;
+        let hi = edge_pos + stroke_half_width;
 
-            let first = lo.floor().max(0.0) as usize;
-            let last = (hi.ceil() as usize).min(buf.height);
-            for y in first..last {
-                let overlap = hi.min((y + 1) as f64) - lo.max(y as f64);
-                if overlap > 0.0 {
-                    ink[y * buf.width + col] += amount * overlap;
-                }
+        let first = lo.floor().max(0.0) as usize;
+        let last = (hi.ceil() as usize).min(height);
+        for y in first..last {
+            let overlap = hi.min((y + 1) as f64) - lo.max(y as f64);
+            if overlap > 0.0 {
+                ink[y] += amount * overlap;
             }
         }
     }
 
-    for row in 0..buf.height {
-        let alt = p.alt_max - (row as f64 + 0.5) * p.alt_step_deg;
-        for col in 0..buf.width {
-            let idx = row * buf.width + col;
-            let d = buf.dist[idx];
+    (0..height)
+        .map(|row| {
+            let alt = p.alt_max - (row as f64 + 0.5) * alt_step;
+            let d = col.dist[row];
 
             // Composite the partially-covered top edge of a band over whatever
             // lies behind it -- sky on the horizon, farther terrain within a
-            // ridge stack. Rounding this fraction away is what leaves a
-            // staircase.
-            let c = f64::from(buf.cover[idx]);
-            let front = surface(row, col);
+            // ridge stack. Rounding this fraction away leaves a staircase.
+            let c = f64::from(col.cover[row]);
+            let front = surface(row);
             let px = if d.is_finite() && c < 0.999 {
                 let back = if row > 0 {
-                    surface(row - 1, col)
+                    surface(row - 1)
                 } else {
                     let s = sky_colour(alt);
                     (f64::from(s.0), f64::from(s.1), f64::from(s.2))
@@ -582,26 +493,129 @@ pub fn render_image(buf: &Buffer, p: &Params) -> image::RgbImage {
                 front
             };
 
-            let k = 1.0 - ink[idx].clamp(0.0, 1.0);
+            let k = 1.0 - ink[row].clamp(0.0, 1.0);
             let px = (px.0 * k, px.1 * k, px.2 * k);
 
             // Faint eye-level line at 0 deg.
-            let on_eye_level = p.eye_level && alt.abs() < p.alt_step_deg * 0.5;
-            let (r, g, b) = if on_eye_level {
+            if p.eye_level && alt.abs() < alt_step * 0.5 {
                 (px.0 * 0.75 + 60.0, px.1 * 0.75 + 60.0, px.2 * 0.75 + 60.0)
             } else {
                 px
-            };
+            }
+        })
+        .collect()
+}
 
-            img.put_pixel(
-                col as u32,
-                row as u32,
-                image::Rgb([clamp(r), clamp(g), clamp(b)]),
-            );
+/// Render the panorama, streaming one output column at a time.
+///
+/// Supersampling is what makes the strokes and the far skyline look right, but
+/// materialising the whole supersampled buffer is what made it expensive: a
+/// 360 degree frame at 9x9 needed 6.7 GB. Nothing requires that. An output
+/// column depends only on its own sub-columns, and shading is column-local, so
+/// each is marched, shaded, averaged and discarded in turn.
+pub fn render(root: &Path, doc: &Doc, p: &Params) -> Result<(image::RgbImage, Stats)> {
+    let (coarsest, finest) = (doc.grid.coarsest_level, doc.grid.finest_level);
+    let (ssx, ssy) = (p.supersample_x.max(1), p.supersample_y.max(1));
+
+    let (ex, ey) = lonlat_to_merc(p.lon, p.lat);
+    let eye = {
+        let mut pyr = Pyramid::open(root, doc)?;
+        pyr.sample_finest(ex, ey)
+            .context("viewpoint has no elevation data")?
+            + p.eye_height
+    };
+
+    let out_w = (p.az_span / p.step_deg).round() as usize;
+    let out_h = ((p.alt_max - p.alt_min) / p.step_deg).round() as usize;
+    let sub_h = out_h * ssy as usize;
+    let az_step = p.step_deg / f64::from(ssx);
+    let alt_step = p.step_deg / f64::from(ssy);
+
+    let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+    let chunk = out_w.div_ceil(threads).max(1);
+
+    // Chunked so each worker opens the pyramid once and keeps its block cache
+    // warm across the columns it owns.
+    let parts: Vec<(usize, Vec<[u8; 3]>, usize, usize, usize)> = (0..out_w)
+        .step_by(chunk)
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|start| -> Result<_> {
+            let cols = chunk.min(out_w - start);
+            let mut pyr = Pyramid::open(root, doc)?;
+            let mut pixels = vec![[0u8; 3]; cols * out_h];
+            let mut samples = 0usize;
+            let mut sky = 0usize;
+
+            let mut column = Column::new(sub_h);
+            let mut shaded: Vec<Vec<(f64, f64, f64)>> = Vec::with_capacity(ssx as usize);
+
+            for local in 0..cols {
+                let oc = start + local;
+                shaded.clear();
+                for k in 0..ssx {
+                    column.dist.fill(f64::INFINITY);
+                    column.cover.fill(0.0);
+                    let az = p.az_start
+                        + ((oc * ssx as usize + k as usize) as f64 + 0.5) * az_step;
+                    samples += march_ray(
+                        &mut pyr, p, eye, az, alt_step, sub_h, coarsest, finest, &mut column,
+                    );
+                    sky += column.dist.iter().filter(|d| d.is_infinite()).count();
+                    shaded.push(shade_column(&column, p, alt_step, sub_h));
+                }
+
+                // Box-average the ssx x ssy block behind each output pixel.
+                let n = f64::from(ssx * ssy);
+                for orow in 0..out_h {
+                    let (mut r, mut g, mut b) = (0.0, 0.0, 0.0);
+                    for sc in &shaded {
+                        for sy in 0..ssy as usize {
+                            let (pr, pg, pb) = sc[orow * ssy as usize + sy];
+                            r += pr;
+                            g += pg;
+                            b += pb;
+                        }
+                    }
+                    pixels[orow * cols + local] =
+                        [clamp(r / n), clamp(g / n), clamp(b / n)];
+                }
+            }
+
+            Ok((start, pixels, samples, pyr.cached_blocks(), sky))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut img = image::RgbImage::new(out_w as u32, out_h as u32);
+    let mut samples = 0usize;
+    let mut blocks = 0usize;
+    let mut sky = 0usize;
+    let mut cells = 0usize;
+    for (start, pixels, n, b, s) in parts {
+        samples += n;
+        blocks += b;
+        sky += s;
+        let cols = pixels.len() / out_h;
+        cells += cols * sub_h * ssx as usize;
+        for orow in 0..out_h {
+            for local in 0..cols {
+                let px = pixels[orow * cols + local];
+                img.put_pixel((start + local) as u32, orow as u32, image::Rgb(px));
+            }
         }
     }
 
-    img
+    Ok((
+        img,
+        Stats {
+            width: out_w,
+            height: out_h,
+            eye_elevation: eye,
+            samples,
+            blocks,
+            sky_fraction: sky as f64 / cells.max(1) as f64,
+        },
+    ))
 }
 
 fn sky_colour(alt: f64) -> (u8, u8, u8) {

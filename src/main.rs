@@ -261,15 +261,6 @@ fn main() -> Result<()> {
             supersample_x,
             supersample_y,
         } => {
-            let (ssx, ssy) = (supersample_x.max(1), supersample_y.max(1));
-            // The two axes need very different factors. Horizontally, one ray
-            // per output pixel picks a single arbitrary value out of the
-            // several DEM cells inside that pixel's footprint at long range,
-            // so the far skyline needs real samples to average. Vertically,
-            // coverage and stroke position are already computed at exact
-            // fractional rows, so extra rows buy almost nothing -- and since
-            // buffer memory is the product of the two, keeping this at 1 makes
-            // a high horizontal factor affordable.
             let p = panorama::Params {
                 lon,
                 lat,
@@ -278,46 +269,45 @@ fn main() -> Result<()> {
                 az_span: fov,
                 alt_min,
                 alt_max,
-                az_step_deg: step / f64::from(ssx),
-                alt_step_deg: step / f64::from(ssy),
+                step_deg: step,
                 max_range: range,
                 edge_ratio,
                 edge_hidden_ref,
                 eye_level,
-                supersample_y: f64::from(ssy),
+                supersample_x,
+                supersample_y,
             };
             let t0 = std::time::Instant::now();
-            let buf = panorama::march(&cli.root, &doc, &p)?;
-            let marched = t0.elapsed();
-            let hi = panorama::render_image(&buf, &p);
-            let img = panorama::downsample(&hi, ssx, ssy);
+            let (img, stats) = panorama::render(&cli.root, &doc, &p)?;
+            let elapsed = t0.elapsed();
             img.save(&out)
                 .with_context(|| format!("writing {}", out.display()))?;
 
-            let sky = buf.dist.iter().filter(|d| d.is_infinite()).count();
             println!(
                 "viewpoint  {lon:.5} {lat:.5}  ground {:.1} m  eye {:.1} m",
-                buf.eye_elevation - eye,
-                buf.eye_elevation
+                stats.eye_elevation - eye,
+                stats.eye_elevation
             );
             println!(
-                "buffer     {}x{} px  {:.0} deg from {:.0} ({})",
-                buf.width,
-                buf.height,
+                "image      {}x{} px  {:.0} deg from {:.0} ({})  supersample {}x{}",
+                stats.width,
+                stats.height,
                 fov,
                 az,
-                panorama::compass(az)
+                panorama::compass(az),
+                supersample_x,
+                supersample_y
             );
             println!(
                 "marched    {} samples, {} blocks cached, {:.2} s",
-                buf.samples,
-                buf.blocks,
-                marched.as_secs_f64()
+                stats.samples,
+                stats.blocks,
+                elapsed.as_secs_f64()
             );
             println!(
                 "terrain    {:.1}% of the frame ({:.1}% sky)",
-                100.0 * (buf.dist.len() - sky) as f64 / buf.dist.len() as f64,
-                100.0 * sky as f64 / buf.dist.len() as f64
+                100.0 * (1.0 - stats.sky_fraction),
+                100.0 * stats.sky_fraction
             );
             println!("wrote      {}", out.display());
         }
