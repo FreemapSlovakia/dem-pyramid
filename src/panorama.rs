@@ -247,6 +247,9 @@ pub struct Buffer {
     pub height: usize,
     /// Distance to visible terrain per cell; f64::INFINITY for sky.
     pub dist: Vec<f64>,
+    /// Fraction of the cell covered by that surface, 0..1. Less than 1 only on
+    /// a band's top edge, which is what makes the horizon smooth.
+    pub cover: Vec<f32>,
     pub eye_elevation: f64,
     pub samples: usize,
     pub blocks: usize,
@@ -273,7 +276,7 @@ pub fn march(root: &Path, doc: &Doc, p: &Params) -> Result<Buffer> {
     let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let chunk = width.div_ceil(threads).max(1);
 
-    let parts: Vec<(usize, usize, Vec<f64>, usize, usize)> = (0..width)
+    let parts: Vec<(usize, usize, Vec<f64>, Vec<f32>, usize, usize)> = (0..width)
         .step_by(chunk)
         .collect::<Vec<_>>()
         .into_par_iter()
@@ -281,14 +284,17 @@ pub fn march(root: &Path, doc: &Doc, p: &Params) -> Result<Buffer> {
         .collect::<Result<Vec<_>>>()?;
 
     let mut dist = vec![f64::INFINITY; width * height];
+    let mut cover = vec![0f32; width * height];
     let mut samples = 0usize;
     let mut blocks = 0usize;
-    for (start, cols, local, n, b) in parts {
+    for (start, cols, local_d, local_c, n, b) in parts {
         samples += n;
         blocks += b;
         for row in 0..height {
             dist[row * width + start..row * width + start + cols]
-                .copy_from_slice(&local[row * cols..row * cols + cols]);
+                .copy_from_slice(&local_d[row * cols..row * cols + cols]);
+            cover[row * width + start..row * width + start + cols]
+                .copy_from_slice(&local_c[row * cols..row * cols + cols]);
         }
     }
 
@@ -296,6 +302,7 @@ pub fn march(root: &Path, doc: &Doc, p: &Params) -> Result<Buffer> {
         width,
         height,
         dist,
+        cover,
         eye_elevation: eye,
         samples,
         blocks,
@@ -314,9 +321,10 @@ fn march_columns(
     height: usize,
     coarsest: u32,
     finest: u32,
-) -> Result<(usize, usize, Vec<f64>, usize, usize)> {
+) -> Result<(usize, usize, Vec<f64>, Vec<f32>, usize, usize)> {
     let mut pyr = Pyramid::open(root, doc)?;
     let mut dist = vec![f64::INFINITY; cols * height];
+    let mut cover = vec![0f32; cols * height];
     let mut samples = 0usize;
     let width = cols;
 
@@ -346,14 +354,25 @@ fn march_columns(
                 if alpha > max_alpha {
                     max_alpha = alpha;
                     // Everything between the old maximum and this angle is
-                    // terrain first seen at this distance.
-                    let r = ((p.alt_max - alpha) / p.step_deg).round();
-                    let row_new = r.clamp(0.0, height as f64) as usize;
-                    if row_new < filled_from {
-                        for row in row_new..filled_from {
+                    // terrain first seen at this distance. The band's top edge
+                    // lands at a fractional row -- keeping that fraction as
+                    // coverage is what antialiases the horizon, and it costs
+                    // nothing since alpha is already a float.
+                    let f = ((p.alt_max - alpha) / p.step_deg).max(0.0);
+                    if f < filled_from as f64 {
+                        let full_start = f.ceil() as usize;
+                        for row in full_start..filled_from {
                             dist[row * width + col] = d;
+                            cover[row * width + col] = 1.0;
                         }
-                        filled_from = row_new;
+                        let partial = f.floor() as usize;
+                        if partial < full_start {
+                            dist[partial * width + col] = d;
+                            cover[partial * width + col] = (full_start as f64 - f) as f32;
+                            filled_from = partial;
+                        } else {
+                            filled_from = full_start;
+                        }
                     }
                     // Once the column is full, no farther sample can add to it.
                     if filled_from == 0 {
@@ -366,7 +385,7 @@ fn march_columns(
     }
 
     let blocks = pyr.cached_blocks();
-    Ok((start, cols, dist, samples, blocks))
+    Ok((start, cols, dist, cover, samples, blocks))
 }
 
 /// Haze-shaded render. Colour comes from the distance value alone -- the
@@ -438,37 +457,92 @@ pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
         discontinuity * extent
     };
 
+    // Colour of whatever surface a cell holds, ignoring coverage.
+    let surface = |row: usize, col: usize| -> (f64, f64, f64) {
+        let alt = p.alt_max - (row as f64 + 0.5) * p.step_deg;
+        let d = buf.dist[row * buf.width + col];
+        let sky = sky_colour(alt);
+        if d.is_finite() {
+            // Near terrain is dark and saturated, far terrain washes out
+            // towards the sky colour.
+            let t = 1.0 - (-d / haze).exp();
+            let base = (58.0, 74.0, 52.0);
+            (
+                lerp(base.0, f64::from(sky.0), t),
+                lerp(base.1, f64::from(sky.1), t),
+                lerp(base.2, f64::from(sky.2), t),
+            )
+        } else {
+            (f64::from(sky.0), f64::from(sky.1), f64::from(sky.2))
+        }
+    };
+
+    // Strokes accumulate into their own buffer, because a line lying at a
+    // fractional row straddles two pixels. Darkening only the pixel that
+    // happens to contain the edge leaves the stroke aliased even when the fill
+    // behind it is smooth -- so each is splatted across the rows it really
+    // covers, weighted by overlap.
+    const STROKE_HALF_WIDTH: f64 = 0.7;
+    let mut ink = vec![0f64; buf.width * buf.height];
+
+    for row in 0..buf.height {
+        for col in 0..buf.width {
+            let s = edge_strength(row, col);
+            if s <= 0.0 {
+                continue;
+            }
+            let d = buf.dist[row * buf.width + col];
+            let depth_fade = 0.45 + 0.4 * (1.0 - (-d / haze).exp());
+            let amount = s * (1.0 - depth_fade);
+
+            // Coverage encodes where the band's top edge actually falls.
+            let c = f64::from(buf.cover[row * buf.width + col]);
+            let edge_pos = row as f64 + (1.0 - c);
+            let lo = edge_pos - STROKE_HALF_WIDTH;
+            let hi = edge_pos + STROKE_HALF_WIDTH;
+
+            let first = lo.floor().max(0.0) as usize;
+            let last = (hi.ceil() as usize).min(buf.height);
+            for y in first..last {
+                let overlap = hi.min((y + 1) as f64) - lo.max(y as f64);
+                if overlap > 0.0 {
+                    ink[y * buf.width + col] +=
+                        amount * overlap / (2.0 * STROKE_HALF_WIDTH);
+                }
+            }
+        }
+    }
+
     for row in 0..buf.height {
         let alt = p.alt_max - (row as f64 + 0.5) * p.step_deg;
         for col in 0..buf.width {
-            let d = buf.dist[row * buf.width + col];
+            let idx = row * buf.width + col;
+            let d = buf.dist[idx];
 
-            let px = if d.is_finite() {
-                // Near terrain is dark and saturated, far terrain washes out
-                // towards the sky colour.
-                let t = 1.0 - (-d / haze).exp();
-                let base = (58.0, 74.0, 52.0);
-                let sky = sky_colour(alt);
+            // Composite the partially-covered top edge of a band over whatever
+            // lies behind it -- sky on the horizon, farther terrain within a
+            // ridge stack. Rounding this fraction away is what leaves a
+            // staircase.
+            let c = f64::from(buf.cover[idx]);
+            let front = surface(row, col);
+            let px = if d.is_finite() && c < 0.999 {
+                let back = if row > 0 {
+                    surface(row - 1, col)
+                } else {
+                    let s = sky_colour(alt);
+                    (f64::from(s.0), f64::from(s.1), f64::from(s.2))
+                };
                 (
-                    lerp(base.0, f64::from(sky.0), t),
-                    lerp(base.1, f64::from(sky.1), t),
-                    lerp(base.2, f64::from(sky.2), t),
+                    lerp(back.0, front.0, c),
+                    lerp(back.1, front.1, c),
+                    lerp(back.2, front.2, c),
                 )
             } else {
-                let s = sky_colour(alt);
-                (f64::from(s.0), f64::from(s.1), f64::from(s.2))
+                front
             };
 
-            // Silhouette stroke, opacity proportional to how much terrain the
-            // edge hides, then faded with haze so distant detail stays quiet.
-            let s = edge_strength(row, col);
-            let px = if s > 0.0 {
-                let depth_fade = 0.45 + 0.4 * (1.0 - (-d / haze).exp());
-                let k = 1.0 - s * (1.0 - depth_fade);
-                (px.0 * k, px.1 * k, px.2 * k)
-            } else {
-                px
-            };
+            let k = 1.0 - ink[idx].clamp(0.0, 1.0);
+            let px = (px.0 * k, px.1 * k, px.2 * k);
 
             // Faint eye-level line at 0 deg.
             let on_eye_level = p.eye_level && alt.abs() < p.step_deg * 0.5;
