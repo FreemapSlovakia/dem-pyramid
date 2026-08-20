@@ -43,7 +43,8 @@ pub struct Params {
     pub az_span: f64,
     pub alt_min: f64,
     pub alt_max: f64,
-    pub step_deg: f64,
+    pub az_step_deg: f64,
+    pub alt_step_deg: f64,
     pub max_range: f64,
     /// Depth ratio above which a ridge-against-ridge edge is stroked. Set very
     /// high to stroke only true terrain-against-sky skylines.
@@ -57,12 +58,12 @@ pub struct Params {
     pub edge_hidden_ref: f64,
     /// Draw the eye-level line at 0 degrees.
     pub eye_level: bool,
-    /// Samples per output pixel per axis.
+    /// Vertical supersampling factor.
     ///
-    /// Stroke width is expressed in *output* pixels, so it has to know the
-    /// factor: a line one buffer-pixel wide at 3x becomes a third of a pixel
-    /// once averaged down, and comes out at a third of its intended weight.
-    pub supersample: f64,
+    /// Stroke width is expressed in *output* pixels, so it has to know this: a
+    /// line one buffer-row wide at 3x becomes a third of a pixel once averaged
+    /// down, and comes out at a third of its intended weight.
+    pub supersample_y: f64,
 }
 
 /// One pyramid level, with a block cache over its GTI index.
@@ -272,8 +273,8 @@ pub fn march(root: &Path, doc: &Doc, p: &Params) -> Result<Buffer> {
             + p.eye_height
     };
 
-    let width = (p.az_span / p.step_deg).round() as usize;
-    let height = ((p.alt_max - p.alt_min) / p.step_deg).round() as usize;
+    let width = (p.az_span / p.az_step_deg).round() as usize;
+    let height = ((p.alt_max - p.alt_min) / p.alt_step_deg).round() as usize;
 
     // Columns are independent, so the only shared state is the block cache.
     // Rather than lock one, give each worker its own pyramid handle: the whole
@@ -336,7 +337,7 @@ fn march_columns(
 
     for local_col in 0..cols {
         let col = local_col;
-        let az = p.az_start + ((start + local_col) as f64 + 0.5) * p.step_deg;
+        let az = p.az_start + ((start + local_col) as f64 + 0.5) * p.az_step_deg;
         let mut max_alpha = f64::NEG_INFINITY;
         // Row 0 is the top of the frame (alt_max), so a larger angle means a
         // smaller row index. `filled_from` is the topmost row already written;
@@ -364,7 +365,7 @@ fn march_columns(
                     // lands at a fractional row -- keeping that fraction as
                     // coverage is what antialiases the horizon, and it costs
                     // nothing since alpha is already a float.
-                    let f = ((p.alt_max - alpha) / p.step_deg).max(0.0);
+                    let f = ((p.alt_max - alpha) / p.alt_step_deg).max(0.0);
                     if f < filled_from as f64 {
                         let full_start = f.ceil() as usize;
                         for row in full_start..filled_from {
@@ -404,19 +405,19 @@ fn march_columns(
 /// per column cannot: where adjacent rays hit nearly the same DEM cells the
 /// edge height is quantised, and a line that should drift smoothly instead
 /// jumps in whole steps.
-pub fn downsample(img: &image::RgbImage, factor: u32) -> image::RgbImage {
-    if factor <= 1 {
+pub fn downsample(img: &image::RgbImage, fx: u32, fy: u32) -> image::RgbImage {
+    if fx <= 1 && fy <= 1 {
         return img.clone();
     }
-    let (w, h) = (img.width() / factor, img.height() / factor);
+    let (w, h) = (img.width() / fx, img.height() / fy);
     let mut out = image::RgbImage::new(w, h);
-    let n = f64::from(factor * factor);
+    let n = f64::from(fx * fy);
     for y in 0..h {
         for x in 0..w {
             let (mut r, mut g, mut b) = (0.0, 0.0, 0.0);
-            for dy in 0..factor {
-                for dx in 0..factor {
-                    let px = img.get_pixel(x * factor + dx, y * factor + dy);
+            for dy in 0..fy {
+                for dx in 0..fx {
+                    let px = img.get_pixel(x * fx + dx, y * fy + dy);
                     r += f64::from(px[0]);
                     g += f64::from(px[1]);
                     b += f64::from(px[2]);
@@ -497,7 +498,7 @@ pub fn render_image(buf: &Buffer, p: &Params) -> image::RgbImage {
 
     // Colour of whatever surface a cell holds, ignoring coverage.
     let surface = |row: usize, col: usize| -> (f64, f64, f64) {
-        let alt = p.alt_max - (row as f64 + 0.5) * p.step_deg;
+        let alt = p.alt_max - (row as f64 + 0.5) * p.alt_step_deg;
         let d = buf.dist[row * buf.width + col];
         let sky = sky_colour(alt);
         if d.is_finite() {
@@ -522,7 +523,7 @@ pub fn render_image(buf: &Buffer, p: &Params) -> image::RgbImage {
     // The ink applies to whatever the line covers, sky included -- a dark
     // outline drawn over the horizon does darken the sky above it, and
     // withholding that half is what stopped the stroke influencing two rows.
-    let stroke_half_width = 0.5 * p.supersample;
+    let stroke_half_width = 0.5 * p.supersample_y;
     let mut ink = vec![0f64; buf.width * buf.height];
 
     for row in 0..buf.height {
@@ -554,7 +555,7 @@ pub fn render_image(buf: &Buffer, p: &Params) -> image::RgbImage {
     }
 
     for row in 0..buf.height {
-        let alt = p.alt_max - (row as f64 + 0.5) * p.step_deg;
+        let alt = p.alt_max - (row as f64 + 0.5) * p.alt_step_deg;
         for col in 0..buf.width {
             let idx = row * buf.width + col;
             let d = buf.dist[idx];
@@ -585,7 +586,7 @@ pub fn render_image(buf: &Buffer, p: &Params) -> image::RgbImage {
             let px = (px.0 * k, px.1 * k, px.2 * k);
 
             // Faint eye-level line at 0 deg.
-            let on_eye_level = p.eye_level && alt.abs() < p.step_deg * 0.5;
+            let on_eye_level = p.eye_level && alt.abs() < p.alt_step_deg * 0.5;
             let (r, g, b) = if on_eye_level {
                 (px.0 * 0.75 + 60.0, px.1 * 0.75 + 60.0, px.2 * 0.75 + 60.0)
             } else {

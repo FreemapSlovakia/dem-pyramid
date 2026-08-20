@@ -110,9 +110,23 @@ enum Command {
         /// Draw the eye-level line at 0 degrees.
         #[arg(long, default_value_t = false)]
         eye_level: bool,
-        /// Render this many samples per output pixel per axis, then average.
-        #[arg(long, default_value_t = 3)]
-        supersample: u32,
+        /// Rays per output pixel horizontally, averaged down.
+        ///
+        /// This is where supersampling earns its cost. At long range several
+        /// DEM cells fall inside one pixel's angular footprint, and a single
+        /// ray picks one arbitrary value out of them.
+        #[arg(long, default_value_t = 9)]
+        supersample_x: u32,
+        /// Rows per output pixel vertically, averaged down.
+        ///
+        /// Needed as much as the horizontal factor, for a reason that is not
+        /// obvious: sub-pixel placement is analytic, but only for *one* edge
+        /// per cell. The buffer holds a single surface per cell, so where
+        /// several ridge bands fall inside one output pixel -- routine near
+        /// the horizon -- all but the nearest are discarded and never
+        /// stroked. Extra rows give each band its own cell to occupy.
+        #[arg(long, default_value_t = 9)]
+        supersample_y: u32,
     },
 }
 
@@ -244,13 +258,18 @@ fn main() -> Result<()> {
             edge_ratio,
             edge_hidden_ref,
             eye_level,
-            supersample,
+            supersample_x,
+            supersample_y,
         } => {
-            let ss = supersample.max(1);
-            // March and shade at ss times the output resolution, then average
-            // down. Both axes: vertical fixes the stroke placement, horizontal
-            // is the only way to antialias across columns, since one ray per
-            // output pixel has no sub-pixel coverage to work with.
+            let (ssx, ssy) = (supersample_x.max(1), supersample_y.max(1));
+            // The two axes need very different factors. Horizontally, one ray
+            // per output pixel picks a single arbitrary value out of the
+            // several DEM cells inside that pixel's footprint at long range,
+            // so the far skyline needs real samples to average. Vertically,
+            // coverage and stroke position are already computed at exact
+            // fractional rows, so extra rows buy almost nothing -- and since
+            // buffer memory is the product of the two, keeping this at 1 makes
+            // a high horizontal factor affordable.
             let p = panorama::Params {
                 lon,
                 lat,
@@ -259,18 +278,19 @@ fn main() -> Result<()> {
                 az_span: fov,
                 alt_min,
                 alt_max,
-                step_deg: step / f64::from(ss),
+                az_step_deg: step / f64::from(ssx),
+                alt_step_deg: step / f64::from(ssy),
                 max_range: range,
                 edge_ratio,
                 edge_hidden_ref,
                 eye_level,
-                supersample: f64::from(ss),
+                supersample_y: f64::from(ssy),
             };
             let t0 = std::time::Instant::now();
             let buf = panorama::march(&cli.root, &doc, &p)?;
             let marched = t0.elapsed();
             let hi = panorama::render_image(&buf, &p);
-            let img = panorama::downsample(&hi, ss);
+            let img = panorama::downsample(&hi, ssx, ssy);
             img.save(&out)
                 .with_context(|| format!("writing {}", out.display()))?;
 

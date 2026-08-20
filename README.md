@@ -143,6 +143,34 @@ Sampling is bilinear. With nearest-neighbour, adjacent rays at 2 km are 1.75 m
 apart against 6.27 m cells, so many rays return the same cell and the skyline
 comes out as a staircase.
 
+### Supersampling
+
+Renders at `--supersample-x` × `--supersample-y` the output resolution and
+box-averages down. Both default to 9, and both are needed, for different
+reasons:
+
+- **Horizontal** — at long range several DEM cells fall inside one pixel's
+  angular footprint (~2.9 cells at 100 km), and a single ray picks one
+  arbitrary value out of them. Only real samples can average that.
+- **Vertical** — sub-pixel placement *is* analytic, but only for one edge per
+  cell. The buffer holds a single surface per cell, so where several ridge
+  bands fall inside one output pixel, all but the nearest are discarded and
+  never stroked. Extra rows give each band a cell of its own.
+
+Rays scale with the horizontal factor only; vertical rows cost no marching.
+Disk I/O does not change at all (same 396 blocks at every setting) — the extra
+work is arithmetic over data already cached. Buffer memory is the *product* of
+the two, which is the real limit.
+
+| view | rays | time | peak RSS |
+|---|---|---|---|
+| 90°, 9×9 | 117M | 5.8 s | ~1 GB |
+| 360°, 9×9 | 465M | 21.3 s | 6.7 GB |
+
+Below 9 the far skyline visibly degrades. Two easy reductions if memory ever
+binds: distances are `f64` where `f32` gives 0.03 m at 300 km, and the
+full-resolution RGB buffer could be averaged row-by-row instead of built whole.
+
 Not yet done: SVG output, peak labels, sun path.
 
 ## Known source hazards
