@@ -74,6 +74,46 @@ tail -f /fm/storage2/dem/logs/footprints.log
 Long steps go in tmux and log to `$DEM_ROOT/logs/<step>.log`; nothing depends on
 staying attached.
 
+## Pilot results (tile 70_44, 2026-08-20)
+
+Tile 70_44 spans lon 16.875–19.6875, lat 47.04–48.92: southwestern Slovakia,
+northeastern Austria, northern Hungary.
+
+| source | level | build | size | valid % | ratio | B/px |
+|---|---|---|---|---|---|---|
+| sk | 14 | 33.5 min | 437.7 MB | 51.1 | 3.34× | 0.80 |
+| at | 14 | 2.0 min | 13.9 MB | 2.3 | 4.66× | 0.57 |
+| gedtm30 | 12 | 15 s | 83.1 MB | 100 | 2.15× | 1.24 |
+
+Ratio is stored bytes against the raw bytes of the *valid* pixels plus their
+overview chain; SPARSE_OK means nodata blocks are never written.
+
+At 0.80 B/px the national coverage projects to **~90 GB** (49.6 GB for
+se+fi+no at 63N, 40.8 GB for the rest at 46N — pixel count per km² of ground
+rises with latitude). This tile is lowland plus low hills; Alpine 1 m LiDAR
+will compress worse, so budget 90–150 GB.
+
+Verified:
+
+- **Priority** at a genuine sk/at overlap: sk 6388, at 6393, index returns
+  6388. SORT_FIELD resolves correctly.
+- **Fall-through** sk → at → gedtm30 at points where each is the first with
+  data.
+- **Sparse fine levels**: z14 returns nodata over Hungary while z12 returns
+  215.1 m from gedtm30 — the marcher's fallback case.
+- **Geometric alignment**: sk and at tiles have bit-identical geotransforms and
+  corners. Because every source is warped to the same `-te`/`-ts`, a
+  half-cell seam is impossible by construction.
+- **Vertical agreement**: sk − at = −0.129 m mean, sd 0.158 m over the overlap
+  (n=7 — the overlap strip is thin, so treat as an order of magnitude). That is
+  the expected decimetre-scale vertical datum difference, and it is 1/70 of a
+  pixel at 10 km. Not worth chasing.
+
+The visual seam check was **inconclusive**: the sk/at boundary here follows the
+Morava floodplain, whose paleochannel microrelief saturates a hillshade long
+before a 13 cm step becomes visible. Natural exaggeration showed no gross
+artefacts. A mountainous border (SK/PL Tatras) would be the better test.
+
 ## Known source hazards
 
 Re-measured 2026-08-20, all 23 sources.
