@@ -105,7 +105,7 @@ enum Command {
         #[arg(long, default_value_t = 1.35)]
         edge_ratio: f64,
         /// Hidden extent, metres, at which a silhouette reaches full strength.
-        #[arg(long, default_value_t = 20_000.0)]
+        #[arg(long, default_value_t = 8_000.0)]
         edge_hidden_ref: f64,
         /// Draw the eye-level line at 0 degrees.
         #[arg(long, default_value_t = false)]

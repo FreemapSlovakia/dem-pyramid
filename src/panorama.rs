@@ -454,7 +454,12 @@ pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
         // distant range that hides ten times more.
         let extent = (hidden / p.edge_hidden_ref).clamp(0.0, 1.0).sqrt();
 
-        discontinuity * extent
+        // Square root as a perceptual curve. Raw strengths cluster low -- a
+        // typical mid-distance ridge lands near 0.15 -- and once the fills
+        // either side of it differ by a single level, a stroke that faint is
+        // lost to rounding. This lifts weak-but-real edges into visibility
+        // while preserving their ordering against strong ones.
+        (discontinuity * extent).sqrt()
     };
 
     // Colour of whatever surface a cell holds, ignoring coverage.
@@ -482,7 +487,10 @@ pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
     // happens to contain the edge leaves the stroke aliased even when the fill
     // behind it is smooth -- so each is splatted across the rows it really
     // covers, weighted by overlap.
-    const STROKE_HALF_WIDTH: f64 = 0.7;
+    // One pixel wide. Wider spreads the same ink over more pixels, and since
+    // the stroke is already only a few levels darker than the fill, dilution
+    // puts it below the quantisation floor and the line breaks into patches.
+    const STROKE_HALF_WIDTH: f64 = 0.5;
     let mut ink = vec![0f64; buf.width * buf.height];
 
     for row in 0..buf.height {
@@ -492,8 +500,10 @@ pub fn render(buf: &Buffer, p: &Params, out: &Path) -> Result<()> {
                 continue;
             }
             let d = buf.dist[row * buf.width + col];
-            let depth_fade = 0.45 + 0.4 * (1.0 - (-d / haze).exp());
-            let amount = s * (1.0 - depth_fade);
+            // The fill washes out with distance, but the outlines must not:
+            // they are what keeps nested ridges legible once the fills between
+            // them differ by a level or two.
+            let amount = s * (0.55 - 0.15 * (1.0 - (-d / haze).exp()));
 
             // Coverage encodes where the band's top edge actually falls.
             let c = f64::from(buf.cover[row * buf.width + col]);
