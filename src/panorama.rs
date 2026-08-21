@@ -59,6 +59,15 @@ pub struct Params {
     pub edge_hidden_ref: f64,
     /// Draw the eye-level line at 0 degrees.
     pub eye_level: bool,
+    /// Radius, in metres, over which the viewpoint's ground elevation is taken
+    /// as the local maximum rather than the value at the exact point.
+    ///
+    /// The pyramid stores a 6.27 m average, and averaging costs a summit more
+    /// the sharper it is, so `value at the point + eye height` reliably places
+    /// the eye below where a person would stand. On Gerlach that put ground
+    /// 10 m away 6.6 m above the eye -- subtending +33 degrees and filling the
+    /// frame with rock.
+    pub eye_search_radius: f64,
     /// Rays per output pixel horizontally.
     ///
     /// At long range several DEM cells fall inside one pixel's angular
@@ -518,12 +527,26 @@ pub fn render(root: &Path, doc: &Doc, p: &Params) -> Result<(image::RgbImage, St
     let (ssx, ssy) = (p.supersample_x.max(1), p.supersample_y.max(1));
 
     let (ex, ey) = lonlat_to_merc(p.lon, p.lat);
-    let eye = {
+    let ground = {
         let mut pyr = Pyramid::open(root, doc)?;
-        pyr.sample_finest(ex, ey)
-            .context("viewpoint has no elevation data")?
-            + p.eye_height
+        let at_point = pyr
+            .sample_finest(ex, ey)
+            .context("viewpoint has no elevation data")?;
+
+        // Mercator metres are ground metres divided by cos(lat).
+        let r = p.eye_search_radius / p.lat.to_radians().cos();
+        let mut best = at_point;
+        if r > 0.0 {
+            for k in 0..8 {
+                let a = f64::from(k) * std::f64::consts::FRAC_PI_4;
+                if let Some(h) = pyr.sample_finest(ex + r * a.cos(), ey + r * a.sin()) {
+                    best = best.max(h);
+                }
+            }
+        }
+        best
     };
+    let eye = ground + p.eye_height;
 
     let out_w = (p.az_span / p.step_deg).round() as usize;
     let out_h = ((p.alt_max - p.alt_min) / p.step_deg).round() as usize;

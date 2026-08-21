@@ -90,6 +90,13 @@ enum Command {
         /// Eye height above ground, metres.
         #[arg(long, default_value_t = 1.7)]
         eye: f64,
+        /// Take ground elevation as the local maximum within this radius,
+        /// metres, instead of the value at the exact point.
+        ///
+        /// Compensates for the pyramid storing a 6.27 m average, which costs a
+        /// summit more the sharper it is. 0 disables.
+        #[arg(long, default_value_t = 10.0)]
+        eye_search_radius: f64,
         /// Leftmost azimuth, degrees clockwise from north.
         #[arg(long, default_value_t = 0.0)]
         az: f64,
@@ -267,6 +274,7 @@ fn main() -> Result<()> {
             lat,
             out,
             eye,
+            eye_search_radius,
             az,
             fov,
             alt_min,
@@ -283,6 +291,7 @@ fn main() -> Result<()> {
                 lon,
                 lat,
                 eye_height: eye,
+                eye_search_radius,
                 az_start: az,
                 az_span: fov,
                 alt_min,
