@@ -61,15 +61,28 @@ height = round((alt_max - alt_min) / step)
 needed for a different reason: where several ridges fall inside one output
 pixel, only the nearest survives without it.
 
-Measured on a 12-core machine, 360° at the default step:
+Measured on a 12-core machine, 360°, peaks and depth included:
 
-| settings | rays | wall |
-|---|---|---|
-| `supersample 3×3` | 157 M | ~9 s |
-| `supersample 9×9` | 470 M | ~27 s |
+| settings | wall |
+|---|---|
+| `step 0.1`, `supersample 3×3` | ~5 s |
+| `step 0.05`, `supersample 3×3` | ~9 s |
+| `step 0.05`, `supersample 9×9` | ~27 s |
 
-A 60–120° viewport is proportionally cheaper. Renders are serialised by
-default, because one already saturates nine cores.
+A 60–120° viewport is proportionally cheaper. Peaks add roughly a second;
+depth costs almost nothing.
+
+Three things multiply those figures, and they compound:
+
+- **A cold viewpoint is about twice a warm one** — 9.6 s against 4.9 s for the
+  same request — because the pyramid blocks come off disk the first time.
+- **Requests are serialised**, so a second one waits for the first: two
+  overlapping requests measured 8.9 s and 14.9 s.
+- **Other load on the host** stretches everything, since a render already uses
+  nine of twelve cores.
+
+So budget for several times the table under real conditions, and treat these as
+a floor rather than a promise.
 
 ## Queueing and cancellation
 
@@ -177,11 +190,22 @@ by `prominence` descending.
 | `azimuth` | degrees clockwise from north |
 | `altitude` | degrees above horizontal from the eye, including curvature and refraction |
 | `x`, `y` | position in the image, **output pixels**, origin top-left |
-| `prominence` | degrees the summit stands above the skyline behind it |
+| `prominence` | degrees the summit stands clear of the skyline **beside** it |
 
 `prominence` is angular, not metric, and it is the right thing to rank labels
-by: a high summit seen edge-on behind a nearer ridge scores low, a modest hill
-alone on the horizon scores high.
+by: a summit standing clear of its neighbours reads as a peak, one on a long
+level ridge does not, however tall it is.
+
+Measured sideways rather than backwards, and not by choice — height above the
+terrain *behind* a peak cannot be known, because that terrain is exactly what a
+skyline peak hides. So it walks out along the skyline each way until the ground
+rises above the summit, and takes the higher of the two lowest points found:
+the same shape as topographic prominence, in degrees.
+
+Typical values are small. From one viewpoint in central Slovakia the visible
+peaks ranged 0.09° to 0.52°, so `min_prominence` around 0.02–0.05 is a
+meaningful filter. Sort by it rather than testing it against a fixed idea of
+what a "prominent" peak scores.
 
 `x` and `y` are fractional — place labels at sub-pixel positions.
 
