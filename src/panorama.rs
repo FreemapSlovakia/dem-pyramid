@@ -319,6 +319,62 @@ struct Column {
     cover: Vec<f32>,
 }
 
+/// Log-spaced distance bins holding the highest ground the marcher saw in
+/// each, per output column.
+///
+/// Dominance asks "what is the highest ground beside this summit, at its own
+/// depth" -- elevation against distance, which is exactly what the marcher
+/// has and used to discard. Recovering it from the rendered depth instead
+/// meant inverting the projection through an angular row, and a row spans
+/// `d * step` of elevation: 210 m at 60 km on the coarse tier against 52 m on
+/// the fine one. Scores moved with quality enough to scramble the ranking --
+/// the top twenty by dominance agreed on seven -- so labels chosen by it were
+/// never going to be stable however stable visibility became.
+///
+/// Bins are log-spaced over the same range as the depth encoding, so a bin is
+/// a fixed *ratio* of distance, matching a neighbourhood that scales with how
+/// far away it is.
+/// 256 spans a factor of 1.042 each. It has to beat the neighbourhood it is
+/// asked about, and that narrows with distance: the band at 60 km is a factor
+/// of 1.105, where 64 bins would have spanned 1.18 -- one slot wider than the
+/// whole question, smearing a summit's neighbours into the range behind it.
+/// 7 MB for a default 360 degrees, 18 MB at the pixel cap.
+const PROFILE_BINS: usize = 256;
+
+struct Profile {
+    /// `PROFILE_BINS` per column, column-major. `NEG_INFINITY` where the
+    /// marcher saw no ground at that depth.
+    max_h: Vec<f32>,
+}
+
+impl Profile {
+    fn new(cols: usize) -> Self {
+        Self {
+            max_h: vec![f32::NEG_INFINITY; cols * PROFILE_BINS],
+        }
+    }
+
+    fn bin_of(d: f64) -> usize {
+        let t = (d.max(DEPTH_NEAR).ln() - DEPTH_NEAR.ln()) / (DEPTH_FAR.ln() - DEPTH_NEAR.ln());
+        ((t.clamp(0.0, 1.0) * (PROFILE_BINS - 1) as f64) as usize).min(PROFILE_BINS - 1)
+    }
+
+    fn record(&mut self, col: usize, d: f64, h: f64) {
+        let slot = &mut self.max_h[col * PROFILE_BINS + Profile::bin_of(d)];
+        *slot = slot.max(h as f32);
+    }
+
+    /// Highest ground in `col` between two distances, or `None` if the
+    /// marcher found none there.
+    fn max_between(&self, col: usize, near: f64, far: f64) -> Option<f64> {
+        let (a, b) = (Profile::bin_of(near), Profile::bin_of(far));
+        let best = self.max_h[col * PROFILE_BINS + a..=col * PROFILE_BINS + b]
+            .iter()
+            .fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+        best.is_finite().then(|| f64::from(best))
+    }
+}
+
 impl Column {
     fn new(h: usize) -> Self {
         Self {
@@ -355,7 +411,13 @@ fn march_ray(
     col: &mut Column,
     probe_d: &[f64],
     probe_h: &mut Vec<f64>,
+    profile: Option<(&mut Profile, usize)>,
 ) -> usize {
+    let (profile, profile_col) = match profile {
+        Some((p, c)) => (Some(p), c),
+        None => (None, 0),
+    };
+    let mut profile = profile;
     probe_h.clear();
     probe_h.resize(probe_d.len(), NO_HORIZON);
     let mut probe_i = 0usize;
@@ -387,6 +449,12 @@ fn march_ray(
 
         if let Some(h) = pyr.sample(z, sx, sy) {
             samples += 1;
+            // Every sample, not just the ones that raise the horizon: ground
+            // hidden behind a nearer crest is still ground beside a summit,
+            // and dominance asks about the landscape, not the silhouette.
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.record(profile_col, d, h);
+            }
             let drop = curvature_drop(d);
             let alpha = ((h - eye - drop) / d).atan().to_degrees();
 
@@ -650,13 +718,9 @@ pub fn encode_depth(d: f64) -> u16 {
     1 + (t.clamp(0.0, 1.0) * 65_534.0).round() as u16
 }
 
-/// Inverse of `encode_depth`. 0 is sky and has no distance.
-pub fn decode_depth(v: u16) -> Option<f64> {
-    (v != 0).then(|| {
-        let t = (v - 1) as f64 / 65_534.0;
-        (DEPTH_NEAR.ln() + t * (DEPTH_FAR.ln() - DEPTH_NEAR.ln())).exp()
-    })
-}
+// The inverse of `encode_depth` lives in docs/API.md, where the client needs
+// it. Nothing here decodes any more: dominance reads elevations the marcher
+// recorded directly, rather than reconstructing them from the picture.
 
 /// Round a depth sample down to a multiple of `step`, never onto the sentinel.
 ///
@@ -725,88 +789,6 @@ impl Cancel {
     }
 }
 
-/// What every peak's dominance walk shares: the frame it reads and the
-/// geometry needed to turn a pixel back into an elevation.
-struct Frame<'a> {
-    depth: &'a image::ImageBuffer<image::Luma<u16>, Vec<u16>>,
-    eye: f64,
-    /// Tangent of each output row's altitude, precomputed per frame.
-    tan_alt: Vec<f64>,
-    /// Every distance the encoding can express, so the walk never calls `exp`.
-    /// 512 KB built once, against a `ln`/`exp` pair per row read otherwise.
-    depth_lut: Vec<f64>,
-}
-
-/// Highest ground *elevation* visible in one column within a distance band, or
-/// `None` if the column holds nothing at that depth.
-///
-/// Elevation, not image altitude, because altitude confounds height with
-/// distance: looking down from a summit, the terrain highest in the frame is
-/// merely the farthest, so an altitude comparison calls every distant thing
-/// higher ground. Inverting the projection removes the distance term and
-/// leaves metres above sea level, which is what "higher ground" has to mean.
-///
-/// The band test runs in encoded space -- the depth encoding is monotone in
-/// distance -- so only rows that pass it are ever decoded. 0 is sky and must
-/// be excluded explicitly: it encodes below every real distance.
-/// The band is a contiguous run of rows, so it is found rather than scanned.
-/// `march_ray` fills a column bottom-up from a running maximum, so distance is
-/// monotone non-increasing down the column with sky as a prefix and no holes
-/// -- taking the nearest of the supersampled block preserves that, and the
-/// encoding is monotone in distance. Verified on a rendered frame: no
-/// inversions and no holes in 1029 sampled columns. Should that fill order
-/// ever change, this silently reads the wrong rows, so it is stated here.
-fn profile_at(f: &Frame, col: u32, band: (u16, u16)) -> Option<f64> {
-    let h = f.depth.height();
-    let at = |row: u32| f.depth.get_pixel(col, row).0[0];
-
-    // First row at or below the far edge, then the first past the near edge.
-    // Sky is 0 and sorts below every distance, so it has to be excluded from
-    // the predicate rather than treated as "very near".
-    let start = partition_point(h, |r| {
-        let v = at(r);
-        v == 0 || v > band.1
-    });
-    let end = partition_point(h, |r| {
-        let v = at(r);
-        v == 0 || v >= band.0
-    });
-
-    let mut best = f64::NEG_INFINITY;
-    for row in start..end {
-        let v = at(row);
-        if v == 0 {
-            continue;
-        }
-        best = best.max(elevation_at_row(f, row, v));
-    }
-    best.is_finite().then_some(best)
-}
-
-/// Elevation of the surface recorded at `row` of a column, metres.
-///
-/// The inverse of what `march_ray` projects, and it has to stay that way or
-/// dominance is measured in a different geometry than visibility was. Reads
-/// the tangent and the distance from tables rather than recomputing them:
-/// this runs once per row of every column the dominance walk touches.
-fn elevation_at_row(f: &Frame, row: u32, v: u16) -> f64 {
-    let d = f.depth_lut[v as usize];
-    f.eye + curvature_drop(d) + d * f.tan_alt[row as usize]
-}
-
-/// Index of the first row in `0..h` where `pred` stops holding.
-///
-/// `slice::partition_point` over a virtual range: the rows live in an
-/// `ImageBuffer` column, not a slice.
-fn partition_point(h: u32, pred: impl Fn(u32) -> bool) -> u32 {
-    let (mut lo, mut hi) = (0u32, h);
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if pred(mid) { lo = mid + 1 } else { hi = mid }
-    }
-    lo
-}
-
 /// How far a summit rises above the terrain beside it *at its own depth*, in
 /// metres.
 ///
@@ -839,7 +821,14 @@ fn partition_point(h: u32, pred: impl Fn(u32) -> bool) -> u32 {
 /// Occlusion makes this a lower bound: a col hidden behind nearer ground reads
 /// as whatever hides it, which is higher, so the figure comes out too small
 /// rather than too large. Under-labelling a peak is the safer failure.
-fn dominance_m(f: &Frame, col: usize, elevation: f64, distance: f64, window: usize) -> f64 {
+fn dominance_m(
+    profile: &Profile,
+    cols: usize,
+    col: usize,
+    elevation: f64,
+    distance: f64,
+    window: usize,
+) -> f64 {
     let radius = DOMINANCE_RADIUS;
     // The neighbourhood is a ball of ground around the summit, so it is as
     // deep as it is wide -- the same radius the column window uses. A ratio
@@ -852,8 +841,8 @@ fn dominance_m(f: &Frame, col: usize, elevation: f64, distance: f64, window: usi
     // ball includes the slope they are standing on, which is higher than the
     // hill and settles both cols at once.
     let band = (
-        encode_depth((distance - radius).max(distance * 0.5)),
-        encode_depth((distance + radius).min(distance * 2.0)),
+        (distance - radius).max(distance * 0.5),
+        (distance + radius).min(distance * 2.0),
     );
     let mut key_col = f64::NEG_INFINITY;
     for dir in [-1isize, 1] {
@@ -861,13 +850,13 @@ fn dominance_m(f: &Frame, col: usize, elevation: f64, distance: f64, window: usi
         let mut c = col as isize;
         for _ in 0..window {
             c += dir;
-            let Ok(c) = u32::try_from(c) else { break };
-            if c >= f.depth.width() {
+            let Ok(c) = usize::try_from(c) else { break };
+            if c >= cols {
                 break;
             }
             // Nothing at this depth: the ridge has ended and we are seeing
             // past it. Not a col -- keep walking, in case it resumes.
-            let Some(s) = profile_at(f, c, band) else {
+            let Some(s) = profile.max_between(c, band.0, band.1) else {
                 continue;
             };
             // Recorded before the break, so a side that rises immediately
@@ -1000,6 +989,7 @@ pub fn render(
         /// Peak index, which bracketing ray this was, and that ray's horizon
         /// angle at the peak's distance.
         answers: Vec<(usize, u8, f64)>,
+        profile: Profile,
     }
     let parts: Vec<ChunkOut> = (0..out_w)
         .step_by(chunk)
@@ -1013,6 +1003,7 @@ pub fn render(
             let mut peak_results: Vec<(usize, u8, f64)> = Vec::new();
             let mut probe_d: Vec<f64> = Vec::new();
             let mut probe_h: Vec<f64> = Vec::new();
+            let mut profile = Profile::new(cols);
             let mut samples = 0usize;
             let mut sky = 0usize;
 
@@ -1036,9 +1027,12 @@ pub fn render(
                     probe_d.clear();
                     probe_d.extend(probes.iter().map(|&(d, _, _)| d));
 
+                    // One profile per output column: the ssx rays inside it
+                    // all contribute, so a narrow gully seen by one ray is not
+                    // lost when its neighbour misses it.
                     samples += march_ray(
                         &mut pyr, p, eye, az, alt_step, sub_h, coarsest, finest, &mut column,
-                        &probe_d, &mut probe_h,
+                        &probe_d, &mut probe_h, Some((&mut profile, local)),
                     );
                     sky += column.dist.iter().filter(|d| d.is_infinite()).count();
 
@@ -1088,6 +1082,7 @@ pub fn render(
                 blocks: pyr.cached_blocks(),
                 sky,
                 answers: peak_results,
+                profile,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1101,6 +1096,7 @@ pub fn render(
     let mut cells = 0usize;
     // Horizon angle from each bracketing ray, per peak.
     let mut horizon = vec![[f64::NAN; 2]; peaks.len()];
+    let mut profile = Profile::new(out_w);
     for part in parts {
         let ChunkOut {
             start,
@@ -1115,6 +1111,8 @@ pub fn render(
             horizon[i][slot as usize] = h;
         }
         let cols = pixels.len() / out_h;
+        profile.max_h[start * PROFILE_BINS..(start + cols) * PROFILE_BINS]
+            .copy_from_slice(&part.profile.max_h);
         cells += cols * sub_h * ssx as usize;
         for orow in 0..out_h {
             for local in 0..cols {
@@ -1150,18 +1148,8 @@ pub fn render(
     // a summit dominates its surroundings, and a fixed angle would ask that
     // over 170 m of ground for a near hill and 12 km for a far one. Clamped
     // because at close range the equivalent angle runs to tens of degrees.
-    let frame = Frame {
-        depth: &depth_img,
-        eye,
-        tan_alt: (0..out_h)
-            .map(|row| (p.alt_max - (row as f64 + 0.5) * p.step_deg).to_radians().tan())
-            .collect(),
-        depth_lut: (0..=u16::MAX)
-            .map(|v| decode_depth(v).unwrap_or(0.0))
-            .collect(),
-    };
     // Parallel like the marching it follows. Peaks are independent -- each
-    // writes only its own dominance and reads only the shared frame -- and the
+    // writes only its own dominance and reads only the shared profile -- and the
     // 20-degree window applies to everything within 8 km, so a viewpoint
     // ringed by close summits can otherwise spend longer here, on one core,
     // than the whole render took on all of them. It holds the render permit
@@ -1177,7 +1165,7 @@ pub fn render(
                     .to_degrees()
                     .clamp(1.0, 20.0);
                 let window = (span / p.step_deg).round() as usize;
-                dominance_m(&frame, out_col, ele, pk.distance, window)
+                dominance_m(&profile, out_w, out_col, ele, pk.distance, window)
             }
             _ => 0.0,
         };

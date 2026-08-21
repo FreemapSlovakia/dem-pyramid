@@ -232,15 +232,21 @@ against the horizon it already tracks, rather than read back out of the
 finished image. Across `step` 0.2→0.05 and `supersample_x` 1→9 the same
 viewpoint returns 765–778 peaks, agreeing on all but ~1% of the set.
 
-**`dominance` values are not yet stable across quality**, so a fixed
-`min_dominance` still admits different numbers per tier — 122 peaks at
-`step: 0.2` against 84 at `0.05` on that viewpoint, and the top-20 by
-dominance agree on only 7. Dominance is measured from the depth image, whose
-angular row height is `step`, and at 60 km one row spans 210 m of elevation at
-`step: 0.2` against 52 m at `0.05`. Until that is measured at fixed
-resolution, **pin `step` for label ranking** if you need a stable set, and
-prefer `max_peaks` over a `min_dominance` threshold — neither is stable yet,
-but the cap at least bounds how many labels you draw. This is not a filter bug — if you
+**`dominance` values still move with quality**, and cannot fully stop while
+they are measured from the render. The marcher is the only thing that knows
+the terrain, and at `step: 0.2` it casts 1,800 rays where `0.05` casts 64,800
+— the coarse tier simply cannot see what lies between its rays, so its
+neighbourhood samples are sparser and its scores come out higher. Across those
+two tiers the median score differs by 8 m, the 90th percentile by 77 m, and
+the top-20 by dominance agree on about half.
+
+So **pin `step` when the label set must be stable** — for a pannable panorama,
+fetch peaks once at a fixed `step` and vary quality only for the image.
+
+Making this exact needs dominance to stop being a render-time measurement: true
+topographic prominence is a property of the summit, computable once from the
+DEM at ingest and stored with the peak. That would be perfectly stable, free
+per request, and is the intended direction. This is not a filter bug — if you
 need a stable set across zoom levels, pin `step` for the peak query.
 
 Metres, not degrees, because degrees are not comparable across distance: a 2 km
