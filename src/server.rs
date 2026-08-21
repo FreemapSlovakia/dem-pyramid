@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use crate::config::Doc;
 use crate::panorama::Cancel;
-use crate::queue::Queue;
+use crate::queue::{Queue, Rejected};
 use crate::{panorama, peaks};
 
 /// Caps on what a single request may cost. Not entitlement -- that belongs to
@@ -40,6 +40,12 @@ const MIN_STEP: f64 = 0.02;
 pub struct Request {
     lon: f64,
     lat: f64,
+    /// Accepted only to warn about it. Priority moved to the `X-Priority`
+    /// header because a body field cannot be overridden by the proxy; a caller
+    /// still sending it here would otherwise have every premium user silently
+    /// served at priority 0, with nothing to show why.
+    #[serde(default)]
+    priority: Option<i32>,
     #[serde(default = "d_az")]
     az: f64,
     #[serde(default = "d_fov")]
@@ -148,14 +154,42 @@ async fn panorama_route(
     headers: header::HeaderMap,
     Json(req): Json<Request>,
 ) -> Response {
-    let step = req.step.max(MIN_STEP);
-    let fov = req.fov.clamp(0.1, 360.0);
+    if req.priority.is_some() {
+        eprintln!(
+            "warning: request carried a body `priority` field, which is ignored; \
+             set the X-Priority header instead"
+        );
+    }
+
+    // Validate before arithmetic. `as usize` saturates rather than failing and
+    // the product then wraps in release, so an absurd alt range sails past the
+    // pixel limit and reaches the allocator -- one request aborting the
+    // process on a service that is otherwise carefully bounded.
+    for (name, v) in [
+        ("lon", req.lon),
+        ("lat", req.lat),
+        ("az", req.az),
+        ("fov", req.fov),
+        ("step", req.step),
+        ("alt_min", req.alt_min),
+        ("alt_max", req.alt_max),
+    ] {
+        if !v.is_finite() {
+            return bad(format!("{name} must be a finite number"));
+        }
+    }
+    if !(-90.0..=90.0).contains(&req.alt_min) || !(-90.0..=90.0).contains(&req.alt_max) {
+        return bad("alt_min and alt_max must lie within -90..90");
+    }
     if req.alt_max <= req.alt_min {
         return bad("alt_max must exceed alt_min");
     }
+
+    let step = req.step.max(MIN_STEP);
+    let fov = req.fov.clamp(0.1, 360.0);
     let width = (fov / step) as usize;
     let height = ((req.alt_max - req.alt_min) / step) as usize;
-    if width * height > MAX_PIXELS {
+    if width.checked_mul(height).is_none_or(|n| n > MAX_PIXELS) {
         return bad(format!(
             "{width}x{height} exceeds the {MAX_PIXELS} pixel limit; raise step or narrow fov"
         ));
@@ -193,12 +227,18 @@ async fn panorama_route(
     let cancel = Cancel::default();
     let guard = Guard(cancel.clone());
 
-    let Ok((permit, queued)) = ctx.queue.acquire(priority_of(&headers)).await else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "render queue is full; try again shortly",
-        )
-            .into_response();
+    let (permit, queued) = match ctx.queue.acquire(priority_of(&headers)).await {
+        Ok(v) => v,
+        Err(Rejected::Full) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "render queue is full; try again shortly",
+            )
+                .into_response();
+        }
+        Err(Rejected::ShuttingDown) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, "shutting down").into_response();
+        }
     };
 
     // Rendering is CPU-bound and blocking; keep it off the async runtime.
@@ -220,15 +260,7 @@ async fn panorama_route(
         // what keeps "one render at a time" true.
         let _permit = permit;
         let cancel = render_cancel;
-        let started = std::time::Instant::now();
-        let (img, stats) = panorama::render(&root, &doc, &p, &cancel).inspect_err(|_| {
-            if cancel.is_cancelled() {
-                eprintln!(
-                    "render abandoned after {:.1} s: client hung up",
-                    started.elapsed().as_secs_f64()
-                );
-            }
-        })?;
+        let (img, stats) = panorama::render(&root, &doc, &p, &cancel)?;
 
         let mut found = Vec::new();
         if want_peaks {
@@ -300,7 +332,17 @@ async fn panorama_route(
         }
         Ok(parts)
     })
-    .await;
+    .await
+    // Log inside the task, around the whole of it: peak resolution can be
+    // cancelled too, and once the client has hung up nothing after the await
+    // runs, so this is the only place any of it can be observed.
+    .inspect(|outcome| {
+        if let Err(e) = outcome {
+            if cancel.is_cancelled() {
+                eprintln!("render abandoned: client hung up ({e})");
+            }
+        }
+    });
 
     // Only reachable while the client is still connected: if it hangs up, axum
     // drops this future and none of the code below runs. Cancellation is

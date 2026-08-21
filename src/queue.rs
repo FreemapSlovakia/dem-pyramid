@@ -21,9 +21,15 @@ use tokio::sync::oneshot;
 /// request ten points above it after fifty seconds.
 const AGE_PER_SECOND: f64 = 0.2;
 
-/// Refuse rather than accept work that will not be reached in any reasonable
-/// time. Each entry is seconds of nine cores.
-pub const MAX_QUEUE: usize = 32;
+/// Refuse rather than accept work that will not be reached in time.
+///
+/// Sized against the proxy, not picked round: renders take roughly 25 s and
+/// nothing is sent upstream until one finishes, so with nginx's 300 s
+/// `proxy_read_timeout` only about a dozen waiters can be served before the
+/// connection is cut. Admitting more guarantees a 504 after five minutes of
+/// holding a slot -- worse for the client than an immediate 503, and exactly
+/// what this cap exists to prevent.
+pub const MAX_QUEUE: usize = 10;
 
 struct Waiter {
     priority: i32,
@@ -58,8 +64,12 @@ pub struct Queue(Arc<Mutex<Inner>>);
 /// including on panic, early return, or never being delivered at all.
 pub struct Permit(Queue);
 
-/// Nobody will get to this request in a sensible time.
-pub struct QueueFull;
+pub enum Rejected {
+    /// Nobody will get to this request in a sensible time.
+    Full,
+    /// The queue itself is going away.
+    ShuttingDown,
+}
 
 impl Queue {
     pub fn new() -> Self {
@@ -73,16 +83,25 @@ impl Queue {
     /// in progress -- a caller who arrives to a busy service with nobody
     /// queued still waits a full render, and reporting 0 there would tell the
     /// client the opposite of the truth.
-    pub async fn acquire(&self, priority: i32) -> Result<(Permit, usize), QueueFull> {
+    pub async fn acquire(&self, priority: i32) -> Result<(Permit, usize), Rejected> {
         let (rx, depth) = {
             let mut inner = self.0.lock().unwrap();
+
+            // Drop waiters that have hung up. Their futures are gone, but the
+            // entries survive until the next release() scan -- which only
+            // happens when the current render ends. Clients are told to abort
+            // and resubmit whenever the user reframes, so without this the
+            // queue fills with corpses within seconds and starts refusing work
+            // while genuinely idle.
+            inner.waiting.retain(|w| !w.wake.is_closed());
+
             let depth = inner.waiting.len() + usize::from(inner.busy);
             if !inner.busy {
                 inner.busy = true;
                 return Ok((Permit(self.clone()), depth));
             }
             if inner.waiting.len() >= MAX_QUEUE {
-                return Err(QueueFull);
+                return Err(Rejected::Full);
             }
             let (tx, rx) = oneshot::channel();
             let seq = inner.next_seq;
@@ -98,8 +117,7 @@ impl Queue {
 
         match rx.await {
             Ok(permit) => Ok((permit, depth)),
-            // The queue is going away; nothing to wait for.
-            Err(_) => Err(QueueFull),
+            Err(_) => Err(Rejected::ShuttingDown),
         }
     }
 
