@@ -8,9 +8,19 @@ POST /panorama      Content-Type: application/json
 GET  /health        -> "ok"
 ```
 
-The service is deliberately policy-free. Its limits bound how much work one
-request can demand, not who may demand it — a proxy in front decides what each
-user is allowed to ask for.
+## Where it runs
+
+`dem-pyramid serve` on fm6, bound to `127.0.0.1:3100` — loopback only, not
+reachable from outside the host.
+
+**Clients do not call it directly.** The service is deliberately policy-free:
+its limits bound how much work one request can demand, not who may demand it.
+`freemap-v3-api` proxies it and clamps quality per user, the same way it
+already gates elevation sources on `premiumExpiration` — for example
+`supersample 3` / `step 0.1` for anonymous users and `9` / `0.05` for premium.
+
+Renders are serialised server-side (one at a time by default), so the proxy
+should expect to queue.
 
 ## Request
 
@@ -244,3 +254,15 @@ radius to 0 to disable, and expect summit views to suffer.
 **Sub-pixel viewpoint accuracy matters on peaks.** A few metres off a summit
 can place terrain above the eye. When a user taps a named peak, resolve to the
 local maximum rather than passing the tapped coordinate through.
+
+**A 360° image is 7200 px wide** at the default step, which can exceed texture
+and canvas limits on older mobile GPUs. Either request `step: 0.1` (3600 px) or
+split the image client-side.
+
+## Not implemented yet
+
+- **Sun path** — the data is there in the distance buffer, the projection is not
+  written.
+- **Caching or precomputation** — every request renders from scratch, which is
+  why latency is seconds. Plan the UI around an explicit action with progress
+  rather than something firing on map movement.
