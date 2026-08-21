@@ -42,7 +42,7 @@ All fields except `lon` and `lat` are optional.
 | `depth` | bool | `false` | include the distance buffer |
 | `depth_step` | int | `4` | depth quantisation; see [Depth](#depth) |
 | `peaks` | bool | `true` | include peak labels |
-| `min_prominence` | number | `30` | drop peaks standing less than this above their surroundings, metres |
+| `min_prominence` | number | `30` | drop peaks standing less than this above their surroundings, metres; may be negative |
 | `max_peaks` | int | `0` | keep at most this many, most dominant first; 0 is no cap |
 
 Image dimensions follow from the angles:
@@ -194,7 +194,7 @@ density, and it costs the server nothing.
 | `azimuth` | degrees clockwise from north |
 | `altitude` | degrees above horizontal from the eye, including curvature and refraction |
 | `x`, `y` | position in the image, **output pixels**, origin top-left |
-| `prominence` | **metres** the summit stands above the terrain around it |
+| `prominence` | **metres** the summit stands above the terrain around it, **signed** |
 
 This is what makes a summit worth a label: one standing clear of its
 neighbours reads as a peak, one on a long level ridge does not, however tall
@@ -203,10 +203,24 @@ ground rises above it and taking the higher of the two lowest points — the
 shape of topographic prominence, and close to it in practice: Slavkovský štít
 measures 338 m against a true 370 m, Východná Vysoká 207 m against ~180 m.
 
+**Negative is normal and useful.** A top that never rises clear of its own
+ridge scores how far the ridge stands over it: −37 m for a shoulder, −281 m
+for a bump inside a massif. In ridge country most visible tops are like this —
+from one viewpoint above Krompachy, 167 of 219. They are still real, still
+worth labelling when there is room, and the sign is what lets you order them.
+Rank on the value; do not treat it as a magnitude. `prominence: 0` now means
+only that nothing at the peak's own depth was found to compare it against.
+
 Two honest limits. Where a valley runs alongside a peak rather than a ridge,
 the figure reads the valley depth and comes out high. Where the surrounding
 cols are hidden behind nearer ground it reads whatever hides them, and comes
 out low — under-labelling being the safer failure.
+
+**The peak count depends on render resolution.** Visibility is decided against
+the depth buffer, so a finer `step` resolves more tops: the same viewpoint
+returns ~136 peaks at `step: 0.1` and ~273 at `0.05`. Prominence shifts
+slightly with it too, for the same reason. This is not a filter bug — if you
+need a stable set across zoom levels, pin `step` for the peak query.
 
 Metres, not degrees, because degrees are not comparable across distance: a 2 km
 hill subtends more than the whole High Tatra range and would outrank every
@@ -226,7 +240,10 @@ A distance for every pixel, so the client can answer "how far is that ridge?"
 under the cursor.
 
 Encoding, in order: distance → logarithmic 16-bit → quantised by `depth_step`
-→ delta-coded along each row → gzip. `0` means sky.
+→ delta-coded along each row → gzip. `0` means sky, and **only** sky:
+quantisation never floors real ground onto that sentinel. Ground closer than
+`near_m` saturates at `near_m` rather than reading as sky, so from a normal eye
+height the bottom of the frame is terrain at 10 m, not a hole.
 
 Logarithmic because the useful precision is relative — a metre matters at 200 m
 and is meaningless at 200 km. One unit is 0.0162% of the distance, so

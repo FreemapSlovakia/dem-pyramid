@@ -323,7 +323,17 @@ async fn panorama_route(
                 let mut prev = 0i32;
                 for col in 0..stats.width {
                     let v = stats.depth.get_pixel(col as u32, row as u32)[0];
-                    let q = if v == 0 { 0 } else { (v / depth_step) * depth_step };
+                    // Floored to a multiple of depth_step, but never onto 0 --
+                    // that is the sky sentinel, and integer division sent
+                    // every value below depth_step there. Ground within 10 m
+                    // encodes as 1, so from a normal eye height the bottom of
+                    // the frame is full of it: half the last row was being
+                    // handed to the client as sky.
+                    let q = if v == 0 {
+                        0
+                    } else {
+                        ((v / depth_step) * depth_step).max(depth_step)
+                    };
                     raw.extend_from_slice(&((i32::from(q) - prev) as i16).to_le_bytes());
                     prev = i32::from(q);
                 }

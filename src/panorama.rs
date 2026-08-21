@@ -725,6 +725,14 @@ fn profile_at(f: &Frame, col: u32, band: (u16, u16)) -> Option<f64> {
 /// and a distant range while an angle does not -- a 2 km hill would otherwise
 /// outrank every summit in the Tatras.
 ///
+/// Signed. A top that never rises clear of its ridge returns how far the ridge
+/// stands *over* it, negative. Clamping those to zero looked tidy and cost the
+/// client the whole near field: in ridge country 60% of visible peaks never
+/// stand clear of anything, so they all tied at zero and could not be ordered
+/// at all -- exactly where a panorama most needs to choose which names to
+/// show. Zero now means only that nothing at the peak's own depth was found to
+/// compare against.
+///
 /// Occlusion makes this a lower bound: a col hidden behind nearer ground reads
 /// as whatever hides it, which is higher, so prominence comes out too small
 /// rather than too large. Under-labelling a peak is the safer failure.
@@ -759,19 +767,24 @@ fn prominence_m(f: &Frame, col: usize, elevation: f64, distance: f64, window: us
             let Some(s) = profile_at(f, c, band) else {
                 continue;
             };
+            // Recorded before the break, so a side that rises immediately
+            // still contributes. `lowest` is a minimum, so this only ever
+            // matters when higher ground was the *first* thing found -- a top
+            // inside a massif -- and it is what lets the result go negative
+            // instead of tying at zero with every other such top.
+            lowest = lowest.min(s);
             if s > elevation {
                 break; // higher ground at this depth: this side's col is settled
             }
-            lowest = lowest.min(s);
         }
         if lowest.is_finite() {
             key_col = key_col.max(lowest);
         }
     }
     if key_col.is_finite() {
-        (elevation - key_col).max(0.0)
+        elevation - key_col
     } else {
-        0.0
+        0.0 // nothing at this peak's depth to compare it against
     }
 }
 

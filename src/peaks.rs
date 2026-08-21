@@ -37,8 +37,8 @@ pub struct Peak {
     pub y: f64,
     pub visible: bool,
     /// How far the summit stands above the terrain beside it at its own depth,
-    /// in metres. Measured from what the render saw, so it is a lower bound
-    /// where the surrounding cols are hidden.
+    /// in metres, negative where its own ridge stands over it. Measured from
+    /// what the render saw, so it is a lower bound where the cols are hidden.
     pub prominence: f64,
 
     /// Output column, used while rendering; not part of the API.
