@@ -360,7 +360,12 @@ fn main() -> Result<()> {
             let t0 = std::time::Instant::now();
             // Nothing cancels a CLI render; the flag exists for the server.
             let cancel = panorama::Cancel::default();
-            let (img, stats) = panorama::render(&cli.root, &doc, &p, &cancel)?;
+            let mut cands = match &peaks_path {
+                Some(src) => peaks::load(src, lon, lat, range)?,
+                None => Vec::new(),
+            };
+            let found = cands.len();
+            let (img, stats) = panorama::render(&cli.root, &doc, &p, &cancel, &mut cands)?;
             let elapsed = t0.elapsed();
             img.save(&out)
                 .with_context(|| format!("writing {}", out.display()))?;
@@ -444,14 +449,10 @@ fn main() -> Result<()> {
                 println!("wrote      {}", rpath.display());
             }
 
-            if let Some(src) = peaks_path {
-                let t1 = std::time::Instant::now();
-                let mut cands = peaks::load(&src, lon, lat, range)?;
-                let found = cands.len();
-                let rays = panorama::resolve_peaks(&cli.root, &doc, &p, &mut cands, &cancel)?;
-
+            if peaks_path.is_some() {
                 // In frame, not hidden, and standing far enough above what is
-                // behind it to be worth a label.
+                // behind it to be worth a label. Visibility was decided during
+                // the render, from the columns it marched anyway.
                 cands.retain(|k| {
                     k.visible
                         && k.column >= 0
@@ -467,9 +468,8 @@ fn main() -> Result<()> {
                     &cands,
                 )?;
                 println!(
-                    "peaks      {found} in range, {} labelled, {rays} rays, {:.2} s",
-                    cands.len(),
-                    t1.elapsed().as_secs_f64()
+                    "peaks      {found} in range, {} labelled, no extra rays",
+                    cands.len()
                 );
                 println!("wrote      {}", dst.display());
             }

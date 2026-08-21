@@ -260,24 +260,22 @@ async fn panorama_route(
         // what keeps "one render at a time" true.
         let _permit = permit;
         let cancel = render_cancel;
-        let (img, stats) = panorama::render(&root, &doc, &p, &cancel)?;
+        // Candidates go in before marching, so the render answers them from
+        // the columns it produces anyway.
+        let mut found = match (want_peaks, &peaks_file) {
+            (true, Some(pf)) => peaks::load(pf, p.lon, p.lat, p.max_range)?,
+            _ => Vec::new(),
+        };
+        let (img, stats) = panorama::render(&root, &doc, &p, &cancel, &mut found)?;
 
-        let mut found = Vec::new();
-        if want_peaks {
-            if let Some(pf) = &peaks_file {
-                let mut cands = peaks::load(pf, p.lon, p.lat, p.max_range)?;
-                panorama::resolve_peaks(&root, &doc, &p, &mut cands, &cancel)?;
-                cands.retain(|k| {
-                    k.visible
-                        && k.column >= 0
-                        && k.prominence >= min_prom
-                        && k.y >= 0.0
-                        && k.y <= stats.height as f64
-                });
-                cands.sort_by(|a, b| b.prominence.partial_cmp(&a.prominence).unwrap());
-                found = cands;
-            }
-        }
+        found.retain(|k| {
+            k.visible
+                && k.column >= 0
+                && k.prominence >= min_prom
+                && k.y >= 0.0
+                && k.y <= stats.height as f64
+        });
+        found.sort_by(|a, b| b.prominence.partial_cmp(&a.prominence).unwrap());
 
         let meta = serde_json::json!({
             "width": stats.width,

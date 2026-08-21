@@ -22,6 +22,7 @@ use gdal::Dataset;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::config::{Doc, ground_res};
 use crate::grid::lonlat_to_merc;
@@ -579,135 +580,6 @@ fn viewpoint_elevation(pyr: &mut Pyramid, p: &Params) -> Result<f64> {
     Ok(best)
 }
 
-/// Project peaks and decide which are visible.
-///
-/// Independent of rendering -- no image is needed, so this also answers "what
-/// can be seen from here" on its own. Peaks are bucketed by azimuth and one
-/// ray is marched per occupied bucket, which bounds the work by the number of
-/// distinct bearings rather than by the number of peaks.
-pub fn resolve_peaks(
-    root: &Path,
-    doc: &Doc,
-    p: &Params,
-    peaks: &mut [Peak],
-    cancel: &Cancel,
-) -> Result<usize> {
-    let (coarsest, finest) = (doc.grid.coarsest_level, doc.grid.finest_level);
-    let mut pyr = Pyramid::open(root, doc)?;
-    let eye = viewpoint_elevation(&mut pyr, p)? + p.eye_height;
-
-    // Geometry first: distance, bearing, DTM elevation, and where each lands.
-    for pk in peaks.iter_mut() {
-        pk.distance = great_circle(p.lon, p.lat, pk.lon, pk.lat);
-        pk.azimuth = initial_bearing(p.lon, p.lat, pk.lon, pk.lat);
-        let (mx, my) = lonlat_to_merc(pk.lon, pk.lat);
-        pk.ele = pyr.sample_finest(mx, my);
-
-        let h = pk.ele.unwrap_or(f64::NEG_INFINITY);
-        let drop = pk.distance * pk.distance * (1.0 - REFRACTION_K) / (2.0 * EARTH_R);
-        pk.altitude = ((h - eye - drop) / pk.distance).atan().to_degrees();
-
-        let off = (pk.azimuth - p.az_start).rem_euclid(360.0);
-        pk.x = off / p.step_deg;
-        pk.y = (p.alt_max - pk.altitude) / p.step_deg;
-        pk.column = if off <= p.az_span { pk.x.floor() as isize } else { -1 };
-    }
-
-    // Bucket by the ray we would cast, then walk each bucket's peaks outward
-    // in distance against a single running maximum.
-    let mut order: Vec<usize> = (0..peaks.len()).filter(|&i| peaks[i].ele.is_some()).collect();
-    order.sort_by(|&a, &b| {
-        peaks[a]
-            .azimuth
-            .partial_cmp(&peaks[b].azimuth)
-            .unwrap()
-            .then(peaks[a].distance.partial_cmp(&peaks[b].distance).unwrap())
-    });
-
-    // Group into rays. A bucket wider than one output pixel would merge peaks
-    // that render apart, so the bucket is the pixel.
-    let bucket_deg = p.step_deg;
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    let mut i = 0;
-    while i < order.len() {
-        let az0 = peaks[order[i]].azimuth;
-        let mut j = i;
-        while j < order.len() && peaks[order[j]].azimuth - az0 < bucket_deg {
-            j += 1;
-        }
-        groups.push(order[i..j].to_vec());
-        i = j;
-    }
-
-    let geometry: Vec<(f64, f64)> = peaks.iter().map(|k| (k.azimuth, k.distance)).collect();
-
-    // Chunked, not one task per bucket: opening a pyramid means opening seven
-    // GTI datasets and starting with a cold block cache, so doing it per
-    // bucket costs far more than the marching it parallelises.
-    let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
-    let chunk = groups.len().div_ceil(threads).max(1);
-
-    let results: Vec<Vec<(usize, f64, f64)>> = groups
-        .par_chunks(chunk)
-        .map(|chunk_groups| -> Result<Vec<(usize, f64, f64)>> {
-            let mut pyr = Pyramid::open(root, doc)?;
-            let mut out = Vec::new();
-            for group in chunk_groups {
-            cancel.check()?;
-            let az = geometry[group[0]].0 + bucket_deg / 2.0;
-
-            // One pass outward: the running maximum before a peak decides
-            // whether it is visible, and the maximum beyond it is what the
-            // peak stands above.
-            let mut max_before = vec![f64::NEG_INFINITY; group.len()];
-            let mut max_after = vec![f64::NEG_INFINITY; group.len()];
-            let mut running = f64::NEG_INFINITY;
-
-            let mut d = ground_res(finest, p.lat);
-            while d < p.max_range {
-                let z = level_for(d, p.lat, coarsest, finest);
-                let step = ground_res(z, p.lat);
-                let (lon, lat) = destination(p.lon, p.lat, az, d);
-                let (sx, sy) = lonlat_to_merc(lon, lat);
-
-                if let Some(h) = pyr.sample(z, sx, sy) {
-                    let drop = d * d * (1.0 - REFRACTION_K) / (2.0 * EARTH_R);
-                    let alpha = ((h - eye - drop) / d).atan().to_degrees();
-                    running = running.max(alpha);
-                    for (k, &idx) in group.iter().enumerate() {
-                        if d < geometry[idx].1 {
-                            max_before[k] = running;
-                        } else if d > geometry[idx].1 * 1.05 {
-                            max_after[k] = max_after[k].max(alpha);
-                        }
-                    }
-                }
-                d += step;
-            }
-
-            out.extend(
-                group
-                    .iter()
-                    .enumerate()
-                    .map(|(k, &idx)| (idx, max_before[k], max_after[k])),
-            );
-            }
-            Ok(out)
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    // A tolerance of a fifth of a pixel: at its own summit the peak *is* the
-    // terrain, so it ties with the running maximum rather than beating it.
-    let tol = p.step_deg * 0.2;
-    for group in results {
-        for (idx, before, after) in group {
-            peaks[idx].visible = peaks[idx].altitude + tol >= before;
-            peaks[idx].prominence = (peaks[idx].altitude - after).max(0.0);
-        }
-    }
-
-    Ok(groups.len())
-}
 
 /// Render the panorama, streaming one output column at a time.
 ///
@@ -756,19 +628,81 @@ impl Cancel {
     }
 }
 
+/// Is a peak visible, judged from the column its bearing falls in?
+///
+/// No extra rays: the column already says how far the visible surface is at
+/// every angle, so the peak is visible exactly when nothing nearer occupies
+/// its cell.
+fn peak_is_visible(
+    altitude: f64,
+    distance: f64,
+    col: &Column,
+    p: &Params,
+    alt_step: f64,
+    height: usize,
+) -> bool {
+    let row = ((p.alt_max - altitude) / alt_step).floor();
+    if row < 0.0 || row >= height as f64 {
+        return false;
+    }
+    // A summit is its own terrain, so it ties with the surface rather than
+    // beating it; allow a little slack.
+    let tolerance = 1.0 - p.step_deg * 0.002;
+    match col.dist[row as usize] {
+        // Pokes into sky: sharper than the averaged DEM the ray walked.
+        d if !d.is_finite() => true,
+        d => d >= distance * tolerance,
+    }
+}
+
+/// How far a summit rises above the skyline to either side of it, in degrees.
+///
+/// The obvious measure -- height above the terrain *behind* the peak -- cannot
+/// come from the distance buffer, because terrain behind a skyline peak is
+/// exactly what the peak hides. Measuring sideways is both computable and a
+/// truer statement of what makes a summit worth labelling: one standing clear
+/// of its neighbours reads as a peak, one on a long level ridge does not.
+///
+/// Follows topographic prominence in shape: walk out each way to the col where
+/// the skyline rises above the summit, and take the higher of the two lowest
+/// points found.
+fn angular_prominence(skyline: &[f64], col: usize, altitude: f64, window: usize) -> f64 {
+    let mut key_col = f64::NEG_INFINITY;
+    for dir in [-1isize, 1] {
+        let mut lowest = f64::INFINITY;
+        let mut c = col as isize;
+        for _ in 0..window {
+            c += dir;
+            let Some(&s) = usize::try_from(c).ok().and_then(|c| skyline.get(c)) else {
+                break;
+            };
+            if s > altitude {
+                break; // higher ground: this side's col is settled
+            }
+            if s.is_finite() {
+                lowest = lowest.min(s);
+            }
+        }
+        if lowest.is_finite() {
+            key_col = key_col.max(lowest);
+        }
+    }
+    if key_col.is_finite() {
+        (altitude - key_col).max(0.0)
+    } else {
+        0.0
+    }
+}
+
 pub fn render(
     root: &Path,
     doc: &Doc,
     p: &Params,
     cancel: &Cancel,
+    peaks: &mut [Peak],
 ) -> Result<(image::RgbImage, Stats)> {
     let (coarsest, finest) = (doc.grid.coarsest_level, doc.grid.finest_level);
     let (ssx, ssy) = (p.supersample_x.max(1), p.supersample_y.max(1));
-
-    let eye = {
-        let mut pyr = Pyramid::open(root, doc)?;
-        viewpoint_elevation(&mut pyr, p)? + p.eye_height
-    };
 
     let out_w = (p.az_span / p.step_deg).round() as usize;
     let out_h = ((p.alt_max - p.alt_min) / p.step_deg).round() as usize;
@@ -776,12 +710,69 @@ pub fn render(
     let az_step = p.step_deg / f64::from(ssx);
     let alt_step = p.step_deg / f64::from(ssy);
 
+    // Eye elevation, and the peak geometry that depends on it, before any
+    // marching. Peaks are then answered from the columns the render produces
+    // anyway -- resolving them with their own rays cost more than the whole
+    // image did.
+    let eye = {
+        let mut pyr = Pyramid::open(root, doc)?;
+        let eye = viewpoint_elevation(&mut pyr, p)? + p.eye_height;
+        for pk in peaks.iter_mut() {
+            pk.distance = great_circle(p.lon, p.lat, pk.lon, pk.lat);
+            pk.azimuth = initial_bearing(p.lon, p.lat, pk.lon, pk.lat);
+            let (mx, my) = lonlat_to_merc(pk.lon, pk.lat);
+
+            // At the level the marcher uses for that distance, not the finest.
+            // Correctness first: a summit read at z14 but compared against
+            // terrain the ray sampled at z9 looks artificially sharp and can
+            // report as visible when it is not. It is also far cheaper -- tens
+            // of thousands of scattered peaks each pull their own z14 block,
+            // where coarse levels cover enough ground to share them.
+            let z = level_for(pk.distance, p.lat, coarsest, finest);
+            pk.ele = pyr.sample(z, mx, my);
+
+            let h = pk.ele.unwrap_or(f64::NEG_INFINITY);
+            let drop = pk.distance * pk.distance * (1.0 - REFRACTION_K) / (2.0 * EARTH_R);
+            pk.altitude = ((h - eye - drop) / pk.distance).atan().to_degrees();
+
+            let off = (pk.azimuth - p.az_start).rem_euclid(360.0);
+            pk.x = off / p.step_deg;
+            pk.y = (p.alt_max - pk.altitude) / p.step_deg;
+            pk.column = if off <= p.az_span && pk.ele.is_some() {
+                (off / az_step).floor() as isize // sub-column, not output column
+            } else {
+                -1
+            };
+        }
+        eye
+    };
+
+    // Which peaks belong to which ray.
+    let mut by_sub: HashMap<isize, Vec<usize>> = HashMap::new();
+    for (i, pk) in peaks.iter().enumerate() {
+        if pk.column >= 0 {
+            by_sub.entry(pk.column).or_default().push(i);
+        }
+    }
+    let by_sub = Arc::new(by_sub);
+    let peak_geom: Vec<(f64, f64)> = peaks.iter().map(|k| (k.altitude, k.distance)).collect();
+
     let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let chunk = out_w.div_ceil(threads).max(1);
 
     // Chunked so each worker opens the pyramid once and keeps its block cache
     // warm across the columns it owns.
-    let parts: Vec<(usize, Vec<[u8; 3]>, Vec<u16>, usize, usize, usize)> = (0..out_w)
+    type ChunkOut = (
+        usize,
+        Vec<[u8; 3]>,
+        Vec<u16>,
+        usize,
+        usize,
+        usize,
+        Vec<(usize, bool)>,
+        Vec<f64>,
+    );
+    let parts: Vec<ChunkOut> = (0..out_w)
         .step_by(chunk)
         .collect::<Vec<_>>()
         .into_par_iter()
@@ -790,6 +781,8 @@ pub fn render(
             let mut pyr = Pyramid::open(root, doc)?;
             let mut pixels = vec![[0u8; 3]; cols * out_h];
             let mut depth = vec![0u16; cols * out_h];
+            let mut peak_results: Vec<(usize, bool)> = Vec::new();
+            let mut skyline = vec![f64::NEG_INFINITY; cols];
             let mut samples = 0usize;
             let mut sky = 0usize;
 
@@ -811,6 +804,24 @@ pub fn render(
                         &mut pyr, p, eye, az, alt_step, sub_h, coarsest, finest, &mut column,
                     );
                     sky += column.dist.iter().filter(|d| d.is_infinite()).count();
+
+                    // Peaks whose bearing falls in this exact ray.
+                    if let Some(idxs) = by_sub.get(&((oc * ssx as usize + k as usize) as isize)) {
+                        for &i in idxs {
+                            let (altitude, distance) = peak_geom[i];
+                            let vis =
+                                peak_is_visible(altitude, distance, &column, p, alt_step, sub_h);
+                            peak_results.push((i, vis));
+                        }
+                    }
+
+                    // Skyline angle for this column, for prominence later.
+                    if let Some(r) = (0..sub_h).find(|&r| column.dist[r].is_finite()) {
+                        let a = p.alt_max - (r as f64 + 0.5) * alt_step;
+                        if a > skyline[local] {
+                            skyline[local] = a;
+                        }
+                    }
 
                     // Depth takes the nearest sub-sample rather than the mean:
                     // averaging across a silhouette would report a distance at
@@ -846,7 +857,16 @@ pub fn render(
                 }
             }
 
-            Ok((start, pixels, depth, samples, pyr.cached_blocks(), sky))
+            Ok((
+                start,
+                pixels,
+                depth,
+                samples,
+                pyr.cached_blocks(),
+                sky,
+                peak_results,
+                skyline,
+            ))
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -857,10 +877,15 @@ pub fn render(
     let mut blocks = 0usize;
     let mut sky = 0usize;
     let mut cells = 0usize;
-    for (start, pixels, depth, n, b, s) in parts {
+    let mut skyline = vec![f64::NEG_INFINITY; out_w];
+    for (start, pixels, depth, n, b, s, answers, sky_chunk) in parts {
         samples += n;
         blocks += b;
         sky += s;
+        for (i, visible) in answers {
+            peaks[i].visible = visible;
+        }
+        skyline[start..start + sky_chunk.len()].copy_from_slice(&sky_chunk);
         let cols = pixels.len() / out_h;
         cells += cols * sub_h * ssx as usize;
         for orow in 0..out_h {
@@ -874,6 +899,19 @@ pub fn render(
                 );
             }
         }
+    }
+
+    // Prominence needs the whole skyline, so it waits until the columns are
+    // merged. Bounded to five degrees either side: beyond that the comparison
+    // stops being about this summit and starts being about the range.
+    let window = (5.0 / p.step_deg).round() as usize;
+    for pk in peaks.iter_mut() {
+        pk.prominence = if pk.visible && pk.column >= 0 {
+            let out_col = (pk.column as usize / ssx as usize).min(out_w.saturating_sub(1));
+            angular_prominence(&skyline, out_col, pk.altitude, window)
+        } else {
+            0.0
+        };
     }
 
     Ok((
