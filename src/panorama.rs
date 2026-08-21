@@ -1310,15 +1310,22 @@ fn sky_colour(alt: f64) -> (f64, f64, f64) {
 /// eye to find the grid and read it as structure. Deterministic all the same,
 /// so a given pixel always dithers identically and renders stay reproducible.
 fn dither(x: usize, y: usize) -> f64 {
-    // Two decorrelated uniforms; their difference is triangular on [-1, 1].
-    let mut h = (x as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        ^ (y as u64).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
-    h ^= h >> 29;
-    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    h ^= h >> 32;
-    let a = (h & 0xff_ffff) as f64 / f64::from(0xff_ffffu32);
-    let b = ((h >> 32) & 0xff_ffff) as f64 / f64::from(0xff_ffffu32);
-    a - b
+    // Interleaved gradient noise: cheap, and its energy sits at high spatial
+    // frequencies where the eye is least sensitive. A plain hash is white
+    // noise, which carries just as much energy at low frequencies -- and
+    // low-frequency noise laid over a slow gradient reads as soft mottling,
+    // which is banding by another name.
+    fn ign(x: f64, y: f64) -> f64 {
+        let v = 0.067_110_56 * x + 0.005_837_15 * y;
+        (52.982_918_9 * v.fract()).fract()
+    }
+    // Differenced against a second sample to make it triangular, which is what
+    // stops the visible dither strength pulsing as the ramp crosses each level
+    // boundary. The axes are swapped and rescaled rather than offset: IGN is a
+    // function of one linear combination of x and y, so shifting both merely
+    // slides the same noise and the difference collapses towards zero.
+    let (x, y) = (x as f64, y as f64);
+    ign(x, y) - ign(y * 1.7 + 11.0, x * 0.9 + 23.0)
 }
 
 fn lerp(a: f64, b: f64, t: f64) -> f64 {
