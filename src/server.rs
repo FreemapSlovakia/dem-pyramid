@@ -90,6 +90,9 @@ pub struct Request {
     /// Multiplier on the ridge silhouettes; 0 removes them.
     #[serde(default = "d_ridge_strength")]
     ridge_strength: f64,
+    /// Stroke thickness in output pixels.
+    #[serde(default = "d_ridge_width")]
+    ridge_width: f64,
     /// `#rrggbb` for the silhouettes; black by default, which reads as shading.
     #[serde(default)]
     ridge_color: Option<String>,
@@ -111,6 +114,12 @@ fn d_depth_step() -> u16 { 4 }
 fn d_peaks() -> bool { true }
 fn d_min_dom() -> f64 { 30.0 }
 fn d_ridge_strength() -> f64 { 1.0 }
+fn d_ridge_width() -> f64 { 1.0 }
+
+/// Unlike `ridge_strength`, width has to be bounded: every stroke inks a band
+/// of rows, so the cost of the pass grows with it, and an absurd value would
+/// have one request painting the whole column height for every edge.
+const MAX_RIDGE_WIDTH: f64 = 20.0;
 
 #[derive(Clone)]
 pub struct Ctx {
@@ -206,6 +215,7 @@ async fn panorama_route(
         ("alt_min", req.alt_min),
         ("alt_max", req.alt_max),
         ("ridge_strength", req.ridge_strength),
+        ("ridge_width", req.ridge_width),
     ] {
         if !v.is_finite() {
             return bad(format!("{name} must be a finite number"));
@@ -213,6 +223,9 @@ async fn panorama_route(
     }
     if req.ridge_strength < 0.0 {
         return bad("ridge_strength must not be negative");
+    }
+    if !(0.0..=MAX_RIDGE_WIDTH).contains(&req.ridge_width) {
+        return bad(format!("ridge_width must lie within 0..{MAX_RIDGE_WIDTH}"));
     }
     if !(-90.0..=90.0).contains(&req.alt_min) || !(-90.0..=90.0).contains(&req.alt_max) {
         return bad("alt_min and alt_max must lie within -90..90");
@@ -268,6 +281,7 @@ async fn panorama_route(
         // here would silently rewrite the caller's number instead -- negative
         // is rejected outright above, since it would brighten rather than ink.
         ridge_strength: req.ridge_strength,
+        ridge_width: req.ridge_width,
         ridge_colour,
         ground_colour,
     };

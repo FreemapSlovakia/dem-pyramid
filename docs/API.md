@@ -45,6 +45,7 @@ All fields except `lon` and `lat` are optional.
 | `min_dominance` | number | `30` | drop peaks standing less than this above their surroundings, metres; may be negative |
 | `max_peaks` | int | `0` | keep at most this many, most dominant first; 0 is no cap |
 | `ridge_strength` | number | `1` | multiplier on the silhouettes' alpha; 0 removes them, no upper bound |
+| `ridge_width` | number | `1` | silhouette thickness in output pixels (0–20) |
 | `ridge_color` | string | `#000000` | silhouette colour, `#rrggbb` or `#rgb` |
 | `ground_color` | string | `#3a4a34` | near-terrain colour, before haze |
 
@@ -111,6 +112,16 @@ There is no upper limit — alpha is clamped at composite time, so a large value
 simply makes everything solid. Negative is rejected, since it would brighten
 rather than ink.
 
+`ridge_width` is thickness in **output pixels**, so a line looks the same
+weight whatever `step` you render at — sub-rows are only how it is drawn.
+It is independent of `ridge_strength`: the interior of a stroke inks at the
+same alpha however wide it is, so widening thickens a line without darkening
+it. Fractional values work, and antialias.
+
+Unlike strength this one *is* bounded, to 20. Every stroke inks a band of
+rows, so the cost of the pass grows with the width, and an unbounded value
+would let one request paint the full column height for every edge it found.
+
 `ridge_color` is what those strokes are drawn in. Black is the default and
 reads as shading, since inking towards black is a plain multiply. A colour
 near the ground makes ridges read as folds rather than outlines, and a light
@@ -124,6 +135,8 @@ which is what keeps depth readable whatever colour you choose.
 { "ridge_strength": 0 }                        // shaded relief, no linework
 { "ridge_strength": 2.2, "ground_color": "#7a6a4a" }   // drawn, sandy
 { "ridge_color": "#2b1a10", "ground_color": "#d8cfc0" } // engraved
+{ "ridge_width": 2.5, "ridge_strength": 3 }    // bold outlines, poster-like
+{ "ridge_width": 0.5 }                         // hairlines for a big render
 ```
 
 Both colours take `#rrggbb` or `#rgb`, with or without the `#`. A malformed

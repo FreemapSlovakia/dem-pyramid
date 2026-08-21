@@ -91,6 +91,10 @@ pub struct Params {
     /// How heavily ridge silhouettes are inked, as a multiplier on the
     /// strength the geometry calls for. 0 removes them entirely.
     pub ridge_strength: f64,
+    /// Stroke thickness in output pixels. Independent of `ridge_strength`:
+    /// interior rows of a stroke ink at the same alpha however wide it is, so
+    /// widening thickens the line without darkening it.
+    pub ridge_width: f64,
     /// What the silhouettes are drawn in. Black is the default and reads as
     /// shading; a lighter ink gives an engraved look, and a colour matching
     /// the ground makes ridges read as folds rather than outlines.
@@ -652,7 +656,9 @@ fn shade_column(col: &Column, p: &Params, alt_step: f64, height: usize) -> Vec<(
     //
     // The ink applies to whatever the line covers, sky included -- a dark
     // outline over the horizon does darken the sky above it.
-    let stroke_half_width = 0.5 * f64::from(p.supersample_y);
+    // In output pixels, so a line looks the same thickness whatever
+    // resolution was asked for -- sub-rows are only how it is drawn.
+    let stroke_half_width = 0.5 * p.ridge_width * f64::from(p.supersample_y);
     let mut ink = vec![0f64; height];
 
     for row in 0..height {
