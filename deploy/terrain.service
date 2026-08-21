@@ -1,0 +1,35 @@
+# systemd unit for the terrain service.
+#
+# Install:
+#   cp terrain.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now terrain
+#
+# Replaces running it in tmux, which does not survive a reboot.
+
+[Unit]
+Description=Freemap terrain service (panorama, later viewshed and shadows)
+After=network.target
+
+[Service]
+Type=simple
+User=martin
+WorkingDirectory=/fm/storage2/dem/build
+ExecStart=/fm/storage2/dem/build/target/release/dem-tool serve \
+    --root /fm/storage2/dem \
+    --listen 127.0.0.1:3100 \
+    --peaks /fm/storage2/dem/peaks.gpkg
+
+# Loopback only; nginx is the only thing that should reach it.
+Environment=GDAL_CACHEMAX=1024
+
+# A render saturates most of the box. Leave the tile servers and the API
+# responsive: renders are a background nicety, serving maps is not.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
