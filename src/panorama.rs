@@ -627,12 +627,12 @@ fn shade_column(col: &Column, p: &Params, alt_step: f64, height: usize) -> Vec<(
             let t = 1.0 - (-d / haze).exp();
             let base = (58.0, 74.0, 52.0);
             (
-                lerp(base.0, f64::from(sky.0), t),
-                lerp(base.1, f64::from(sky.1), t),
-                lerp(base.2, f64::from(sky.2), t),
+                lerp(base.0, sky.0, t),
+                lerp(base.1, sky.1, t),
+                lerp(base.2, sky.2, t),
             )
         } else {
-            (f64::from(sky.0), f64::from(sky.1), f64::from(sky.2))
+            sky
         }
     };
 
@@ -684,8 +684,7 @@ fn shade_column(col: &Column, p: &Params, alt_step: f64, height: usize) -> Vec<(
                 let back = if row > 0 {
                     surface(row - 1)
                 } else {
-                    let s = sky_colour(alt);
-                    (f64::from(s.0), f64::from(s.1), f64::from(s.2))
+                    sky_colour(alt)
                 };
                 (
                     lerp(back.0, front.0, c),
@@ -1120,8 +1119,14 @@ pub fn render(
                             b += pb;
                         }
                     }
-                    pixels[orow * cols + local] =
-                        [clamp(r / n), clamp(g / n), clamp(b / n)];
+                    // Dither by absolute position, not by position within the
+                    // chunk, or the pattern restarts at every worker boundary.
+                    let (dx, dy) = (start + local, orow);
+                    pixels[orow * cols + local] = [
+                        clamp(r / n, dx, dy),
+                        clamp(g / n, dx, dy),
+                        clamp(b / n, dx, dy),
+                    ];
                 }
             }
 
@@ -1250,22 +1255,48 @@ pub fn render(
     ))
 }
 
-fn sky_colour(alt: f64) -> (u8, u8, u8) {
+/// Kept in floating point all the way to the final quantisation. Rounding to
+/// bytes here and then blending haze against the result banded the sky twice
+/// over -- and `as u8` truncates rather than rounds, widening every band by a
+/// level.
+fn sky_colour(alt: f64) -> (f64, f64, f64) {
     // Deeper blue overhead, pale towards the horizon.
     let t = (alt / 30.0).clamp(0.0, 1.0);
     (
-        lerp(196.0, 110.0, t) as u8,
-        lerp(216.0, 156.0, t) as u8,
-        lerp(238.0, 214.0, t) as u8,
+        lerp(196.0, 110.0, t),
+        lerp(216.0, 156.0, t),
+        lerp(238.0, 214.0, t),
     )
+}
+
+/// Ordered dither, plus or minus half a level, from an 8x8 Bayer matrix.
+///
+/// A sky gradient crosses few levels over many pixels -- blue runs 238 to 214
+/// across the whole frame, so one level lasts 25 rows at the default step and
+/// the eye reads the steps as stripes. Displacing each pixel by under half a
+/// level breaks the step into a boundary that scatters across two values, and
+/// the mean over any 8x8 block is unchanged.
+fn dither(x: usize, y: usize) -> f64 {
+    const BAYER: [[u8; 8]; 8] = [
+        [0, 32, 8, 40, 2, 34, 10, 42],
+        [48, 16, 56, 24, 50, 18, 58, 26],
+        [12, 44, 4, 36, 14, 46, 6, 38],
+        [60, 28, 52, 20, 62, 30, 54, 22],
+        [3, 35, 11, 43, 1, 33, 9, 41],
+        [51, 19, 59, 27, 49, 17, 57, 25],
+        [15, 47, 7, 39, 13, 45, 5, 37],
+        [63, 31, 55, 23, 61, 29, 53, 21],
+    ];
+    (f64::from(BAYER[y & 7][x & 7]) + 0.5) / 64.0 - 0.5
 }
 
 fn lerp(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
 }
 
-fn clamp(v: f64) -> u8 {
-    v.clamp(0.0, 255.0) as u8
+/// Quantise to a byte, dithered by position and rounded rather than truncated.
+fn clamp(v: f64, x: usize, y: usize) -> u8 {
+    (v + dither(x, y)).clamp(0.0, 255.0).round() as u8
 }
 
 /// Degrees of the compass, for the summary line.
@@ -1523,6 +1554,41 @@ mod tests {
     fn a_narrow_view_drops_rays_past_its_edges() {
         assert_eq!(bracketing(0.25, 8, false).0, [None, Some(0)]);
         assert_eq!(bracketing(7.9, 8, false).0, [Some(7), None]);
+    }
+
+    // ---- dithering --------------------------------------------------------
+
+    /// Dither must not shift the picture, only spread each step's boundary:
+    /// over one tile of the matrix the offsets cancel.
+    #[test]
+    fn dither_has_no_bias() {
+        let sum: f64 = (0..8).flat_map(|y| (0..8).map(move |x| dither(x, y))).sum();
+        assert!(sum.abs() < 1e-12, "dither is biased by {sum}");
+        for y in 0..8 {
+            for x in 0..8 {
+                assert!(dither(x, y).abs() <= 0.5, "dither exceeds half a level");
+            }
+        }
+    }
+
+    /// A gradient crossing one level over many pixels must not step all at
+    /// once. Blue spans 24 levels across the whole sky, so a run of a single
+    /// value tens of rows long is exactly what banded the picture.
+    #[test]
+    fn a_slow_gradient_does_not_band() {
+        // One level over 32 rows, the shallowest the sky ever gets.
+        let value = |row: usize| 238.0 - row as f64 / 32.0;
+        let column: Vec<u8> = (0..64).map(|row| clamp(value(row), 0, row)).collect();
+        let longest = column
+            .chunk_by(|a, b| a == b)
+            .map(<[u8]>::len)
+            .max()
+            .unwrap();
+        assert!(longest <= 16, "a flat run of {longest} rows is a visible band");
+        // And it still tracks the underlying ramp.
+        let mean = column.iter().map(|&v| f64::from(v)).sum::<f64>() / 64.0;
+        let want = (0..64).map(value).sum::<f64>() / 64.0;
+        assert!((mean - want).abs() < 0.5, "mean drifted: {mean} vs {want}");
     }
 
     // ---- geometry ---------------------------------------------------------
