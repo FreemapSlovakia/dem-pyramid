@@ -132,24 +132,15 @@ enum Command {
         /// invertible.
         #[arg(long)]
         depth_out: Option<PathBuf>,
-        /// Write depth as a gzipped raw little-endian f32 buffer: metres,
-        /// Infinity for sky.
+        /// Write depth as a gzipped raw little-endian u16 buffer: log-scaled,
+        /// row delta-coded, 0 for sky.
         ///
         /// Less client code than a PNG, not more -- fetch, pipe through
-        /// DecompressionStream, wrap in a Float32Array -- and no decode step,
-        /// since the values are already metres. No canvas either, so no
+        /// DecompressionStream, wrap in an Int16Array. No canvas, so no
         /// colour-profile transform to worry about. Dimensions come from the
         /// render response.
         #[arg(long)]
         depth_raw: Option<PathBuf>,
-        /// Sample format for --depth-raw.
-        ///
-        /// u16 is half the bytes and, being log-scaled, three times more
-        /// precise at range than float16 would be at the same size -- and the
-        /// decode is one Math.exp on the pixel under the cursor, not on the
-        /// buffer. f32 is metres with no decode at all.
-        #[arg(long, default_value = "f32")]
-        depth_format: String,
         /// Quantise u16 depth to this step before delta-coding, trading
         /// precision for size. One step is 0.0162% of the distance, so step 4
         /// is +-13 m at 20 km and step 16 is +-52 m.
@@ -332,7 +323,6 @@ fn main() -> Result<()> {
             eye_level,
             depth_out,
             depth_raw,
-            depth_format,
             depth_step,
             peaks: peaks_path,
             peaks_out,
@@ -406,32 +396,20 @@ fn main() -> Result<()> {
 
             if let Some(rpath) = depth_raw {
                 use std::io::Write;
-                let u16_mode = match depth_format.as_str() {
-                    "u16" => true,
-                    "f32" => false,
-                    other => anyhow::bail!("--depth-format wants u16 or f32, got {other}"),
-                };
-
-                let px = stats.width * stats.height;
-                let mut bytes = Vec::with_capacity(px * if u16_mode { 2 } else { 4 });
+                let step = depth_step.max(1);
+                let mut bytes = Vec::with_capacity(stats.width * stats.height * 2);
                 for row in 0..stats.height {
-                    // Delta-code the u16 rows before deflating: this is where
-                    // PNG gets its compression on smooth gradients, and
-                    // without it a raw buffer loses to the PNG.
+                    // Delta-code rows before deflating: this is where PNG gets
+                    // its compression on smooth gradients, and without it a
+                    // raw buffer loses to the PNG.
                     let mut prev = 0i32;
                     for col in 0..stats.width {
                         let v = stats.depth.get_pixel(col as u32, row as u32)[0];
-                        if u16_mode {
-                            let step = depth_step.max(1);
-                            // Keep 0 meaning sky rather than rounding it away.
-                            let q = if v == 0 { 0 } else { (v / step) * step };
-                            let d = (i32::from(q) - prev) as i16;
-                            bytes.extend_from_slice(&d.to_le_bytes());
-                            prev = i32::from(q);
-                        } else {
-                            let m = panorama::decode_depth(v).unwrap_or(f64::INFINITY);
-                            bytes.extend_from_slice(&(m as f32).to_le_bytes());
-                        }
+                        // Keep 0 meaning sky rather than rounding it away.
+                        let q = if v == 0 { 0 } else { (v / step) * step };
+                        let d = (i32::from(q) - prev) as i16;
+                        bytes.extend_from_slice(&d.to_le_bytes());
+                        prev = i32::from(q);
                     }
                 }
                 let mut enc = flate2::write::GzEncoder::new(
@@ -440,24 +418,17 @@ fn main() -> Result<()> {
                 );
                 enc.write_all(&bytes)?;
                 enc.finish()?;
-                if u16_mode {
-                    let rel = f64::from(depth_step.max(1)) * 100.0
-                        * (panorama::DEPTH_FAR.ln() - panorama::DEPTH_NEAR.ln())
-                        / 65534.0;
-                    println!(
-                        "depth-raw  {}x{} u16 LE log-scaled, step {} (+-{:.0} m at 20 km), \
-                         delta-coded, 0 = sky, gzip",
-                        stats.width,
-                        stats.height,
-                        depth_step,
-                        20_000.0 * rel / 200.0
-                    );
-                } else {
-                    println!(
-                        "depth-raw  {}x{} f32 LE metres, Infinity = sky, gzip",
-                        stats.width, stats.height
-                    );
-                }
+                let rel = f64::from(step) * 100.0
+                    * (panorama::DEPTH_FAR.ln() - panorama::DEPTH_NEAR.ln())
+                    / 65534.0;
+                println!(
+                    "depth-raw  {}x{} u16 LE log-scaled, step {} (+-{:.0} m at 20 km), \
+                     delta-coded, 0 = sky, gzip",
+                    stats.width,
+                    stats.height,
+                    step,
+                    20_000.0 * rel / 200.0
+                );
                 println!("wrote      {}", rpath.display());
             }
 

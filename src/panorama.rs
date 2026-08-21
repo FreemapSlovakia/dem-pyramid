@@ -725,14 +725,6 @@ pub fn encode_depth(d: f64) -> u16 {
     1 + (t.clamp(0.0, 1.0) * 65_534.0).round() as u16
 }
 
-/// The inverse, for reference -- clients do this to read a distance back.
-pub fn decode_depth(v: u16) -> Option<f64> {
-    (v > 0).then(|| {
-        let t = f64::from(v - 1) / 65_534.0;
-        (DEPTH_NEAR.ln() + t * (DEPTH_FAR.ln() - DEPTH_NEAR.ln())).exp()
-    })
-}
-
 pub fn render(root: &Path, doc: &Doc, p: &Params) -> Result<(image::RgbImage, Stats)> {
     let (coarsest, finest) = (doc.grid.coarsest_level, doc.grid.finest_level);
     let (ssx, ssy) = (p.supersample_x.max(1), p.supersample_y.max(1));
