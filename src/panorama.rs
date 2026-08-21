@@ -402,6 +402,28 @@ impl Column {
     }
 }
 
+/// The two rays bracketing a bearing, and how far between them it lies.
+///
+/// `sub_pos` is the bearing in sub-columns from the frame's start. Ray `k`
+/// looks along centre `k + 0.5`, so a bearing at `u` sits between rays
+/// `floor(u - 0.5)` and the next. A full circle wraps -- the ray before the
+/// first is the last -- and anything else drops the ray that falls outside.
+fn bracketing(sub_pos: f64, sub_cols: usize, wraps: bool) -> ([Option<usize>; 2], f64) {
+    let u = sub_pos - 0.5;
+    let k0 = u.floor();
+    let mut rays = [None, None];
+    for (slot, k) in [(0usize, k0), (1, k0 + 1.0)] {
+        rays[slot] = if wraps {
+            Some((k as isize).rem_euclid(sub_cols as isize) as usize)
+        } else if k >= 0.0 && (k as usize) < sub_cols {
+            Some(k as usize)
+        } else {
+            None
+        };
+    }
+    (rays, u - k0)
+}
+
 /// March one ray and fill its column.
 ///
 /// `probe_d` holds distances, ascending, at which the caller wants the horizon
@@ -981,16 +1003,15 @@ pub fn render(
             continue;
         }
         // pk.x is fractional output columns; sub-columns are ssx times finer.
-        let u = pk.x * f64::from(ssx) - 0.5;
-        let k0 = u.floor();
-        blend[i] = u - k0;
-        for (slot, k) in [(0u8, k0), (1, k0 + 1.0)] {
-            let k = match (wraps, k) {
-                (true, k) => (k as isize).rem_euclid(sub_cols as isize) as usize,
-                (false, k) if k >= 0.0 && (k as usize) < sub_cols => k as usize,
-                (false, _) => continue,
-            };
-            by_sub.entry(k).or_default().push((pk.distance, i, slot));
+        let (rays, t) = bracketing(pk.x * f64::from(ssx), sub_cols, wraps);
+        blend[i] = t;
+        for (slot, ray) in rays.iter().enumerate() {
+            if let Some(k) = ray {
+                by_sub
+                    .entry(*k)
+                    .or_default()
+                    .push((pk.distance, i, slot as u8));
+            }
         }
     }
     // The marcher answers probes in the order it reaches them.
@@ -1251,4 +1272,296 @@ fn clamp(v: f64) -> u8 {
 pub fn compass(az: f64) -> &'static str {
     const NAMES: [&str; 8] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
     NAMES[((az.rem_euclid(360.0) / 45.0).round() as usize) % 8]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- depth codec ------------------------------------------------------
+    //
+    // 0 means sky and only sky. Ground was floored onto that sentinel twice,
+    // in two separately written emitters, and each time it surfaced as holes
+    // in the bottom of the client's depth buffer rather than as an error.
+
+    #[test]
+    fn sky_is_the_only_zero() {
+        assert_eq!(encode_depth(f64::INFINITY), 0);
+        assert_eq!(encode_depth(f64::NAN), 0);
+        // Ground nearer than the encodable range saturates rather than
+        // falling through to the sentinel.
+        for d in [0.0, 0.5, 5.0, DEPTH_NEAR] {
+            assert_eq!(encode_depth(d), 1, "d = {d}");
+        }
+        assert_eq!(encode_depth(DEPTH_FAR), u16::MAX);
+        assert_eq!(encode_depth(DEPTH_FAR * 10.0), u16::MAX);
+    }
+
+    #[test]
+    fn quantising_never_reaches_the_sentinel() {
+        for step in [1u16, 2, 3, 4, 7, 16, 64, 255, 4096] {
+            assert_eq!(quantise_depth(0, step), 0, "sky must stay sky");
+            for v in [1u16, 2, 3, 4, 5, 100, 30_000, u16::MAX] {
+                let q = quantise_depth(v, step);
+                assert_ne!(q, 0, "v = {v} step = {step} landed on the sky sentinel");
+                assert!(q <= v, "v = {v} step = {step} quantised upward to {q}");
+                assert!(
+                    u32::from(v) - u32::from(q) < u32::from(step),
+                    "v = {v} step = {step} lost more than one step"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encoding_is_monotone_in_distance() {
+        let mut prev = 0u16;
+        let mut d = DEPTH_NEAR;
+        while d < DEPTH_FAR {
+            let v = encode_depth(d);
+            assert!(v >= prev, "encoding went backwards at {d}");
+            prev = v;
+            d *= 1.05;
+        }
+    }
+
+    /// The wire format the client decodes: quantise, delta along each row,
+    /// gzip. Deltas are signed 16-bit over unsigned values, so the reader has
+    /// to accumulate modulo 65536 -- this pins that contract.
+    #[test]
+    fn depth_bytes_round_trip() {
+        use std::io::Read;
+
+        let (w, h) = (7u32, 3u32);
+        let mut img = image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::new(w, h);
+        // Sky next to near ground, and a jump big enough to wrap an i16.
+        let vals = [
+            [0u16, 1, 2, 3, 65_535, 0, 40_000],
+            [0, 0, 0, 0, 0, 0, 0],
+            [65_535, 1, 65_535, 1, 12_345, 6, 7],
+        ];
+        for y in 0..h {
+            for x in 0..w {
+                img.put_pixel(x, y, image::Luma([vals[y as usize][x as usize]]));
+            }
+        }
+
+        for step in [1u16, 4, 97] {
+            let gz = depth_bytes(&img, step).unwrap();
+            let mut raw = Vec::new();
+            flate2::read::GzDecoder::new(&gz[..])
+                .read_to_end(&mut raw)
+                .unwrap();
+            assert_eq!(raw.len(), (w * h) as usize * 2);
+
+            let mut i = 0;
+            for row in vals.iter() {
+                let mut acc = 0i32;
+                for &want in row.iter() {
+                    let delta = i16::from_le_bytes([raw[i], raw[i + 1]]);
+                    i += 2;
+                    acc += i32::from(delta);
+                    let got = (acc as u32 & 0xffff) as u16;
+                    assert_eq!(got, quantise_depth(want, step), "step {step}, value {want}");
+                }
+            }
+        }
+    }
+
+    // ---- elevation profile ------------------------------------------------
+
+    #[test]
+    fn bins_are_monotone_and_clamped() {
+        assert_eq!(Profile::bin_of(0.0), 0);
+        assert_eq!(Profile::bin_of(DEPTH_NEAR), 0);
+        assert_eq!(Profile::bin_of(DEPTH_FAR), PROFILE_BINS - 1);
+        assert_eq!(Profile::bin_of(f64::MAX), PROFILE_BINS - 1);
+        let mut prev = 0;
+        let mut d = 1.0;
+        while d < DEPTH_FAR * 2.0 {
+            let b = Profile::bin_of(d);
+            assert!(b >= prev && b < PROFILE_BINS, "bin went backwards at {d}");
+            prev = b;
+            d *= 1.01;
+        }
+    }
+
+    /// The marcher walks bins forward with a cursor instead of taking a
+    /// logarithm per sample. That shortcut is only sound while it agrees with
+    /// the direct computation for every distance a ray visits.
+    #[test]
+    fn walked_bins_match_computed_bins() {
+        let edges = Profile::edges();
+        let mut profile = Profile::new(1);
+        let mut cursor = 0usize;
+        let mut d = DEPTH_NEAR;
+        while d < DEPTH_FAR {
+            profile.record(0, &mut cursor, &edges, d, 0.0);
+            assert_eq!(cursor, Profile::bin_of(d), "cursor drifted at d = {d}");
+            d *= 1.003;
+        }
+    }
+
+    #[test]
+    fn profile_reports_the_highest_ground_in_a_band() {
+        let edges = Profile::edges();
+        let mut profile = Profile::new(2);
+        let mut cursor = 0usize;
+        for (d, h) in [(1_000.0, 500.0), (5_000.0, 900.0), (50_000.0, 1_500.0)] {
+            profile.record(0, &mut cursor, &edges, d, h);
+        }
+        assert_eq!(profile.max_between(0, 900.0, 1_100.0), Some(500.0));
+        assert_eq!(profile.max_between(0, 900.0, 6_000.0), Some(900.0));
+        assert_eq!(profile.max_between(0, 900.0, 60_000.0), Some(1_500.0));
+        // Nothing recorded there, and nothing recorded in that column at all.
+        assert_eq!(profile.max_between(0, 100_000.0, 200_000.0), None);
+        assert_eq!(profile.max_between(1, 900.0, 60_000.0), None);
+    }
+
+    /// `max_between` slices `a..=b` and panics if the band comes out
+    /// backwards. `dominance_m` builds that band from a distance, so no
+    /// distance may produce one.
+    #[test]
+    fn dominance_bands_are_never_inverted() {
+        let profile = Profile::new(1);
+        let mut d = 0.001;
+        while d < DEPTH_FAR * 4.0 {
+            let near = (d - DOMINANCE_RADIUS).max(d * 0.5);
+            let far = (d + DOMINANCE_RADIUS).min(d * 2.0);
+            assert!(near <= far, "band inverted at d = {d}: {near}..{far}");
+            // Must not panic.
+            let _ = profile.max_between(0, near, far);
+            d *= 1.07;
+        }
+    }
+
+    // ---- dominance --------------------------------------------------------
+
+    /// Build a profile where every column holds one summit-height reading at
+    /// the same distance, so the walk sees a pure skyline of elevations.
+    fn ridge(heights: &[f64], d: f64) -> Profile {
+        let edges = Profile::edges();
+        let mut profile = Profile::new(heights.len());
+        for (c, &h) in heights.iter().enumerate() {
+            let mut cursor = 0usize;
+            profile.record(c, &mut cursor, &edges, d, h);
+        }
+        profile
+    }
+
+    #[test]
+    fn a_summit_standing_clear_scores_its_height_above_the_cols() {
+        let d = 10_000.0;
+        let p = ridge(&[500.0, 600.0, 1_000.0, 600.0, 500.0], d);
+        assert_eq!(dominance_m(&p, 5, 2, 1_000.0, d, 5), 500.0);
+    }
+
+    /// A top its own ridge stands over scores negative -- the whole near field
+    /// used to clamp to zero here and become unorderable.
+    ///
+    /// The score is set by the nearest higher ground on each side, taking the
+    /// higher of the two (1300, not the 1500 further along), because that is
+    /// the col you would have to cross.
+    #[test]
+    fn a_top_inside_a_massif_scores_negative() {
+        let d = 10_000.0;
+        let p = ridge(&[1_400.0, 1_200.0, 1_000.0, 1_300.0, 1_500.0], d);
+        assert_eq!(dominance_m(&p, 5, 2, 1_000.0, d, 5), -300.0);
+    }
+
+    /// The two halves are one continuous scale: lower a summit past its
+    /// neighbours and the score passes through zero rather than jumping.
+    ///
+    /// The ridge rises again at both ends, which is what bounds the search --
+    /// without that the walk runs to the window edge and finds the valley
+    /// floor, which is a different and much larger number.
+    #[test]
+    fn dominance_is_continuous_through_zero() {
+        let d = 10_000.0;
+        for (summit, want) in [(1_150.0, 50.0), (1_100.0, 0.0), (1_050.0, -50.0)] {
+            let p = ridge(&[1_200.0, 1_100.0, summit, 1_100.0, 1_200.0], d);
+            assert_eq!(dominance_m(&p, 5, 2, summit, d, 5), want, "summit {summit}");
+        }
+    }
+
+    #[test]
+    fn nothing_at_the_peaks_depth_scores_zero() {
+        let p = ridge(&[500.0, 600.0, 1_000.0, 600.0, 500.0], 10_000.0);
+        // Same columns, but asked about a depth where nothing was recorded.
+        assert_eq!(dominance_m(&p, 5, 2, 1_000.0, 200_000.0, 5), 0.0);
+    }
+
+    // ---- bracketing rays --------------------------------------------------
+
+    #[test]
+    fn a_bearing_is_bracketed_by_the_rays_either_side() {
+        // Dead on ray 3's centre: both slots are ray 3's neighbours at t = 0.
+        let (rays, t) = bracketing(3.5, 10, false);
+        assert_eq!(rays, [Some(3), Some(4)]);
+        assert!((t - 0.0).abs() < 1e-12);
+        // Halfway between rays 3 and 4.
+        let (rays, t) = bracketing(4.0, 10, false);
+        assert_eq!(rays, [Some(3), Some(4)]);
+        assert!((t - 0.5).abs() < 1e-12);
+    }
+
+    /// A full circle has no edge. Without wrapping, a peak in the first or
+    /// last half-ray falls back to a single ray and takes back the bearing
+    /// error the bracketing exists to remove -- at the seam of the default
+    /// 360-degree render.
+    #[test]
+    fn a_full_circle_wraps_at_the_seam() {
+        let (rays, t) = bracketing(0.25, 8, true);
+        assert_eq!(rays, [Some(7), Some(0)]);
+        assert!((t - 0.75).abs() < 1e-12);
+
+        let (rays, _) = bracketing(7.9, 8, true);
+        assert_eq!(rays, [Some(7), Some(0)]);
+    }
+
+    #[test]
+    fn a_narrow_view_drops_rays_past_its_edges() {
+        assert_eq!(bracketing(0.25, 8, false).0, [None, Some(0)]);
+        assert_eq!(bracketing(7.9, 8, false).0, [Some(7), None]);
+    }
+
+    // ---- geometry ---------------------------------------------------------
+
+    #[test]
+    fn curvature_drop_matches_the_textbook_figure() {
+        assert_eq!(curvature_drop(0.0), 0.0);
+        // d^2 (1 - k) / 2R at 10 km, k = 0.13.
+        assert!((curvature_drop(10_000.0) - 6.83).abs() < 0.01);
+        // Quadratic: four times the distance drops sixteen times as far.
+        assert!((curvature_drop(40_000.0) / curvature_drop(10_000.0) - 16.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn great_circle_and_bearing_agree_with_known_values() {
+        // Krompachy to Gerlachovsky stit: ~63.5 km on a bearing near 300.
+        let d = great_circle(20.888781, 48.878479, 20.133, 49.164);
+        assert!((d - 63_500.0).abs() < 1_500.0, "got {d} m");
+        let az = initial_bearing(20.888781, 48.878479, 20.133, 49.164);
+        assert!((az - 300.0).abs() < 3.0, "got {az} degrees");
+        // Due north and due east from anywhere sensible.
+        assert!((initial_bearing(20.0, 49.0, 20.0, 50.0) - 0.0).abs() < 1e-9);
+        assert!((initial_bearing(20.0, 49.0, 21.0, 49.0) - 90.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn level_selection_never_asks_for_more_detail_than_exists() {
+        for d in [10.0, 500.0, 7_000.0, 20_000.0, 100_000.0, 300_000.0] {
+            let z = level_for(d, 49.0, 8, 14);
+            assert!((8..=14).contains(&z), "d = {d} chose z{z}");
+        }
+        // Coarser with distance, never finer.
+        let mut prev = 14;
+        let mut d = 100.0;
+        while d < 300_000.0 {
+            let z = level_for(d, 49.0, 8, 14);
+            assert!(z <= prev, "level went finer at {d}");
+            prev = z;
+            d *= 1.2;
+        }
+    }
 }
