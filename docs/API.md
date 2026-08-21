@@ -43,6 +43,7 @@ All fields except `lon` and `lat` are optional.
 | `depth_step` | int | `4` | depth quantisation; see [Depth](#depth) |
 | `peaks` | bool | `true` | include peak labels |
 | `min_prominence` | number | `0.05` | drop peaks below this angular prominence, degrees |
+| `priority` | int | `0` | queue priority, higher goes first — see below |
 
 Image dimensions follow from the angles:
 
@@ -70,6 +71,29 @@ Measured on a 12-core machine, 360° at the default step:
 
 A 60–120° viewport is proportionally cheaper. Renders are serialised by
 default, because one already saturates nine cores.
+
+## Queueing and cancellation
+
+**One render at a time.** A single render already saturates nine of twelve
+cores, so overlapping them would trade latency for nothing. Requests queue.
+
+**Priority, not FIFO.** The waiting request with the highest `priority` goes
+next; equal priorities stay first-come-first-served. Set it from whatever the
+proxy knows about the caller — the service has no notion of premium. Verified:
+three requests submitted anonymous → plus → premium were served premium →
+plus → anonymous.
+
+**Aborting the connection cancels the work.** Hang up — `AbortController`,
+navigation, a closed tab — and the render stops within about a second, whether
+it was queued or already running. Measured: 11.3 cores in use, 0.3 two seconds
+after the client died, rather than grinding on for the remaining 24 s.
+
+This matters more than usual here. A user who reframes a view while the first
+render is in flight would otherwise queue behind their own abandoned work, so
+**abort the previous request before issuing a new one**.
+
+`X-Queue-Depth` on the response reports how many were waiting when the request
+was admitted, which is a reasonable basis for a "busy" hint in the UI.
 
 ## Response
 

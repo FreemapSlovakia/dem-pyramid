@@ -585,7 +585,13 @@ fn viewpoint_elevation(pyr: &mut Pyramid, p: &Params) -> Result<f64> {
 /// can be seen from here" on its own. Peaks are bucketed by azimuth and one
 /// ray is marched per occupied bucket, which bounds the work by the number of
 /// distinct bearings rather than by the number of peaks.
-pub fn resolve_peaks(root: &Path, doc: &Doc, p: &Params, peaks: &mut [Peak]) -> Result<usize> {
+pub fn resolve_peaks(
+    root: &Path,
+    doc: &Doc,
+    p: &Params,
+    peaks: &mut [Peak],
+    cancel: &Cancel,
+) -> Result<usize> {
     let (coarsest, finest) = (doc.grid.coarsest_level, doc.grid.finest_level);
     let mut pyr = Pyramid::open(root, doc)?;
     let eye = viewpoint_elevation(&mut pyr, p)? + p.eye_height;
@@ -647,6 +653,7 @@ pub fn resolve_peaks(root: &Path, doc: &Doc, p: &Params, peaks: &mut [Peak]) -> 
             let mut pyr = Pyramid::open(root, doc)?;
             let mut out = Vec::new();
             for group in chunk_groups {
+            cancel.check()?;
             let az = geometry[group[0]].0 + bucket_deg / 2.0;
 
             // One pass outward: the running maximum before a peak decides
@@ -725,7 +732,36 @@ pub fn encode_depth(d: f64) -> u16 {
     1 + (t.clamp(0.0, 1.0) * 65_534.0).round() as u16
 }
 
-pub fn render(root: &Path, doc: &Doc, p: &Params) -> Result<(image::RgbImage, Stats)> {
+/// Cooperative cancellation.
+///
+/// A blocking task cannot be killed from outside -- dropping its JoinHandle
+/// detaches it, it does not stop it -- so a long render has to check whether
+/// anyone is still waiting for it. Checked per output column, which bounds the
+/// wasted work to one column rather than one panorama.
+#[derive(Clone, Default)]
+pub struct Cancel(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Cancel {
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn check(&self) -> Result<()> {
+        anyhow::ensure!(!self.is_cancelled(), "cancelled");
+        Ok(())
+    }
+}
+
+pub fn render(
+    root: &Path,
+    doc: &Doc,
+    p: &Params,
+    cancel: &Cancel,
+) -> Result<(image::RgbImage, Stats)> {
     let (coarsest, finest) = (doc.grid.coarsest_level, doc.grid.finest_level);
     let (ssx, ssy) = (p.supersample_x.max(1), p.supersample_y.max(1));
 
@@ -762,6 +798,7 @@ pub fn render(root: &Path, doc: &Doc, p: &Params) -> Result<(image::RgbImage, St
             let mut nearest = vec![f64::INFINITY; out_h];
 
             for local in 0..cols {
+                cancel.check()?;
                 let oc = start + local;
                 shaded.clear();
                 nearest.fill(f64::INFINITY);

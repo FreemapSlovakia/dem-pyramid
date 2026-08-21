@@ -15,6 +15,7 @@ mod gdal_cli;
 mod grid;
 mod panorama;
 mod peaks;
+mod queue;
 mod server;
 
 #[derive(Parser)]
@@ -88,10 +89,6 @@ enum Command {
         /// GeoPackage of candidate peaks.
         #[arg(long)]
         peaks: Option<PathBuf>,
-        /// Renders in flight at once. One already saturates nine cores, so
-        /// overlapping them trades latency for nothing.
-        #[arg(long, default_value_t = 1)]
-        concurrency: usize,
     },
     /// Render a panorama from a viewpoint.
     Panorama {
@@ -361,7 +358,9 @@ fn main() -> Result<()> {
                 supersample_y,
             };
             let t0 = std::time::Instant::now();
-            let (img, stats) = panorama::render(&cli.root, &doc, &p)?;
+            // Nothing cancels a CLI render; the flag exists for the server.
+            let cancel = panorama::Cancel::default();
+            let (img, stats) = panorama::render(&cli.root, &doc, &p, &cancel)?;
             let elapsed = t0.elapsed();
             img.save(&out)
                 .with_context(|| format!("writing {}", out.display()))?;
@@ -449,7 +448,7 @@ fn main() -> Result<()> {
                 let t1 = std::time::Instant::now();
                 let mut cands = peaks::load(&src, lon, lat, range)?;
                 let found = cands.len();
-                let rays = panorama::resolve_peaks(&cli.root, &doc, &p, &mut cands)?;
+                let rays = panorama::resolve_peaks(&cli.root, &doc, &p, &mut cands, &cancel)?;
 
                 // In frame, not hidden, and standing far enough above what is
                 // behind it to be worth a label.
@@ -478,16 +477,9 @@ fn main() -> Result<()> {
         Command::Serve {
             listen,
             peaks: peaks_file,
-            concurrency,
         } => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(server::serve(
-                cli.root.clone(),
-                doc,
-                peaks_file,
-                &listen,
-                concurrency,
-            ))?;
+            rt.block_on(server::serve(cli.root.clone(), doc, peaks_file, &listen))?;
         }
         Command::IndexPlan { level } => {
             let root = cli.root.to_str().context("non-utf8 root")?;

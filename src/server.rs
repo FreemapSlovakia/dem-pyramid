@@ -24,9 +24,10 @@ use serde::Deserialize;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
 
 use crate::config::Doc;
+use crate::panorama::Cancel;
+use crate::queue::Queue;
 use crate::{panorama, peaks};
 
 /// Caps on what a single request may cost. Not entitlement -- that belongs to
@@ -69,6 +70,10 @@ pub struct Request {
     peaks: bool,
     #[serde(default = "d_min_prom")]
     min_prominence: f64,
+    /// Queue priority; higher goes first. Set by whoever authenticates the
+    /// caller -- this service does not know what premium means.
+    #[serde(default)]
+    priority: i32,
 }
 
 fn d_az() -> f64 { 0.0 }
@@ -89,9 +94,10 @@ pub struct Ctx {
     root: PathBuf,
     doc: Arc<Doc>,
     peaks_file: Option<PathBuf>,
-    /// One render at a time by default: a single render already saturates nine
-    /// cores, so overlapping them trades latency for nothing.
-    slots: Arc<Semaphore>,
+    /// One render at a time: a single render already saturates nine cores, so
+    /// overlapping them trades latency for nothing. Priority-ordered, so a
+    /// premium request does not queue behind anonymous ones.
+    queue: Queue,
 }
 
 pub async fn serve(
@@ -99,13 +105,12 @@ pub async fn serve(
     doc: Doc,
     peaks_file: Option<PathBuf>,
     listen: &str,
-    concurrency: usize,
 ) -> Result<()> {
     let ctx = Ctx {
         root,
         doc: Arc::new(doc),
         peaks_file,
-        slots: Arc::new(Semaphore::new(concurrency.max(1))),
+        queue: Queue::new(),
     };
 
     let app = Router::new()
@@ -159,9 +164,27 @@ async fn panorama_route(State(ctx): State<Ctx>, Json(req): Json<Request>) -> Res
         supersample_y: req.supersample_y.clamp(1, MAX_SUPERSAMPLE),
     };
 
-    let Ok(_permit) = ctx.slots.clone().acquire_owned().await else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "shutting down").into_response();
-    };
+    // Cancellation has to be cooperative: a blocking task cannot be killed,
+    // and dropping its JoinHandle only detaches it. This guard is owned by the
+    // handler future, so if the client hangs up -- while queued or mid-render
+    // -- axum drops the future, the guard drops, and the render sees the flag
+    // and abandons the work.
+    struct Guard(Cancel);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.cancel();
+        }
+    }
+    let cancel = Cancel::default();
+    let guard = Guard(cancel.clone());
+
+    let queued = ctx.queue.depth();
+    let _permit = ctx.queue.acquire(req.priority).await;
+
+    // Whoever was waiting may have given up by the time the slot came free.
+    if cancel.is_cancelled() {
+        return StatusCode::REQUEST_TIMEOUT.into_response();
+    }
 
     // Rendering is CPU-bound and blocking; keep it off the async runtime.
     let want_peaks = req.peaks && ctx.peaks_file.is_some();
@@ -172,14 +195,16 @@ async fn panorama_route(State(ctx): State<Ctx>, Json(req): Json<Request>) -> Res
     let want_depth = req.depth;
     let min_prom = req.min_prominence;
 
+    let render_cancel = cancel.clone();
     let built = tokio::task::spawn_blocking(move || -> Result<Vec<(String, Option<String>, Vec<u8>)>> {
-        let (img, stats) = panorama::render(&root, &doc, &p)?;
+        let cancel = render_cancel;
+        let (img, stats) = panorama::render(&root, &doc, &p, &cancel)?;
 
         let mut found = Vec::new();
         if want_peaks {
             if let Some(pf) = &peaks_file {
                 let mut cands = peaks::load(pf, p.lon, p.lat, p.max_range)?;
-                panorama::resolve_peaks(&root, &doc, &p, &mut cands)?;
+                panorama::resolve_peaks(&root, &doc, &p, &mut cands, &cancel)?;
                 cands.retain(|k| {
                     k.visible
                         && k.column >= 0
@@ -249,6 +274,11 @@ async fn panorama_route(State(ctx): State<Ctx>, Json(req): Json<Request>) -> Res
 
     let parts = match built {
         Ok(Ok(p)) => p,
+        Ok(Err(e)) if cancel.is_cancelled() => {
+            // Nobody is listening; the status is for the log, not the client.
+            let _ = e;
+            return StatusCode::REQUEST_TIMEOUT.into_response();
+        }
         Ok(Err(e)) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
@@ -256,6 +286,11 @@ async fn panorama_route(State(ctx): State<Ctx>, Json(req): Json<Request>) -> Res
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     };
+
+    // The render finished, so the work is no longer abandonable; keeping the
+    // guard alive until here is what makes the cancellation window cover both
+    // queueing and rendering.
+    drop(guard);
 
     let boundary = "dempyramid7f3a9c2e";
     let mut body = Vec::new();
@@ -285,10 +320,16 @@ async fn panorama_route(State(ctx): State<Ctx>, Json(req): Json<Request>) -> Res
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
 
     (
-        [(
-            header::CONTENT_TYPE,
-            format!("multipart/form-data; boundary={boundary}"),
-        )],
+        [
+            (
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            ),
+            (
+                header::HeaderName::from_static("x-queue-depth"),
+                queued.to_string(),
+            ),
+        ],
         Body::from(body),
     )
         .into_response()
