@@ -47,6 +47,13 @@ for z in "${levels[@]}"; do
     locs=()
     for f in "$dir"/*.tif; do
       [ -e "$f" ] || continue
+      # Tiles are written as NAME.tif.tmp.tif and renamed into place, so the
+      # glob also matches whatever the builder is writing right now. Indexing
+      # one is a race: usually gdaltindex cannot open it and warns, but a tile
+      # complete enough to open gets a row pointing at a name that disappears
+      # at the rename, and the level then reads as a hole until the next
+      # reindex. Renders stay reproducible only if the index ignores them.
+      case "$f" in *.tmp.tif) continue ;; esac
       if [ "$ovr" -lt 0 ]; then
         locs+=("$f")
       else
