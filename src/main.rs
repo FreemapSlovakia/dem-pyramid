@@ -15,6 +15,7 @@ mod gdal_cli;
 mod grid;
 mod panorama;
 mod peaks;
+mod server;
 
 #[derive(Parser)]
 #[command(about, version)]
@@ -79,6 +80,18 @@ enum Command {
     /// What contributes to one pyramid level, for the index builder.
     IndexPlan {
         level: u32,
+    },
+    /// Serve panoramas over HTTP.
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:3100")]
+        listen: String,
+        /// GeoPackage of candidate peaks.
+        #[arg(long)]
+        peaks: Option<PathBuf>,
+        /// Renders in flight at once. One already saturates nine cores, so
+        /// overlapping them trades latency for nothing.
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
     },
     /// Render a panorama from a viewpoint.
     Panorama {
@@ -461,6 +474,20 @@ fn main() -> Result<()> {
                 );
                 println!("wrote      {}", dst.display());
             }
+        }
+        Command::Serve {
+            listen,
+            peaks: peaks_file,
+            concurrency,
+        } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(server::serve(
+                cli.root.clone(),
+                doc,
+                peaks_file,
+                &listen,
+                concurrency,
+            ))?;
         }
         Command::IndexPlan { level } => {
             let root = cli.root.to_str().context("non-utf8 root")?;
