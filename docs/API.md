@@ -225,12 +225,22 @@ the figure reads the valley depth and comes out high. Where the surrounding
 cols are hidden behind nearer ground it reads whatever hides them, and comes
 out low — under-labelling being the safer failure.
 
-**The peak count depends on render resolution.** Visibility is decided against
-the marched column, so a finer `step` resolves more tops: with no dominance
-filter the same viewpoint returns ~540 peaks at `step: 0.1` and ~650 at
-`0.05`. Dominance shifts slightly with it too, for the same reason. Under the
-default `min_dominance: 30` that viewpoint yields 69 — the filter, not the
-resolution, is what you tune for label density. This is not a filter bug — if you
+**Which peaks are visible no longer depends on render quality**, and that is
+deliberate: names should not appear and disappear when a user changes quality
+to make the picture prettier. Visibility is asked of the ray marcher directly,
+against the horizon it already tracks, rather than read back out of the
+finished image. Across `step` 0.2→0.05 and `supersample_x` 1→9 the same
+viewpoint returns 765–778 peaks, agreeing on all but ~1% of the set.
+
+**`dominance` values are not yet stable across quality**, so a fixed
+`min_dominance` still admits different numbers per tier — 122 peaks at
+`step: 0.2` against 84 at `0.05` on that viewpoint, and the top-20 by
+dominance agree on only 7. Dominance is measured from the depth image, whose
+angular row height is `step`, and at 60 km one row spans 210 m of elevation at
+`step: 0.2` against 52 m at `0.05`. Until that is measured at fixed
+resolution, **pin `step` for label ranking** if you need a stable set, and
+prefer `max_peaks` over a `min_dominance` threshold — neither is stable yet,
+but the cap at least bounds how many labels you draw. This is not a filter bug — if you
 need a stable set across zoom levels, pin `step` for the peak query.
 
 Metres, not degrees, because degrees are not comparable across distance: a 2 km

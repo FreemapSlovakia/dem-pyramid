@@ -277,14 +277,6 @@ fn curvature_drop(d: f64) -> f64 {
     d * d * (1.0 - REFRACTION_K) / (2.0 * EARTH_R)
 }
 
-/// The distance step `march_ray` takes at `d`.
-///
-/// Shared with `peak_is_visible`, whose whole tolerance rests on matching the
-/// marcher exactly. Stated twice it was wrong twice, so it is stated once.
-fn marcher_step(d: f64, lat: f64, coarsest: u32, finest: u32) -> f64 {
-    ground_res(level_for(d, lat, coarsest, finest), lat)
-}
-
 /// Initial bearing, degrees clockwise from north.
 pub fn initial_bearing(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
     let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
@@ -336,7 +328,20 @@ impl Column {
     }
 }
 
+/// Nothing can stand below straight down, so this is "no terrain" as an angle.
+/// A real value keeps the horizon interpolable where one ray sees only sky.
+const NO_HORIZON: f64 = -90.0;
+
 /// March one ray and fill its column.
+///
+/// `probe_d` holds distances, ascending, at which the caller wants the horizon
+/// -- the highest elevation angle reached by terrain strictly nearer than
+/// that. `probe_h` receives one angle per probe. This is how peaks are
+/// answered: the marcher is already computing the running maximum that decides
+/// what the image shows, so asking it directly is both cheaper and impossible
+/// to disagree with. Reading it back out of the finished column instead made
+/// visibility depend on the render's own row height, which cost 36% of the
+/// labels at coarse quality.
 #[allow(clippy::too_many_arguments)]
 fn march_ray(
     pyr: &mut Pyramid,
@@ -348,7 +353,12 @@ fn march_ray(
     coarsest: u32,
     finest: u32,
     col: &mut Column,
+    probe_d: &[f64],
+    probe_h: &mut Vec<f64>,
 ) -> usize {
+    probe_h.clear();
+    probe_h.resize(probe_d.len(), NO_HORIZON);
+    let mut probe_i = 0usize;
     let mut samples = 0usize;
     let mut max_alpha = f64::NEG_INFINITY;
     // Row 0 is the top of the frame, so a larger angle means a smaller row
@@ -361,6 +371,16 @@ fn march_ray(
     while d < p.max_range {
         let z = level_for(d, p.lat, coarsest, finest);
         let step = ground_res(z, p.lat);
+
+        // Answer probes before sampling, and one step early: the interval that
+        // brackets a summit contains the summit's own ground, and a broad top
+        // read at its near lip would occlude itself. Skipping that interval is
+        // a geometric statement, where the old distance comparison needed a
+        // fudge factor -- which was wrong three times over.
+        while probe_i < probe_d.len() && probe_d[probe_i] <= d + step {
+            probe_h[probe_i] = max_alpha.max(NO_HORIZON);
+            probe_i += 1;
+        }
 
         let (lon, lat) = destination(p.lon, p.lat, az, d);
         let (sx, sy) = lonlat_to_merc(lon, lat);
@@ -415,6 +435,11 @@ fn march_ray(
             }
         }
         d += step;
+    }
+    // Past the last sample, or out the early exit once the column filled:
+    // whatever the horizon had reached stands for everything beyond.
+    for h in &mut probe_h[probe_i..] {
+        *h = max_alpha.max(NO_HORIZON);
     }
     samples
 }
@@ -700,40 +725,6 @@ impl Cancel {
     }
 }
 
-/// Is a peak visible, judged from the column its bearing falls in?
-///
-/// No extra rays: the column already says how far the visible surface is at
-/// every angle, so the peak is visible exactly when nothing nearer occupies
-/// its cell.
-fn peak_is_visible(
-    altitude: f64,
-    distance: f64,
-    spacing: f64,
-    col: &Column,
-    p: &Params,
-    alt_step: f64,
-    height: usize,
-) -> bool {
-    let row = ((p.alt_max - altitude) / alt_step).floor();
-    if row < 0.0 || row >= height as f64 {
-        return false;
-    }
-    // A summit is its own terrain, so it ties with the surface rather than
-    // beating it; allow a little slack. The slack is the step the marcher
-    // actually took here, because that is what quantises the recorded
-    // distance: the sample winning a broad summit's row can sit a full step
-    // short of the summit itself. Any constant is wrong -- below ~7.2 km
-    // level_for pins to the finest level, so the step stops shrinking and its
-    // relative size grows to 1.25% at 500 m. CELL_PER_METRE floors it for the
-    // long range, where the chosen level is finer than the distance needs.
-    let tolerance = 1.0 - (spacing / distance).max(CELL_PER_METRE);
-    match col.dist[row as usize] {
-        // Pokes into sky: sharper than the averaged DEM the ray walked.
-        d if !d.is_finite() => true,
-        d => d >= distance * tolerance,
-    }
-}
-
 /// What every peak's dominance walk shares: the frame it reads and the
 /// geometry needed to turn a pixel back into an elevation.
 struct Frame<'a> {
@@ -956,15 +947,40 @@ pub fn render(
         eye
     };
 
-    // Which peaks belong to which ray.
-    let mut by_sub: HashMap<usize, Vec<usize>> = HashMap::new();
+    // Each peak is answered by the two rays that *bracket* its bearing, not by
+    // the one whose cell it happens to fall in. A single ray sits up to half a
+    // ray-spacing off the true bearing -- 210 m of ground at 60 km on the
+    // coarse tier -- and tests a line of sight that is not the peak's. Both
+    // rays are marched anyway, so sandwiching the bearing and interpolating
+    // between their horizons costs one extra bucket entry and a lerp.
+    //
+    // Ray k looks along sub-column centre k + 0.5, so a peak at fractional
+    // position u lies between rays floor(u - 0.5) and that plus one.
+    let sub_cols = out_w * ssx as usize;
+    let mut by_sub: HashMap<usize, Vec<(f64, usize, u8)>> = HashMap::new();
+    // Interpolation weight between the two bracketing rays, per peak.
+    let mut blend = vec![0.0f64; peaks.len()];
     for (i, pk) in peaks.iter().enumerate() {
-        if let Some(c) = pk.column {
-            by_sub.entry(c).or_default().push(i);
+        let Some(sub) = pk.column else { continue };
+        // pk.x is fractional output columns; sub-columns are ssx times finer.
+        debug_assert_eq!(sub, (pk.x * f64::from(ssx)).floor() as usize);
+        let u = pk.x * f64::from(ssx) - 0.5;
+        let k0 = u.floor();
+        blend[i] = u - k0;
+        for (slot, k) in [(0u8, k0), (1, k0 + 1.0)] {
+            if k >= 0.0 && (k as usize) < sub_cols {
+                by_sub
+                    .entry(k as usize)
+                    .or_default()
+                    .push((pk.distance, i, slot));
+            }
         }
     }
+    // The marcher answers probes in the order it reaches them.
+    for v in by_sub.values_mut() {
+        v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    }
     let by_sub = Arc::new(by_sub);
-    let peak_geom: Vec<(f64, f64)> = peaks.iter().map(|k| (k.altitude, k.distance)).collect();
 
     let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let chunk = out_w.div_ceil(threads).max(1);
@@ -981,7 +997,9 @@ pub fn render(
         samples: usize,
         blocks: usize,
         sky: usize,
-        answers: Vec<(usize, bool)>,
+        /// Peak index, which bracketing ray this was, and that ray's horizon
+        /// angle at the peak's distance.
+        answers: Vec<(usize, u8, f64)>,
     }
     let parts: Vec<ChunkOut> = (0..out_w)
         .step_by(chunk)
@@ -992,7 +1010,9 @@ pub fn render(
             let mut pyr = Pyramid::open(root, doc)?;
             let mut pixels = vec![[0u8; 3]; cols * out_h];
             let mut depth = vec![0u16; cols * out_h];
-            let mut peak_results: Vec<(usize, bool)> = Vec::new();
+            let mut peak_results: Vec<(usize, u8, f64)> = Vec::new();
+            let mut probe_d: Vec<f64> = Vec::new();
+            let mut probe_h: Vec<f64> = Vec::new();
             let mut samples = 0usize;
             let mut sky = 0usize;
 
@@ -1010,21 +1030,20 @@ pub fn render(
                     column.cover.fill(0.0);
                     let sub = oc * ssx as usize + k as usize;
                     let az = p.az_start + (sub as f64 + 0.5) * az_step;
+
+                    // Peaks this ray brackets, and where along it they sit.
+                    let probes = by_sub.get(&sub).map_or(&[][..], Vec::as_slice);
+                    probe_d.clear();
+                    probe_d.extend(probes.iter().map(|&(d, _, _)| d));
+
                     samples += march_ray(
                         &mut pyr, p, eye, az, alt_step, sub_h, coarsest, finest, &mut column,
+                        &probe_d, &mut probe_h,
                     );
                     sky += column.dist.iter().filter(|d| d.is_infinite()).count();
 
-                    // Peaks whose bearing falls in this exact ray.
-                    if let Some(idxs) = by_sub.get(&sub) {
-                        for &i in idxs {
-                            let (altitude, distance) = peak_geom[i];
-                            let spacing = marcher_step(distance, p.lat, coarsest, finest);
-                            let vis = peak_is_visible(
-                                altitude, distance, spacing, &column, p, alt_step, sub_h,
-                            );
-                            peak_results.push((i, vis));
-                        }
+                    for (&(_, i, slot), &h) in probes.iter().zip(probe_h.iter()) {
+                        peak_results.push((i, slot, h));
                     }
 
                     // Depth takes the nearest sub-sample rather than the mean:
@@ -1080,6 +1099,8 @@ pub fn render(
     let mut blocks = 0usize;
     let mut sky = 0usize;
     let mut cells = 0usize;
+    // Horizon angle from each bracketing ray, per peak.
+    let mut horizon = vec![[f64::NAN; 2]; peaks.len()];
     for part in parts {
         let ChunkOut {
             start,
@@ -1090,8 +1111,8 @@ pub fn render(
         samples += part.samples;
         blocks += part.blocks;
         sky += part.sky;
-        for &(i, visible) in &part.answers {
-            peaks[i].visible = visible;
+        for &(i, slot, h) in &part.answers {
+            horizon[i][slot as usize] = h;
         }
         let cols = pixels.len() / out_h;
         cells += cols * sub_h * ssx as usize;
@@ -1106,6 +1127,22 @@ pub fn render(
                 );
             }
         }
+    }
+
+    // A summit is visible when it stands above the horizon along the line of
+    // sight to it. The two bracketing rays give the horizon either side of
+    // that bearing; interpolating between them lands on the bearing itself,
+    // and where a peak sits at the frame edge only one ray exists to use.
+    //
+    // Being in frame is a separate question, and `peaks::select` asks it.
+    for (i, pk) in peaks.iter_mut().enumerate() {
+        let t = blend[i];
+        pk.visible = match horizon[i] {
+            [h0, h1] if h0.is_nan() && h1.is_nan() => false,
+            [h0, h1] if h1.is_nan() => pk.altitude >= h0,
+            [h0, h1] if h0.is_nan() => pk.altitude >= h1,
+            [h0, h1] => pk.altitude >= h0 + (h1 - h0) * t,
+        };
     }
 
     // Dominance reads across columns, so it waits until they are merged.
