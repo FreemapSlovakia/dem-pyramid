@@ -220,10 +220,10 @@ rank on the value, but do not treat it as a magnitude — `Math.abs` or a
 `dominance: 0` means only that nothing at the peak's own depth was found to
 compare it against.
 
-Two honest limits. Where a valley runs alongside a peak rather than a ridge,
-the figure reads the valley depth and comes out high. Where the surrounding
-cols are hidden behind nearer ground it reads whatever hides them, and comes
-out low — under-labelling being the safer failure.
+One honest limit: where a valley runs alongside a peak rather than a ridge,
+the figure reads the valley depth and comes out high. Terrain hidden behind
+nearer ground no longer biases it — the measurement uses every elevation the
+ray marcher sampled, not only the surfaces that ended up drawn.
 
 **Which peaks are visible no longer depends on render quality**, and that is
 deliberate: names should not appear and disappear when a user changes quality
@@ -246,8 +246,7 @@ fetch peaks once at a fixed `step` and vary quality only for the image.
 Making this exact needs dominance to stop being a render-time measurement: true
 topographic prominence is a property of the summit, computable once from the
 DEM at ingest and stored with the peak. That would be perfectly stable, free
-per request, and is the intended direction. This is not a filter bug — if you
-need a stable set across zoom levels, pin `step` for the peak query.
+per request, and is the intended direction.
 
 Metres, not degrees, because degrees are not comparable across distance: a 2 km
 hill subtends more than the whole High Tatra range and would outrank every

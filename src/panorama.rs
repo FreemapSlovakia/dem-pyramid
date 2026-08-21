@@ -359,8 +359,26 @@ impl Profile {
         ((t.clamp(0.0, 1.0) * (PROFILE_BINS - 1) as f64) as usize).min(PROFILE_BINS - 1)
     }
 
-    fn record(&mut self, col: usize, d: f64, h: f64) {
-        let slot = &mut self.max_h[col * PROFILE_BINS + Profile::bin_of(d)];
+    /// Upper edge of each bin, so the marcher can walk bins instead of taking
+    /// a logarithm per sample -- which is what it does millions of times.
+    fn edges() -> [f64; PROFILE_BINS] {
+        let mut e = [0.0; PROFILE_BINS];
+        let span = DEPTH_FAR.ln() - DEPTH_NEAR.ln();
+        for (i, edge) in e.iter_mut().enumerate() {
+            *edge = (DEPTH_NEAR.ln() + span * (i as f64 + 1.0) / (PROFILE_BINS - 1) as f64).exp();
+        }
+        e
+    }
+
+    /// Record a sample, given a bin cursor the caller advances monotonically.
+    ///
+    /// `d` only ever grows within a ray, so the bin is found by stepping
+    /// forward from wherever the last sample left off.
+    fn record(&mut self, col: usize, bin: &mut usize, edges: &[f64; PROFILE_BINS], d: f64, h: f64) {
+        while *bin + 1 < PROFILE_BINS && d >= edges[*bin] {
+            *bin += 1;
+        }
+        let slot = &mut self.max_h[col * PROFILE_BINS + *bin];
         *slot = slot.max(h as f32);
     }
 
@@ -383,10 +401,6 @@ impl Column {
         }
     }
 }
-
-/// Nothing can stand below straight down, so this is "no terrain" as an angle.
-/// A real value keeps the horizon interpolable where one ray sees only sky.
-const NO_HORIZON: f64 = -90.0;
 
 /// March one ray and fill its column.
 ///
@@ -413,13 +427,17 @@ fn march_ray(
     probe_h: &mut Vec<f64>,
     profile: Option<(&mut Profile, usize)>,
 ) -> usize {
-    let (profile, profile_col) = match profile {
+    let (mut profile, profile_col) = match profile {
         Some((p, c)) => (Some(p), c),
         None => (None, 0),
     };
-    let mut profile = profile;
+    let profile_edges = Profile::edges();
+    let mut profile_bin = 0usize;
     probe_h.clear();
-    probe_h.resize(probe_d.len(), NO_HORIZON);
+    // NEG_INFINITY carries "this ray found no ground at all before here" all
+    // the way to the caller, which must not confuse it with a low horizon:
+    // it means no coverage, not open sky.
+    probe_h.resize(probe_d.len(), f64::NEG_INFINITY);
     let mut probe_i = 0usize;
     let mut samples = 0usize;
     let mut max_alpha = f64::NEG_INFINITY;
@@ -440,7 +458,7 @@ fn march_ray(
         // a geometric statement, where the old distance comparison needed a
         // fudge factor -- which was wrong three times over.
         while probe_i < probe_d.len() && probe_d[probe_i] <= d + step {
-            probe_h[probe_i] = max_alpha.max(NO_HORIZON);
+            probe_h[probe_i] = max_alpha;
             probe_i += 1;
         }
 
@@ -453,7 +471,7 @@ fn march_ray(
             // hidden behind a nearer crest is still ground beside a summit,
             // and dominance asks about the landscape, not the silhouette.
             if let Some(profile) = profile.as_deref_mut() {
-                profile.record(profile_col, d, h);
+                profile.record(profile_col, &mut profile_bin, &profile_edges, d, h);
             }
             let drop = curvature_drop(d);
             let alpha = ((h - eye - drop) / d).atan().to_degrees();
@@ -507,7 +525,7 @@ fn march_ray(
     // Past the last sample, or out the early exit once the column filled:
     // whatever the horizon had reached stands for everything beyond.
     for h in &mut probe_h[probe_i..] {
-        *h = max_alpha.max(NO_HORIZON);
+        *h = max_alpha;
     }
     samples
 }
@@ -818,9 +836,12 @@ impl Cancel {
 /// against -- in ridge country most tops score below it, and clamping them
 /// together left the near field unorderable.
 ///
-/// Occlusion makes this a lower bound: a col hidden behind nearer ground reads
-/// as whatever hides it, which is higher, so the figure comes out too small
-/// rather than too large. Under-labelling a peak is the safer failure.
+/// Occlusion no longer biases it. The profile records every sample the marcher
+/// took, not only the surfaces that won a row, so a col hidden behind nearer
+/// ground is still read as the col -- which is what a question about the
+/// landscape should do. What remains is sampling: the marcher only knows the
+/// bearings it cast rays along, so a coarse render sees a sparser
+/// neighbourhood and scores a little higher.
 fn dominance_m(
     profile: &Profile,
     cols: usize,
@@ -889,6 +910,7 @@ pub fn render(
 ) -> Result<(image::RgbImage, Stats)> {
     let (coarsest, finest) = (doc.grid.coarsest_level, doc.grid.finest_level);
     let (ssx, ssy) = (p.supersample_x.max(1), p.supersample_y.max(1));
+    let want_peaks = !peaks.is_empty();
 
     let out_w = (p.az_span / p.step_deg).round() as usize;
     let out_h = ((p.alt_max - p.alt_min) / p.step_deg).round() as usize;
@@ -949,20 +971,26 @@ pub fn render(
     let mut by_sub: HashMap<usize, Vec<(f64, usize, u8)>> = HashMap::new();
     // Interpolation weight between the two bracketing rays, per peak.
     let mut blend = vec![0.0f64; peaks.len()];
+    // A full circle has no edge: the ray before the first is the last one.
+    // Without this a peak in the first or last half-ray falls back to a single
+    // ray, reintroducing the very bearing error this bracketing removes, and
+    // doing it at the seam of the default render.
+    let wraps = (p.az_span - 360.0).abs() < 1e-9;
     for (i, pk) in peaks.iter().enumerate() {
-        let Some(sub) = pk.column else { continue };
+        if pk.column.is_none() {
+            continue;
+        }
         // pk.x is fractional output columns; sub-columns are ssx times finer.
-        debug_assert_eq!(sub, (pk.x * f64::from(ssx)).floor() as usize);
         let u = pk.x * f64::from(ssx) - 0.5;
         let k0 = u.floor();
         blend[i] = u - k0;
         for (slot, k) in [(0u8, k0), (1, k0 + 1.0)] {
-            if k >= 0.0 && (k as usize) < sub_cols {
-                by_sub
-                    .entry(k as usize)
-                    .or_default()
-                    .push((pk.distance, i, slot));
-            }
+            let k = match (wraps, k) {
+                (true, k) => (k as isize).rem_euclid(sub_cols as isize) as usize,
+                (false, k) if k >= 0.0 && (k as usize) < sub_cols => k as usize,
+                (false, _) => continue,
+            };
+            by_sub.entry(k).or_default().push((pk.distance, i, slot));
         }
     }
     // The marcher answers probes in the order it reaches them.
@@ -1003,7 +1031,9 @@ pub fn render(
             let mut peak_results: Vec<(usize, u8, f64)> = Vec::new();
             let mut probe_d: Vec<f64> = Vec::new();
             let mut probe_h: Vec<f64> = Vec::new();
-            let mut profile = Profile::new(cols);
+            // Only dominance reads it, so a plain image render neither
+            // allocates it nor pays a bin lookup per marched sample.
+            let mut profile = Profile::new(if want_peaks { cols } else { 0 });
             let mut samples = 0usize;
             let mut sky = 0usize;
 
@@ -1032,7 +1062,7 @@ pub fn render(
                     // lost when its neighbour misses it.
                     samples += march_ray(
                         &mut pyr, p, eye, az, alt_step, sub_h, coarsest, finest, &mut column,
-                        &probe_d, &mut probe_h, Some((&mut profile, local)),
+                        &probe_d, &mut probe_h, want_peaks.then_some((&mut profile, local)),
                     );
                     sky += column.dist.iter().filter(|d| d.is_infinite()).count();
 
@@ -1096,7 +1126,7 @@ pub fn render(
     let mut cells = 0usize;
     // Horizon angle from each bracketing ray, per peak.
     let mut horizon = vec![[f64::NAN; 2]; peaks.len()];
-    let mut profile = Profile::new(out_w);
+    let mut profile = Profile::new(if want_peaks { out_w } else { 0 });
     for part in parts {
         let ChunkOut {
             start,
@@ -1111,8 +1141,10 @@ pub fn render(
             horizon[i][slot as usize] = h;
         }
         let cols = pixels.len() / out_h;
-        profile.max_h[start * PROFILE_BINS..(start + cols) * PROFILE_BINS]
-            .copy_from_slice(&part.profile.max_h);
+        if want_peaks {
+            profile.max_h[start * PROFILE_BINS..(start + cols) * PROFILE_BINS]
+                .copy_from_slice(&part.profile.max_h);
+        }
         cells += cols * sub_h * ssx as usize;
         for orow in 0..out_h {
             for local in 0..cols {
@@ -1134,12 +1166,23 @@ pub fn render(
     //
     // Being in frame is a separate question, and `peaks::select` asks it.
     for (i, pk) in peaks.iter_mut().enumerate() {
+        let [h0, h1] = horizon[i];
         let t = blend[i];
-        pk.visible = match horizon[i] {
-            [h0, h1] if h0.is_nan() && h1.is_nan() => false,
-            [h0, h1] if h1.is_nan() => pk.altitude >= h0,
-            [h0, h1] if h0.is_nan() => pk.altitude >= h1,
-            [h0, h1] => pk.altitude >= h0 + (h1 - h0) * t,
+        // Three states, and conflating any two of them is a bug. NaN: no ray
+        // answered, so the peak is outside the rendered arc. NEG_INFINITY: a
+        // ray answered but found no ground at all before the peak -- nodata or
+        // outside coverage, not open sky. Finite: a real horizon.
+        //
+        // Only two finite horizons may be interpolated. Lerping a real one
+        // against a no-coverage ray would average a blocking ridge with a
+        // hole and let a hidden peak through, so where one side has no
+        // coverage the side that does decides -- and where neither does, no
+        // ground was found to block anything.
+        pk.visible = match (h0.is_finite(), h1.is_finite()) {
+            (true, true) => pk.altitude >= h0 + (h1 - h0) * t,
+            (true, false) => pk.altitude >= h0,
+            (false, true) => pk.altitude >= h1,
+            (false, false) => !(h0.is_nan() && h1.is_nan()),
         };
     }
 
