@@ -87,6 +87,15 @@ pub struct Request {
     /// Keep at most this many peaks, the most dominant first. 0 is no cap.
     #[serde(default)]
     max_peaks: usize,
+    /// Multiplier on the ridge silhouettes; 0 removes them.
+    #[serde(default = "d_ridge_strength")]
+    ridge_strength: f64,
+    /// `#rrggbb` for the silhouettes; black by default, which reads as shading.
+    #[serde(default)]
+    ridge_color: Option<String>,
+    /// `#rrggbb` for near terrain, before haze washes it towards the sky.
+    #[serde(default)]
+    ground_color: Option<String>,
 }
 
 fn d_az() -> f64 { 0.0 }
@@ -101,6 +110,7 @@ fn d_ss() -> u32 { 9 }
 fn d_depth_step() -> u16 { 4 }
 fn d_peaks() -> bool { true }
 fn d_min_dom() -> f64 { 30.0 }
+fn d_ridge_strength() -> f64 { 1.0 }
 
 #[derive(Clone)]
 pub struct Ctx {
@@ -221,6 +231,18 @@ async fn panorama_route(
         ));
     }
 
+    let colour = |field: &str, given: &Option<String>, fallback| match given {
+        Some(s) => panorama::parse_colour(s).map_err(|e| format!("{field}: {e}")),
+        None => Ok(fallback),
+    };
+    let (ridge_colour, ground_colour) = match (
+        colour("ridge_color", &req.ridge_color, panorama::DEFAULT_RIDGE),
+        colour("ground_color", &req.ground_color, panorama::DEFAULT_GROUND),
+    ) {
+        (Ok(r), Ok(g)) => (r, g),
+        (Err(e), _) | (_, Err(e)) => return bad(e),
+    };
+
     let p = panorama::Params {
         lon: req.lon,
         lat: req.lat,
@@ -237,6 +259,9 @@ async fn panorama_route(
         eye_level: false,
         supersample_x: req.supersample_x.clamp(1, MAX_SUPERSAMPLE),
         supersample_y: req.supersample_y.clamp(1, MAX_SUPERSAMPLE),
+        ridge_strength: req.ridge_strength.clamp(0.0, 4.0),
+        ridge_colour,
+        ground_colour,
     };
 
     // Cancellation has to be cooperative: a blocking task cannot be killed,

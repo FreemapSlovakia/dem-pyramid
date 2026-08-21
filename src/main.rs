@@ -134,6 +134,15 @@ enum Command {
         /// Draw the eye-level line at 0 degrees.
         #[arg(long, default_value_t = false)]
         eye_level: bool,
+        /// Multiplier on the ridge silhouettes; 0 removes them.
+        #[arg(long, default_value_t = 1.0)]
+        ridge_strength: f64,
+        /// Silhouette colour, #rrggbb. Black reads as shading.
+        #[arg(long)]
+        ridge_color: Option<String>,
+        /// Near-terrain colour, #rrggbb, before haze washes it out.
+        #[arg(long)]
+        ground_color: Option<String>,
         /// Also write a 16-bit greyscale depth image, log-encoded, 0 for sky.
         ///
         /// Lets the client answer "how far is that ridge" for any pixel.
@@ -335,6 +344,9 @@ fn main() -> Result<()> {
             edge_ratio,
             edge_hidden_ref,
             eye_level,
+            ridge_strength,
+            ridge_color,
+            ground_color,
             depth_out,
             depth_raw,
             depth_step,
@@ -361,6 +373,15 @@ fn main() -> Result<()> {
                 eye_level,
                 supersample_x,
                 supersample_y,
+                ridge_strength,
+                ridge_colour: match &ridge_color {
+                    Some(s) => panorama::parse_colour(s)?,
+                    None => panorama::DEFAULT_RIDGE,
+                },
+                ground_colour: match &ground_color {
+                    Some(s) => panorama::parse_colour(s)?,
+                    None => panorama::DEFAULT_GROUND,
+                },
             };
             let t0 = std::time::Instant::now();
             // Nothing cancels a CLI render; the flag exists for the server.

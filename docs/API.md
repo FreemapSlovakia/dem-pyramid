@@ -44,6 +44,9 @@ All fields except `lon` and `lat` are optional.
 | `peaks` | bool | `true` | include peak labels |
 | `min_dominance` | number | `30` | drop peaks standing less than this above their surroundings, metres; may be negative |
 | `max_peaks` | int | `0` | keep at most this many, most dominant first; 0 is no cap |
+| `ridge_strength` | number | `1` | multiplier on the ridge silhouettes; 0 removes them (0–4) |
+| `ridge_color` | string | `#000000` | silhouette colour, `#rrggbb` or `#rgb` |
+| `ground_color` | string | `#3a4a34` | near-terrain colour, before haze |
 
 Image dimensions follow from the angles:
 
@@ -84,6 +87,33 @@ Three things multiply those figures, and they compound:
 
 So budget for several times the table under real conditions, and treat these as
 a floor rather than a promise.
+
+### Styling
+
+Three knobs, all optional, all defaulting to exactly what the renderer drew
+before they existed — omit them and nothing changes.
+
+`ridge_strength` scales the silhouettes the renderer strokes along ridge
+lines. `0` removes them, leaving pure shaded terrain; `2` gives a drawn,
+map-like look. Above about `3` the strokes start to merge on busy horizons.
+
+`ridge_color` is what those strokes are drawn in. Black is the default and
+reads as shading, since inking towards black is a plain multiply. A colour
+near the ground makes ridges read as folds rather than outlines, and a light
+ink on dark ground gives an engraved effect.
+
+`ground_color` is near terrain before haze washes it towards the sky. Haze is
+unchanged, so a warm ground still fades to the same blue with distance —
+which is what keeps depth readable whatever colour you choose.
+
+```jsonc
+{ "ridge_strength": 0 }                        // shaded relief, no linework
+{ "ridge_strength": 2.2, "ground_color": "#7a6a4a" }   // drawn, sandy
+{ "ridge_color": "#2b1a10", "ground_color": "#d8cfc0" } // engraved
+```
+
+Both colours take `#rrggbb` or `#rgb`, with or without the `#`. A malformed
+colour is a `400` naming the field, not a silently ignored parameter.
 
 ## Queueing and cancellation
 

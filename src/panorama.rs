@@ -87,6 +87,16 @@ pub struct Params {
     ///
     /// Stroke width is expressed in output pixels, so it scales with this.
     pub supersample_y: u32,
+
+    /// How heavily ridge silhouettes are inked, as a multiplier on the
+    /// strength the geometry calls for. 0 removes them entirely.
+    pub ridge_strength: f64,
+    /// What the silhouettes are drawn in. Black is the default and reads as
+    /// shading; a lighter ink gives an engraved look, and a colour matching
+    /// the ground makes ridges read as folds rather than outlines.
+    pub ridge_colour: (f64, f64, f64),
+    /// Colour of near terrain, before haze washes it towards the sky.
+    pub ground_colour: (f64, f64, f64),
 }
 
 /// One pyramid level, with a block cache over its GTI index.
@@ -625,7 +635,7 @@ fn shade_column(col: &Column, p: &Params, alt_step: f64, height: usize) -> Vec<(
             // Near terrain is dark and saturated, far terrain washes out
             // towards the sky colour.
             let t = 1.0 - (-d / haze).exp();
-            let base = (58.0, 74.0, 52.0);
+            let base = p.ground_colour;
             (
                 lerp(base.0, sky.0, t),
                 lerp(base.1, sky.1, t),
@@ -651,7 +661,7 @@ fn shade_column(col: &Column, p: &Params, alt_step: f64, height: usize) -> Vec<(
             continue;
         }
         let depth_fade = 0.45 + 0.4 * (1.0 - (-col.dist[row] / haze).exp());
-        let amount = s * (1.0 - depth_fade);
+        let amount = s * (1.0 - depth_fade) * p.ridge_strength;
 
         // Coverage encodes where the band's top edge actually falls: a row
         // covered `c` by its band has that edge at `row + (1 - c)`.
@@ -695,8 +705,15 @@ fn shade_column(col: &Column, p: &Params, alt_step: f64, height: usize) -> Vec<(
                 front
             };
 
-            let k = 1.0 - ink[row].clamp(0.0, 1.0);
-            let px = (px.0 * k, px.1 * k, px.2 * k);
+            // Blended towards the ink colour rather than scaled towards black,
+            // so the default (black, full strength) is the multiply it always
+            // was and any other colour composites the same way.
+            let k = ink[row].clamp(0.0, 1.0);
+            let px = (
+                lerp(px.0, p.ridge_colour.0, k),
+                lerp(px.1, p.ridge_colour.1, k),
+                lerp(px.2, p.ridge_colour.2, k),
+            );
 
             // Faint eye-level line at 0 deg.
             if p.eye_level && alt.abs() < alt_step * 0.5 {
@@ -1294,6 +1311,30 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
 }
 
+/// Parse `#rrggbb`, or `rrggbb`, or the three-digit short form.
+///
+/// Hex because the caller is a web client and this is what it already has;
+/// the renderer works in floating point, so the value is widened once here
+/// rather than being quantised on the way in.
+pub fn parse_colour(s: &str) -> Result<(f64, f64, f64)> {
+    let h = s.trim().trim_start_matches('#');
+    let digits: Vec<u32> = h
+        .chars()
+        .map(|c| c.to_digit(16).with_context(|| format!("bad colour {s:?}")))
+        .collect::<Result<_>>()?;
+    let ch = |hi: u32, lo: u32| f64::from(hi * 16 + lo);
+    match digits[..] {
+        [r, g, b] => Ok((ch(r, r), ch(g, g), ch(b, b))),
+        [r0, r1, g0, g1, b0, b1] => Ok((ch(r0, r1), ch(g0, g1), ch(b0, b1))),
+        _ => anyhow::bail!("colour {s:?} wants 3 or 6 hex digits"),
+    }
+}
+
+/// Terrain as it renders without haze: a muted green.
+pub const DEFAULT_GROUND: (f64, f64, f64) = (58.0, 74.0, 52.0);
+/// Silhouettes darken what they cross, which is a multiply towards black.
+pub const DEFAULT_RIDGE: (f64, f64, f64) = (0.0, 0.0, 0.0);
+
 /// Quantise to a byte, dithered by position and rounded rather than truncated.
 fn clamp(v: f64, x: usize, y: usize) -> u8 {
     (v + dither(x, y)).clamp(0.0, 255.0).round() as u8
@@ -1589,6 +1630,31 @@ mod tests {
         let mean = column.iter().map(|&v| f64::from(v)).sum::<f64>() / 64.0;
         let want = (0..64).map(value).sum::<f64>() / 64.0;
         assert!((mean - want).abs() < 0.5, "mean drifted: {mean} vs {want}");
+    }
+
+    // ---- colours ----------------------------------------------------------
+
+    #[test]
+    fn colours_parse_in_the_forms_a_web_client_has() {
+        assert_eq!(parse_colour("#3a4a34").unwrap(), (58.0, 74.0, 52.0));
+        assert_eq!(parse_colour("3a4a34").unwrap(), (58.0, 74.0, 52.0));
+        assert_eq!(parse_colour("  #FFF  ").unwrap(), (255.0, 255.0, 255.0));
+        assert_eq!(parse_colour("#000").unwrap(), (0.0, 0.0, 0.0));
+        for bad in ["", "#12", "#12345", "#gg0000", "#1234567"] {
+            assert!(parse_colour(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    /// The defaults have to be exactly the colours that were hard-coded, or
+    /// making them configurable would quietly restyle every existing client.
+    #[test]
+    fn defaults_match_the_previous_hard_coded_colours() {
+        assert_eq!(DEFAULT_GROUND, (58.0, 74.0, 52.0));
+        assert_eq!(DEFAULT_RIDGE, (0.0, 0.0, 0.0));
+        // Inking towards black is the multiply the old code did.
+        for k in [0.0, 0.25, 1.0] {
+            assert_eq!(lerp(200.0, DEFAULT_RIDGE.0, k), 200.0 * (1.0 - k));
+        }
     }
 
     // ---- geometry ---------------------------------------------------------
