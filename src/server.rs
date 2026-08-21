@@ -21,7 +21,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::Deserialize;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -35,6 +34,9 @@ use crate::{panorama, peaks};
 const MAX_PIXELS: usize = 24_000_000;
 const MAX_SUPERSAMPLE: u32 = 9;
 const MIN_STEP: f64 = 0.02;
+
+/// One multipart part: field name, optional filename, bytes.
+type Part = (String, Option<String>, Vec<u8>);
 
 #[derive(Deserialize)]
 pub struct Request {
@@ -276,7 +278,7 @@ async fn panorama_route(
     let max_peaks = req.max_peaks;
 
     let render_cancel = cancel.clone();
-    let built = tokio::task::spawn_blocking(move || -> Result<Vec<(String, Option<String>, Vec<u8>)>> {
+    let built = tokio::task::spawn_blocking(move || -> Result<Vec<Part>> {
         // The permit lives here, not in the handler. Handler locals drop in
         // reverse declaration order, so a permit held there would be released
         // the instant the client hung up -- admitting the next render while
@@ -293,19 +295,7 @@ async fn panorama_route(
         };
         let (img, stats) = panorama::render(&root, &doc, &p, &cancel, &mut found)?;
 
-        found.retain(|k| {
-            k.visible
-                && k.column >= 0
-                && k.dominance >= min_dom
-                && k.y >= 0.0
-                && k.y <= stats.height as f64
-        });
-        found.sort_by(|a, b| b.dominance.partial_cmp(&a.dominance).unwrap());
-        // After sorting, so a cap keeps the most dominant summits rather than
-        // an arbitrary slice. Zero means no cap.
-        if max_peaks > 0 {
-            found.truncate(max_peaks);
-        }
+        peaks::select(&mut found, min_dom, max_peaks, stats.height);
 
         let meta = serde_json::json!({
             "width": stats.width,
@@ -327,7 +317,7 @@ async fn panorama_route(
             "peaks": found,
         });
 
-        let mut parts: Vec<(String, Option<String>, Vec<u8>)> = Vec::new();
+        let mut parts: Vec<Part> = Vec::new();
         parts.push(("meta".into(), None, serde_json::to_vec(&meta)?));
 
         let mut png = std::io::Cursor::new(Vec::new());
@@ -339,33 +329,10 @@ async fn panorama_route(
         ));
 
         if want_depth {
-            let mut raw = Vec::with_capacity(stats.width * stats.height * 2);
-            for row in 0..stats.height {
-                let mut prev = 0i32;
-                for col in 0..stats.width {
-                    let v = stats.depth.get_pixel(col as u32, row as u32)[0];
-                    // Floored to a multiple of depth_step, but never onto 0 --
-                    // that is the sky sentinel, and integer division sent
-                    // every value below depth_step there. Ground within 10 m
-                    // encodes as 1, so from a normal eye height the bottom of
-                    // the frame is full of it: half the last row was being
-                    // handed to the client as sky.
-                    let q = if v == 0 {
-                        0
-                    } else {
-                        ((v / depth_step) * depth_step).max(depth_step)
-                    };
-                    raw.extend_from_slice(&((i32::from(q) - prev) as i16).to_le_bytes());
-                    prev = i32::from(q);
-                }
-            }
-            let mut enc =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-            enc.write_all(&raw)?;
             parts.push((
                 "depth".into(),
                 Some("depth.bin.gz".into()),
-                enc.finish()?,
+                panorama::depth_bytes(&stats.depth, depth_step)?,
             ));
         }
         Ok(parts)

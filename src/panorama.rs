@@ -35,6 +35,9 @@ const EARTH_R: f64 = 6371000.0;
 const REFRACTION_K: f64 = 0.13;
 /// Cell size needed at distance d is d * this, for a 0.05 deg/px step.
 const CELL_PER_METRE: f64 = 0.00087;
+/// Ground radius a summit must stand clear of to count as dominant, metres.
+/// One decision, so it sets both the depth band and the angular window.
+const DOMINANCE_RADIUS: f64 = 3000.0;
 const BLOCK: usize = 512;
 
 pub struct Params {
@@ -264,6 +267,24 @@ pub fn great_circle(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
     2.0 * EARTH_R * a.sqrt().asin()
 }
 
+/// How far the surface falls away over `d` metres, curvature less refraction.
+///
+/// Written out at every site that projects terrain -- the marcher, the peak
+/// geometry, the elevation the dominance walk reads back -- and those three
+/// must agree or a summit is measured in a different geometry than it was
+/// drawn in.
+fn curvature_drop(d: f64) -> f64 {
+    d * d * (1.0 - REFRACTION_K) / (2.0 * EARTH_R)
+}
+
+/// The distance step `march_ray` takes at `d`.
+///
+/// Shared with `peak_is_visible`, whose whole tolerance rests on matching the
+/// marcher exactly. Stated twice it was wrong twice, so it is stated once.
+fn marcher_step(d: f64, lat: f64, coarsest: u32, finest: u32) -> f64 {
+    ground_res(level_for(d, lat, coarsest, finest), lat)
+}
+
 /// Initial bearing, degrees clockwise from north.
 pub fn initial_bearing(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
     let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
@@ -346,7 +367,7 @@ fn march_ray(
 
         if let Some(h) = pyr.sample(z, sx, sy) {
             samples += 1;
-            let drop = d * d * (1.0 - REFRACTION_K) / (2.0 * EARTH_R);
+            let drop = curvature_drop(d);
             let alpha = ((h - eye - drop) / d).atan().to_degrees();
 
             if alpha > max_alpha {
@@ -612,6 +633,49 @@ pub fn decode_depth(v: u16) -> Option<f64> {
     })
 }
 
+/// Round a depth sample down to a multiple of `step`, never onto the sentinel.
+///
+/// Quantising in the offset from the sentinel rather than in the raw value is
+/// what makes that guarantee structural. Flooring the value itself sends
+/// everything below `step` to 0 -- ground within `DEPTH_NEAR` encodes as 1, so
+/// at the default step the bottom of every frame arrived as sky. That was
+/// written, and then fixed, once per emitter, because both emitters open-coded
+/// it; the sentinel's rule now lives beside the codec that defines it.
+pub fn quantise_depth(v: u16, step: u16) -> u16 {
+    match v {
+        0 => 0,
+        v => 1 + ((v - 1) / step.max(1)) * step.max(1),
+    }
+}
+
+/// The depth channel as it goes over the wire: quantised, delta-coded along
+/// each row, gzipped.
+///
+/// Deltas are `i16` over `u16` values, so a step between sky and distant
+/// terrain overflows deliberately; readers accumulate modulo 65536. Rows reset
+/// the accumulator, which costs one full-width value per row and keeps a
+/// corrupt row from poisoning the rest.
+pub fn depth_bytes(
+    depth: &image::ImageBuffer<image::Luma<u16>, Vec<u16>>,
+    step: u16,
+) -> Result<Vec<u8>> {
+    use std::io::Write;
+
+    let (w, h) = (depth.width(), depth.height());
+    let mut raw = Vec::with_capacity(w as usize * h as usize * 2);
+    for row in 0..h {
+        let mut prev = 0i32;
+        for col in 0..w {
+            let q = quantise_depth(depth.get_pixel(col, row).0[0], step);
+            raw.extend_from_slice(&((i32::from(q) - prev) as i16).to_le_bytes());
+            prev = i32::from(q);
+        }
+    }
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(&raw)?;
+    Ok(enc.finish()?)
+}
+
 /// Cooperative cancellation.
 ///
 /// A blocking task cannot be killed from outside -- dropping its JoinHandle
@@ -655,20 +719,13 @@ fn peak_is_visible(
         return false;
     }
     // A summit is its own terrain, so it ties with the surface rather than
-    // beating it; allow a little slack. It has to be the step the marcher
-    // actually took at this distance, which quantises the recorded value: the
-    // sample winning a broad summit's row can sit a full step short of the
-    // summit itself.
-    //
-    // Two wrong constants preceded this. step_deg * 0.002 gave 0.01% at the
-    // default step, several times tighter than the spacing, and moved with
-    // resolution while the spacing did not. CELL_PER_METRE is right only
-    // beyond ~7.2 km: nearer than that level_for is pinned to the finest
-    // level, so the step stops shrinking with distance and its *relative*
-    // size grows -- 0.31% at 2 km, 1.25% at 500 m. A near summit filling the
-    // frame still reported as hidden, in exactly the near field these labels
-    // matter most for. The floor keeps the long-range case where the chosen
-    // level is finer than the distance strictly needs.
+    // beating it; allow a little slack. The slack is the step the marcher
+    // actually took here, because that is what quantises the recorded
+    // distance: the sample winning a broad summit's row can sit a full step
+    // short of the summit itself. Any constant is wrong -- below ~7.2 km
+    // level_for pins to the finest level, so the step stops shrinking and its
+    // relative size grows to 1.25% at 500 m. CELL_PER_METRE floors it for the
+    // long range, where the chosen level is finer than the distance needs.
     let tolerance = 1.0 - (spacing / distance).max(CELL_PER_METRE);
     match col.dist[row as usize] {
         // Pokes into sky: sharper than the averaged DEM the ray walked.
@@ -684,8 +741,9 @@ struct Frame<'a> {
     eye: f64,
     /// Tangent of each output row's altitude, precomputed per frame.
     tan_alt: Vec<f64>,
-    /// Ground radius the neighbourhood spans, metres.
-    radius: f64,
+    /// Every distance the encoding can express, so the walk never calls `exp`.
+    /// 512 KB built once, against a `ln`/`exp` pair per row read otherwise.
+    depth_lut: Vec<f64>,
 }
 
 /// Highest ground *elevation* visible in one column within a distance band, or
@@ -700,18 +758,62 @@ struct Frame<'a> {
 /// The band test runs in encoded space -- the depth encoding is monotone in
 /// distance -- so only rows that pass it are ever decoded. 0 is sky and must
 /// be excluded explicitly: it encodes below every real distance.
+/// The band is a contiguous run of rows, so it is found rather than scanned.
+/// `march_ray` fills a column bottom-up from a running maximum, so distance is
+/// monotone non-increasing down the column with sky as a prefix and no holes
+/// -- taking the nearest of the supersampled block preserves that, and the
+/// encoding is monotone in distance. Verified on a rendered frame: no
+/// inversions and no holes in 1029 sampled columns. Should that fill order
+/// ever change, this silently reads the wrong rows, so it is stated here.
 fn profile_at(f: &Frame, col: u32, band: (u16, u16)) -> Option<f64> {
+    let h = f.depth.height();
+    let at = |row: u32| f.depth.get_pixel(col, row).0[0];
+
+    // First row at or below the far edge, then the first past the near edge.
+    // Sky is 0 and sorts below every distance, so it has to be excluded from
+    // the predicate rather than treated as "very near".
+    let start = partition_point(h, |r| {
+        let v = at(r);
+        v == 0 || v > band.1
+    });
+    let end = partition_point(h, |r| {
+        let v = at(r);
+        v == 0 || v >= band.0
+    });
+
     let mut best = f64::NEG_INFINITY;
-    for row in 0..f.depth.height() {
-        let v = f.depth.get_pixel(col, row).0[0];
-        if v < band.0 || v > band.1 || v == 0 {
+    for row in start..end {
+        let v = at(row);
+        if v == 0 {
             continue;
         }
-        let Some(d) = decode_depth(v) else { continue };
-        let drop = d * d * (1.0 - REFRACTION_K) / (2.0 * EARTH_R);
-        best = best.max(f.eye + drop + d * f.tan_alt[row as usize]);
+        best = best.max(elevation_at_row(f, row, v));
     }
     best.is_finite().then_some(best)
+}
+
+/// Elevation of the surface recorded at `row` of a column, metres.
+///
+/// The inverse of what `march_ray` projects, and it has to stay that way or
+/// dominance is measured in a different geometry than visibility was. Reads
+/// the tangent and the distance from tables rather than recomputing them:
+/// this runs once per row of every column the dominance walk touches.
+fn elevation_at_row(f: &Frame, row: u32, v: u16) -> f64 {
+    let d = f.depth_lut[v as usize];
+    f.eye + curvature_drop(d) + d * f.tan_alt[row as usize]
+}
+
+/// Index of the first row in `0..h` where `pred` stops holding.
+///
+/// `slice::partition_point` over a virtual range: the rows live in an
+/// `ImageBuffer` column, not a slice.
+fn partition_point(h: u32, pred: impl Fn(u32) -> bool) -> u32 {
+    let (mut lo, mut hi) = (0u32, h);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if pred(mid) { lo = mid + 1 } else { hi = mid }
+    }
+    lo
 }
 
 /// How far a summit rises above the terrain beside it *at its own depth*, in
@@ -723,39 +825,31 @@ fn profile_at(f: &Frame, col: u32, band: (u16, u16)) -> Option<f64> {
 /// statement of what makes a summit worth labelling: one standing clear of its
 /// neighbours reads as a peak, one on a long level ridge does not.
 ///
-/// Comparing against the skyline was wrong, and silently discarded the whole
-/// foreground. A hill 2 km away with a mountain range behind it is not on the
-/// skyline at all, so the walk hit higher ground immediately on both sides and
-/// returned zero -- every near peak scored exactly 0 and was filtered out.
 /// What a peak must stand clear of is its *neighbours*, not the backdrop, so
-/// the profile is built per peak from terrain at a comparable depth: a band
-/// around the peak's own distance, wide enough to hold a ridge running
-/// obliquely away, narrow enough to drop what stands behind.
+/// the profile comes from terrain at a comparable depth: a band around the
+/// peak's own distance, wide enough to hold a ridge running obliquely away,
+/// narrow enough to drop what stands behind. The skyline is the wrong
+/// reference -- a hill with a range behind it is not on it at all.
 ///
 /// Follows topographic prominence in shape: walk out each way to where the
 /// ground rises above the summit, and take the higher of the two lowest points
-/// found. In metres rather than degrees, because that is what the comparison
-/// is made in, and because metres stay comparable between a foreground hill
-/// and a distant range while an angle does not -- a 2 km hill would otherwise
-/// outrank every summit in the Tatras.
+/// found. In metres rather than degrees, because metres stay comparable
+/// between a foreground hill and a distant range while an angle does not -- a
+/// 2 km hill would otherwise outrank every summit in the Tatras.
 ///
-/// Signed, and so deliberately *not* called prominence: topographic prominence
-/// is non-negative by definition, and a name promising it would invite
-/// comparison against published figures. A top that never rises clear of its
-/// ridge returns how far the ridge stands over it, negative. Clamping those to
-/// zero looked tidy and cost the client the whole near field: in ridge country
-/// 60% of visible peaks never stand clear of anything, so they all tied at
-/// zero and could not be ordered at all -- exactly where a panorama most needs
-/// to choose which names to show. The two halves are one continuous scale:
-/// flatten a top until its col reaches the summit and it passes through zero.
-/// Zero itself now means only that nothing at the peak's own depth was found
-/// to compare against.
+/// Signed, and so deliberately *not* called prominence, which is non-negative
+/// by definition. A top that never rises clear of its ridge returns how far
+/// the ridge stands over it. The two halves are one continuous scale: flatten
+/// a top until its col reaches the summit and it passes through zero. Zero
+/// itself means only that nothing at the peak's depth was found to compare
+/// against -- in ridge country most tops score below it, and clamping them
+/// together left the near field unorderable.
 ///
 /// Occlusion makes this a lower bound: a col hidden behind nearer ground reads
 /// as whatever hides it, which is higher, so the figure comes out too small
 /// rather than too large. Under-labelling a peak is the safer failure.
 fn dominance_m(f: &Frame, col: usize, elevation: f64, distance: f64, window: usize) -> f64 {
-    let radius = f.radius;
+    let radius = DOMINANCE_RADIUS;
     // The neighbourhood is a ball of ground around the summit, so it is as
     // deep as it is wide -- the same radius the column window uses. A ratio
     // instead of a difference looks reasonable and is not: at 25 km it spans
@@ -844,36 +938,29 @@ pub fn render(
             pk.ele = pyr.sample(z, mx, my);
 
             let h = pk.ele.unwrap_or(f64::NEG_INFINITY);
-            let drop = pk.distance * pk.distance * (1.0 - REFRACTION_K) / (2.0 * EARTH_R);
+            let drop = curvature_drop(pk.distance);
             pk.altitude = ((h - eye - drop) / pk.distance).atan().to_degrees();
 
             let off = (pk.azimuth - p.az_start).rem_euclid(360.0);
             pk.x = off / p.step_deg;
             pk.y = (p.alt_max - pk.altitude) / p.step_deg;
-            // Sub-column, not output column. Bounded against the ray count
-            // rather than against az_span, because out_w *rounds*: when it
-            // rounds up the image covers slightly more than az_span, and a
-            // peak in that sliver -- or one landing exactly on az_span -- used
-            // to be admitted by `off <= az_span` and then assigned a column
-            // past the last ray, matching nothing and silently never being
-            // seen. Testing against the rays themselves is right either way,
-            // and now also guarantees pk.x < out_w.
+            // Sub-column, not output column, and bounded against the ray count
+            // rather than az_span: out_w rounds, so the image can cover
+            // slightly more or less than the requested fov, and only the rays
+            // themselves say which bearings will actually be answered. Also
+            // guarantees pk.x < out_w.
             let sub = (off / az_step).floor();
             let sub_cols = (out_w * ssx as usize) as f64;
-            pk.column = if sub >= 0.0 && sub < sub_cols && pk.ele.is_some() {
-                sub as isize
-            } else {
-                -1
-            };
+            pk.column = (sub >= 0.0 && sub < sub_cols && pk.ele.is_some()).then_some(sub as usize);
         }
         eye
     };
 
     // Which peaks belong to which ray.
-    let mut by_sub: HashMap<isize, Vec<usize>> = HashMap::new();
+    let mut by_sub: HashMap<usize, Vec<usize>> = HashMap::new();
     for (i, pk) in peaks.iter().enumerate() {
-        if pk.column >= 0 {
-            by_sub.entry(pk.column).or_default().push(i);
+        if let Some(c) = pk.column {
+            by_sub.entry(c).or_default().push(i);
         }
     }
     let by_sub = Arc::new(by_sub);
@@ -884,15 +971,18 @@ pub fn render(
 
     // Chunked so each worker opens the pyramid once and keeps its block cache
     // warm across the columns it owns.
-    type ChunkOut = (
-        usize,
-        Vec<[u8; 3]>,
-        Vec<u16>,
-        usize,
-        usize,
-        usize,
-        Vec<(usize, bool)>,
-    );
+    /// One worker's slice of the image. Named rather than a tuple because
+    /// three of its fields are consecutive counters: as positional elements,
+    /// swapping two of them compiles and silently reports wrong stats.
+    struct ChunkOut {
+        start: usize,
+        pixels: Vec<[u8; 3]>,
+        depth: Vec<u16>,
+        samples: usize,
+        blocks: usize,
+        sky: usize,
+        answers: Vec<(usize, bool)>,
+    }
     let parts: Vec<ChunkOut> = (0..out_w)
         .step_by(chunk)
         .collect::<Vec<_>>()
@@ -918,20 +1008,18 @@ pub fn render(
                 for k in 0..ssx {
                     column.dist.fill(f64::INFINITY);
                     column.cover.fill(0.0);
-                    let az = p.az_start
-                        + ((oc * ssx as usize + k as usize) as f64 + 0.5) * az_step;
+                    let sub = oc * ssx as usize + k as usize;
+                    let az = p.az_start + (sub as f64 + 0.5) * az_step;
                     samples += march_ray(
                         &mut pyr, p, eye, az, alt_step, sub_h, coarsest, finest, &mut column,
                     );
                     sky += column.dist.iter().filter(|d| d.is_infinite()).count();
 
                     // Peaks whose bearing falls in this exact ray.
-                    if let Some(idxs) = by_sub.get(&((oc * ssx as usize + k as usize) as isize)) {
+                    if let Some(idxs) = by_sub.get(&sub) {
                         for &i in idxs {
                             let (altitude, distance) = peak_geom[i];
-                            // The marcher's own step at that distance.
-                            let spacing =
-                                ground_res(level_for(distance, p.lat, coarsest, finest), p.lat);
+                            let spacing = marcher_step(distance, p.lat, coarsest, finest);
                             let vis = peak_is_visible(
                                 altitude, distance, spacing, &column, p, alt_step, sub_h,
                             );
@@ -973,15 +1061,15 @@ pub fn render(
                 }
             }
 
-            Ok((
+            Ok(ChunkOut {
                 start,
                 pixels,
                 depth,
                 samples,
-                pyr.cached_blocks(),
+                blocks: pyr.cached_blocks(),
                 sky,
-                peak_results,
-            ))
+                answers: peak_results,
+            })
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -992,11 +1080,17 @@ pub fn render(
     let mut blocks = 0usize;
     let mut sky = 0usize;
     let mut cells = 0usize;
-    for (start, pixels, depth, n, b, s, answers) in parts {
-        samples += n;
-        blocks += b;
-        sky += s;
-        for (i, visible) in answers {
+    for part in parts {
+        let ChunkOut {
+            start,
+            pixels,
+            depth,
+            ..
+        } = &part;
+        samples += part.samples;
+        blocks += part.blocks;
+        sky += part.sky;
+        for &(i, visible) in &part.answers {
             peaks[i].visible = visible;
         }
         let cols = pixels.len() / out_h;
@@ -1019,25 +1113,28 @@ pub fn render(
     // a summit dominates its surroundings, and a fixed angle would ask that
     // over 170 m of ground for a near hill and 12 km for a far one. Clamped
     // because at close range the equivalent angle runs to tens of degrees.
-    const DOMINANCE_RADIUS: f64 = 3000.0;
     let frame = Frame {
         depth: &depth_img,
         eye,
         tan_alt: (0..out_h)
             .map(|row| (p.alt_max - (row as f64 + 0.5) * p.step_deg).to_radians().tan())
             .collect(),
-        radius: DOMINANCE_RADIUS,
+        depth_lut: (0..=u16::MAX)
+            .map(|v| decode_depth(v).unwrap_or(0.0))
+            .collect(),
     };
-    for pk in peaks.iter_mut() {
-        // This pass is not free: every peak rescans `window` full columns, and
-        // the 20-degree clamp applies to everything within ~8 km, so a
-        // viewpoint ringed by close summits can spend longer here than the
-        // marching did. It holds the render permit throughout, so a client
-        // that has already hung up must not be made to wait for it.
+    // Parallel like the marching it follows. Peaks are independent -- each
+    // writes only its own dominance and reads only the shared frame -- and the
+    // 20-degree window applies to everything within 8 km, so a viewpoint
+    // ringed by close summits can otherwise spend longer here, on one core,
+    // than the whole render took on all of them. It holds the render permit
+    // throughout, so its cost is charged to every queued request, not just
+    // this one.
+    peaks.par_iter_mut().try_for_each(|pk| -> Result<()> {
         cancel.check()?;
-        pk.dominance = match (pk.visible && pk.column >= 0, pk.ele) {
-            (true, Some(ele)) => {
-                let out_col = (pk.column as usize / ssx as usize).min(out_w.saturating_sub(1));
+        pk.dominance = match (pk.column, pk.ele) {
+            (Some(column), Some(ele)) if pk.visible => {
+                let out_col = (column / ssx as usize).min(out_w.saturating_sub(1));
                 let span = (DOMINANCE_RADIUS / pk.distance)
                     .atan()
                     .to_degrees()
@@ -1047,7 +1144,8 @@ pub fn render(
             }
             _ => 0.0,
         };
-    }
+        Ok(())
+    })?;
 
     Ok((
         img,

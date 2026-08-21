@@ -46,9 +46,11 @@ pub struct Peak {
     /// comparison against published figures for tops that score below zero.
     pub dominance: f64,
 
-    /// Output column, used while rendering; not part of the API.
+    /// Sub-column the peak's bearing falls in -- a ray index, not an output
+    /// column. `None` when it is out of frame or has no elevation, which is
+    /// the same thing as "no ray will answer it". Not part of the API.
     #[serde(skip)]
-    pub column: isize,
+    pub column: Option<usize>,
 }
 
 /// Load candidates within `range` metres of the viewpoint.
@@ -104,7 +106,7 @@ pub fn load(path: &Path, lon: f64, lat: f64, range: f64) -> Result<Vec<Peak>> {
             y: 0.0,
             visible: false,
             dominance: 0.0,
-            column: -1,
+            column: None,
         });
     }
     Ok(out)
@@ -130,4 +132,30 @@ fn split_csv(line: &str) -> Vec<String> {
     }
     out.push(cur);
     out
+}
+
+/// Which summits earn a label, most dominant first.
+///
+/// In frame, not hidden, and standing far enough above what is around it.
+/// Visibility was decided during the render, from the columns it marched
+/// anyway; `column` is `Some` exactly when a ray answered the peak.
+///
+/// One policy, in one place. Both front-ends want the same answer, and while
+/// they each spelled it out the two copies drifted -- a cast here, a clause
+/// there -- and every change to the rule, including the dominance rename, was
+/// two edits with nothing to catch the one you forgot.
+pub fn select(peaks: &mut Vec<Peak>, min_dominance: f64, max_peaks: usize, height: usize) {
+    peaks.retain(|k| {
+        k.visible
+            && k.column.is_some()
+            && k.dominance >= min_dominance
+            && k.y >= 0.0
+            && k.y <= height as f64
+    });
+    peaks.sort_by(|a, b| b.dominance.partial_cmp(&a.dominance).unwrap());
+    // After the sort, so a cap keeps the summits that dominate the view rather
+    // than an arbitrary slice. Zero is no cap.
+    if max_peaks > 0 {
+        peaks.truncate(max_peaks);
+    }
 }

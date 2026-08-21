@@ -417,31 +417,8 @@ fn main() -> Result<()> {
             }
 
             if let Some(rpath) = depth_raw {
-                use std::io::Write;
                 let step = depth_step.max(1);
-                let mut bytes = Vec::with_capacity(stats.width * stats.height * 2);
-                for row in 0..stats.height {
-                    // Delta-code rows before deflating: this is where PNG gets
-                    // its compression on smooth gradients, and without it a
-                    // raw buffer loses to the PNG.
-                    let mut prev = 0i32;
-                    for col in 0..stats.width {
-                        let v = stats.depth.get_pixel(col as u32, row as u32)[0];
-                        // Keep 0 meaning sky rather than rounding it away --
-                        // integer division sends everything below `step`
-                        // there, and ground within DEPTH_NEAR encodes as 1.
-                        let q = if v == 0 { 0 } else { ((v / step) * step).max(step) };
-                        let d = (i32::from(q) - prev) as i16;
-                        bytes.extend_from_slice(&d.to_le_bytes());
-                        prev = i32::from(q);
-                    }
-                }
-                let mut enc = flate2::write::GzEncoder::new(
-                    std::fs::File::create(&rpath)?,
-                    flate2::Compression::default(),
-                );
-                enc.write_all(&bytes)?;
-                enc.finish()?;
+                std::fs::write(&rpath, panorama::depth_bytes(&stats.depth, step)?)?;
                 let rel = f64::from(step) * 100.0
                     * (panorama::DEPTH_FAR.ln() - panorama::DEPTH_NEAR.ln())
                     / 65534.0;
@@ -457,20 +434,7 @@ fn main() -> Result<()> {
             }
 
             if peaks_path.is_some() {
-                // In frame, not hidden, and standing far enough above what is
-                // around it to be worth a label. Visibility was decided during
-                // the render, from the columns it marched anyway.
-                cands.retain(|k| {
-                    k.visible
-                        && k.column >= 0
-                        && k.dominance >= min_dominance
-                        && k.y >= 0.0
-                        && k.y <= f64::from(stats.height as u32)
-                });
-                cands.sort_by(|a, b| b.dominance.partial_cmp(&a.dominance).unwrap());
-                if max_peaks > 0 {
-                    cands.truncate(max_peaks);
-                }
+                peaks::select(&mut cands, min_dominance, max_peaks, stats.height);
 
                 let dst = peaks_out.unwrap_or_else(|| out.with_extension("json"));
                 serde_json::to_writer_pretty(
