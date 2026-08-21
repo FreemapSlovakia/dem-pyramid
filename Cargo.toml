@@ -18,6 +18,7 @@ anyhow = "1"
 gdal = "0.19"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rayon = "1"
+flate2 = "1"
 clap = { version = "4", features = ["derive", "env"] }
 quick-xml = "0.37"
 serde = { version = "1", features = ["derive"] }
