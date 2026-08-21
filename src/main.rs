@@ -14,6 +14,7 @@ mod footprints;
 mod gdal_cli;
 mod grid;
 mod panorama;
+mod peaks;
 
 #[derive(Parser)]
 #[command(about, version)]
@@ -123,6 +124,24 @@ enum Command {
         /// Draw the eye-level line at 0 degrees.
         #[arg(long, default_value_t = false)]
         eye_level: bool,
+        /// Also write a 16-bit greyscale depth image, log-encoded, 0 for sky.
+        ///
+        /// Lets the client answer "how far is that ridge" for any pixel.
+        /// Recovering it from the rendered colour would not work: colour mixes
+        /// haze, the sky gradient and silhouette ink, so the mapping is not
+        /// invertible.
+        #[arg(long)]
+        depth_out: Option<PathBuf>,
+        /// GeoPackage of candidate peaks; enables the JSON sidecar.
+        #[arg(long)]
+        peaks: Option<PathBuf>,
+        /// Where to write the peak JSON. Defaults to the image path with a
+        /// .json extension.
+        #[arg(long)]
+        peaks_out: Option<PathBuf>,
+        /// Drop peaks whose angular prominence is below this, degrees.
+        #[arg(long, default_value_t = 0.05)]
+        min_prominence: f64,
         /// Rays per output pixel horizontally, averaged down.
         ///
         /// This is where supersampling earns its cost. At long range several
@@ -284,6 +303,10 @@ fn main() -> Result<()> {
             edge_ratio,
             edge_hidden_ref,
             eye_level,
+            depth_out,
+            peaks: peaks_path,
+            peaks_out,
+            min_prominence,
             supersample_x,
             supersample_y,
         } => {
@@ -337,6 +360,49 @@ fn main() -> Result<()> {
                 100.0 * stats.sky_fraction
             );
             println!("wrote      {}", out.display());
+
+            if let Some(dpath) = depth_out {
+                stats
+                    .depth
+                    .save(&dpath)
+                    .with_context(|| format!("writing {}", dpath.display()))?;
+                println!(
+                    "depth      16-bit log scale, {:.0} m .. {:.0} km, 0 = sky",
+                    panorama::DEPTH_NEAR,
+                    panorama::DEPTH_FAR / 1000.0
+                );
+                println!("wrote      {}", dpath.display());
+            }
+
+            if let Some(src) = peaks_path {
+                let t1 = std::time::Instant::now();
+                let mut cands = peaks::load(&src, lon, lat, range)?;
+                let found = cands.len();
+                let rays = panorama::resolve_peaks(&cli.root, &doc, &p, &mut cands)?;
+
+                // In frame, not hidden, and standing far enough above what is
+                // behind it to be worth a label.
+                cands.retain(|k| {
+                    k.visible
+                        && k.column >= 0
+                        && k.prominence >= min_prominence
+                        && k.y >= 0.0
+                        && k.y <= f64::from(stats.height as u32)
+                });
+                cands.sort_by(|a, b| b.prominence.partial_cmp(&a.prominence).unwrap());
+
+                let dst = peaks_out.unwrap_or_else(|| out.with_extension("json"));
+                serde_json::to_writer_pretty(
+                    std::io::BufWriter::new(std::fs::File::create(&dst)?),
+                    &cands,
+                )?;
+                println!(
+                    "peaks      {found} in range, {} labelled, {rays} rays, {:.2} s",
+                    cands.len(),
+                    t1.elapsed().as_secs_f64()
+                );
+                println!("wrote      {}", dst.display());
+            }
         }
         Command::IndexPlan { level } => {
             let root = cli.root.to_str().context("non-utf8 root")?;

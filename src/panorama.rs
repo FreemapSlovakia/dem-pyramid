@@ -25,6 +25,7 @@ use std::path::Path;
 
 use crate::config::{Doc, ground_res};
 use crate::grid::lonlat_to_merc;
+use crate::peaks::Peak;
 
 const EARTH_R: f64 = 6371000.0;
 /// Refraction coefficient. The apparent horizon moves by about half a pixel at
@@ -254,6 +255,23 @@ fn level_for(d: f64, lat: f64, coarsest: u32, finest: u32) -> u32 {
     finest
 }
 
+/// Great-circle distance in metres, degrees in.
+pub fn great_circle(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
+    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
+    let (dp, dl) = ((lat2 - lat1).to_radians(), (lon2 - lon1).to_radians());
+    let a = (dp / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dl / 2.0).sin().powi(2);
+    2.0 * EARTH_R * a.sqrt().asin()
+}
+
+/// Initial bearing, degrees clockwise from north.
+pub fn initial_bearing(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
+    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
+    let dl = (lon2 - lon1).to_radians();
+    let y = dl.sin() * p2.cos();
+    let x = p1.cos() * p2.sin() - p1.sin() * p2.cos() * dl.cos();
+    y.atan2(x).to_degrees().rem_euclid(360.0)
+}
+
 /// Great-circle destination, degrees in and out.
 fn destination(lon: f64, lat: f64, az_deg: f64, d: f64) -> (f64, f64) {
     let (lat1, lon1) = (lat.to_radians(), lon.to_radians());
@@ -275,6 +293,9 @@ pub struct Stats {
     pub samples: usize,
     pub blocks: usize,
     pub sky_fraction: f64,
+    /// Per-pixel distance, 16-bit log-encoded, 0 for sky. Written only if
+    /// asked for; see `encode_depth`.
+    pub depth: image::ImageBuffer<image::Luma<u16>, Vec<u16>>,
 }
 
 /// One ray's column: distance to visible terrain per sub-row, and how much of
@@ -312,6 +333,7 @@ fn march_ray(
     // index. `filled_from` is the topmost row already written; a new maximum
     // fills the band [row_new, filled_from) and moves the boundary up.
     let mut filled_from = height;
+    let mut last_visible = ground_res(finest, p.lat);
 
     let mut d = ground_res(finest, p.lat);
     while d < p.max_range {
@@ -334,8 +356,24 @@ fn march_ray(
                 let f = ((p.alt_max - alpha) / alt_step).max(0.0);
                 if f < filled_from as f64 {
                     let full_start = f.ceil() as usize;
+                    // Rows between two *consecutive* samples show terrain
+                    // genuinely lying between them, so the distance ramps
+                    // across the band. Shading a whole band at one distance is
+                    // what facets a steep near face into flat polygons.
+                    //
+                    // Not across an occlusion though: when the ray clears a
+                    // crest the gap holds no terrain at all, and everything
+                    // above the crest is the far surface. Interpolating there
+                    // would smear the silhouette over many rows.
+                    let smooth = d <= last_visible * 1.05;
+                    let span = (filled_from - full_start).max(1) as f64;
                     for row in full_start..filled_from {
-                        col.dist[row] = d;
+                        col.dist[row] = if smooth {
+                            let t = (row - full_start) as f64 / span;
+                            d + (last_visible - d) * t
+                        } else {
+                            d
+                        };
                         col.cover[row] = 1.0;
                     }
                     let partial = f.floor() as usize;
@@ -346,6 +384,7 @@ fn march_ray(
                     } else {
                         filled_from = full_start;
                     }
+                    last_visible = d;
                 }
                 // Once the column is full, no farther sample can add to it.
                 if filled_from == 0 {
@@ -515,6 +554,154 @@ fn shade_column(col: &Column, p: &Params, alt_step: f64, height: usize) -> Vec<(
         .collect()
 }
 
+/// Ground elevation at the viewpoint, as the local maximum over a small disc.
+///
+/// The pyramid stores a 6.27 m average and averaging costs a summit more the
+/// sharper it is, so the value at the exact point reliably sits below where a
+/// person would stand -- which puts nearby rock above the eye.
+fn viewpoint_elevation(pyr: &mut Pyramid, p: &Params) -> Result<f64> {
+    let (ex, ey) = lonlat_to_merc(p.lon, p.lat);
+    let at_point = pyr
+        .sample_finest(ex, ey)
+        .context("viewpoint has no elevation data")?;
+
+    // Mercator metres are ground metres divided by cos(lat).
+    let r = p.eye_search_radius / p.lat.to_radians().cos();
+    let mut best = at_point;
+    if r > 0.0 {
+        for k in 0..8 {
+            let a = f64::from(k) * std::f64::consts::FRAC_PI_4;
+            if let Some(h) = pyr.sample_finest(ex + r * a.cos(), ey + r * a.sin()) {
+                best = best.max(h);
+            }
+        }
+    }
+    Ok(best)
+}
+
+/// Project peaks and decide which are visible.
+///
+/// Independent of rendering -- no image is needed, so this also answers "what
+/// can be seen from here" on its own. Peaks are bucketed by azimuth and one
+/// ray is marched per occupied bucket, which bounds the work by the number of
+/// distinct bearings rather than by the number of peaks.
+pub fn resolve_peaks(root: &Path, doc: &Doc, p: &Params, peaks: &mut [Peak]) -> Result<usize> {
+    let (coarsest, finest) = (doc.grid.coarsest_level, doc.grid.finest_level);
+    let mut pyr = Pyramid::open(root, doc)?;
+    let eye = viewpoint_elevation(&mut pyr, p)? + p.eye_height;
+
+    // Geometry first: distance, bearing, DTM elevation, and where each lands.
+    for pk in peaks.iter_mut() {
+        pk.distance = great_circle(p.lon, p.lat, pk.lon, pk.lat);
+        pk.azimuth = initial_bearing(p.lon, p.lat, pk.lon, pk.lat);
+        let (mx, my) = lonlat_to_merc(pk.lon, pk.lat);
+        pk.ele = pyr.sample_finest(mx, my);
+
+        let h = pk.ele.unwrap_or(f64::NEG_INFINITY);
+        let drop = pk.distance * pk.distance * (1.0 - REFRACTION_K) / (2.0 * EARTH_R);
+        pk.altitude = ((h - eye - drop) / pk.distance).atan().to_degrees();
+
+        let off = (pk.azimuth - p.az_start).rem_euclid(360.0);
+        pk.x = off / p.step_deg;
+        pk.y = (p.alt_max - pk.altitude) / p.step_deg;
+        pk.column = if off <= p.az_span { pk.x.floor() as isize } else { -1 };
+    }
+
+    // Bucket by the ray we would cast, then walk each bucket's peaks outward
+    // in distance against a single running maximum.
+    let mut order: Vec<usize> = (0..peaks.len()).filter(|&i| peaks[i].ele.is_some()).collect();
+    order.sort_by(|&a, &b| {
+        peaks[a]
+            .azimuth
+            .partial_cmp(&peaks[b].azimuth)
+            .unwrap()
+            .then(peaks[a].distance.partial_cmp(&peaks[b].distance).unwrap())
+    });
+
+    // Group into rays. A bucket wider than one output pixel would merge peaks
+    // that render apart, so the bucket is the pixel.
+    let bucket_deg = p.step_deg;
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut i = 0;
+    while i < order.len() {
+        let az0 = peaks[order[i]].azimuth;
+        let mut j = i;
+        while j < order.len() && peaks[order[j]].azimuth - az0 < bucket_deg {
+            j += 1;
+        }
+        groups.push(order[i..j].to_vec());
+        i = j;
+    }
+
+    let geometry: Vec<(f64, f64)> = peaks.iter().map(|k| (k.azimuth, k.distance)).collect();
+
+    // Chunked, not one task per bucket: opening a pyramid means opening seven
+    // GTI datasets and starting with a cold block cache, so doing it per
+    // bucket costs far more than the marching it parallelises.
+    let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+    let chunk = groups.len().div_ceil(threads).max(1);
+
+    let results: Vec<Vec<(usize, f64, f64)>> = groups
+        .par_chunks(chunk)
+        .map(|chunk_groups| -> Result<Vec<(usize, f64, f64)>> {
+            let mut pyr = Pyramid::open(root, doc)?;
+            let mut out = Vec::new();
+            for group in chunk_groups {
+            let az = geometry[group[0]].0 + bucket_deg / 2.0;
+
+            // One pass outward: the running maximum before a peak decides
+            // whether it is visible, and the maximum beyond it is what the
+            // peak stands above.
+            let mut max_before = vec![f64::NEG_INFINITY; group.len()];
+            let mut max_after = vec![f64::NEG_INFINITY; group.len()];
+            let mut running = f64::NEG_INFINITY;
+
+            let mut d = ground_res(finest, p.lat);
+            while d < p.max_range {
+                let z = level_for(d, p.lat, coarsest, finest);
+                let step = ground_res(z, p.lat);
+                let (lon, lat) = destination(p.lon, p.lat, az, d);
+                let (sx, sy) = lonlat_to_merc(lon, lat);
+
+                if let Some(h) = pyr.sample(z, sx, sy) {
+                    let drop = d * d * (1.0 - REFRACTION_K) / (2.0 * EARTH_R);
+                    let alpha = ((h - eye - drop) / d).atan().to_degrees();
+                    running = running.max(alpha);
+                    for (k, &idx) in group.iter().enumerate() {
+                        if d < geometry[idx].1 {
+                            max_before[k] = running;
+                        } else if d > geometry[idx].1 * 1.05 {
+                            max_after[k] = max_after[k].max(alpha);
+                        }
+                    }
+                }
+                d += step;
+            }
+
+            out.extend(
+                group
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &idx)| (idx, max_before[k], max_after[k])),
+            );
+            }
+            Ok(out)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // A tolerance of a fifth of a pixel: at its own summit the peak *is* the
+    // terrain, so it ties with the running maximum rather than beating it.
+    let tol = p.step_deg * 0.2;
+    for group in results {
+        for (idx, before, after) in group {
+            peaks[idx].visible = peaks[idx].altitude + tol >= before;
+            peaks[idx].prominence = (peaks[idx].altitude - after).max(0.0);
+        }
+    }
+
+    Ok(groups.len())
+}
+
 /// Render the panorama, streaming one output column at a time.
 ///
 /// Supersampling is what makes the strokes and the far skyline look right, but
@@ -522,31 +709,38 @@ fn shade_column(col: &Column, p: &Params, alt_step: f64, height: usize) -> Vec<(
 /// 360 degree frame at 9x9 needed 6.7 GB. Nothing requires that. An output
 /// column depends only on its own sub-columns, and shading is column-local, so
 /// each is marched, shaded, averaged and discarded in turn.
+/// Encode a distance as a 16-bit depth sample.
+///
+/// Logarithmic, because the useful precision is relative: a metre matters at
+/// 200 m and is meaningless at 200 km. Over 10 m to 400 km this holds better
+/// than 0.02% everywhere, so a reading is good to ~4 m at 20 km. 0 is sky.
+pub const DEPTH_NEAR: f64 = 10.0;
+pub const DEPTH_FAR: f64 = 400_000.0;
+
+pub fn encode_depth(d: f64) -> u16 {
+    if !d.is_finite() {
+        return 0;
+    }
+    let t = (d.max(DEPTH_NEAR).ln() - DEPTH_NEAR.ln()) / (DEPTH_FAR.ln() - DEPTH_NEAR.ln());
+    1 + (t.clamp(0.0, 1.0) * 65_534.0).round() as u16
+}
+
+/// The inverse, for reference -- clients do this to read a distance back.
+pub fn decode_depth(v: u16) -> Option<f64> {
+    (v > 0).then(|| {
+        let t = f64::from(v - 1) / 65_534.0;
+        (DEPTH_NEAR.ln() + t * (DEPTH_FAR.ln() - DEPTH_NEAR.ln())).exp()
+    })
+}
+
 pub fn render(root: &Path, doc: &Doc, p: &Params) -> Result<(image::RgbImage, Stats)> {
     let (coarsest, finest) = (doc.grid.coarsest_level, doc.grid.finest_level);
     let (ssx, ssy) = (p.supersample_x.max(1), p.supersample_y.max(1));
 
-    let (ex, ey) = lonlat_to_merc(p.lon, p.lat);
-    let ground = {
+    let eye = {
         let mut pyr = Pyramid::open(root, doc)?;
-        let at_point = pyr
-            .sample_finest(ex, ey)
-            .context("viewpoint has no elevation data")?;
-
-        // Mercator metres are ground metres divided by cos(lat).
-        let r = p.eye_search_radius / p.lat.to_radians().cos();
-        let mut best = at_point;
-        if r > 0.0 {
-            for k in 0..8 {
-                let a = f64::from(k) * std::f64::consts::FRAC_PI_4;
-                if let Some(h) = pyr.sample_finest(ex + r * a.cos(), ey + r * a.sin()) {
-                    best = best.max(h);
-                }
-            }
-        }
-        best
+        viewpoint_elevation(&mut pyr, p)? + p.eye_height
     };
-    let eye = ground + p.eye_height;
 
     let out_w = (p.az_span / p.step_deg).round() as usize;
     let out_h = ((p.alt_max - p.alt_min) / p.step_deg).round() as usize;
@@ -559,7 +753,7 @@ pub fn render(root: &Path, doc: &Doc, p: &Params) -> Result<(image::RgbImage, St
 
     // Chunked so each worker opens the pyramid once and keeps its block cache
     // warm across the columns it owns.
-    let parts: Vec<(usize, Vec<[u8; 3]>, usize, usize, usize)> = (0..out_w)
+    let parts: Vec<(usize, Vec<[u8; 3]>, Vec<u16>, usize, usize, usize)> = (0..out_w)
         .step_by(chunk)
         .collect::<Vec<_>>()
         .into_par_iter()
@@ -567,15 +761,18 @@ pub fn render(root: &Path, doc: &Doc, p: &Params) -> Result<(image::RgbImage, St
             let cols = chunk.min(out_w - start);
             let mut pyr = Pyramid::open(root, doc)?;
             let mut pixels = vec![[0u8; 3]; cols * out_h];
+            let mut depth = vec![0u16; cols * out_h];
             let mut samples = 0usize;
             let mut sky = 0usize;
 
             let mut column = Column::new(sub_h);
             let mut shaded: Vec<Vec<(f64, f64, f64)>> = Vec::with_capacity(ssx as usize);
+            let mut nearest = vec![f64::INFINITY; out_h];
 
             for local in 0..cols {
                 let oc = start + local;
                 shaded.clear();
+                nearest.fill(f64::INFINITY);
                 for k in 0..ssx {
                     column.dist.fill(f64::INFINITY);
                     column.cover.fill(0.0);
@@ -585,7 +782,22 @@ pub fn render(root: &Path, doc: &Doc, p: &Params) -> Result<(image::RgbImage, St
                         &mut pyr, p, eye, az, alt_step, sub_h, coarsest, finest, &mut column,
                     );
                     sky += column.dist.iter().filter(|d| d.is_infinite()).count();
+
+                    // Depth takes the nearest sub-sample rather than the mean:
+                    // averaging across a silhouette would report a distance at
+                    // which there is no terrain at all.
+                    for (orow, near) in nearest.iter_mut().enumerate() {
+                        for sy in 0..ssy as usize {
+                            let d = column.dist[orow * ssy as usize + sy];
+                            if d < *near {
+                                *near = d;
+                            }
+                        }
+                    }
                     shaded.push(shade_column(&column, p, alt_step, sub_h));
+                }
+                for (orow, near) in nearest.iter().enumerate() {
+                    depth[orow * cols + local] = encode_depth(*near);
                 }
 
                 // Box-average the ssx x ssy block behind each output pixel.
@@ -605,16 +817,18 @@ pub fn render(root: &Path, doc: &Doc, p: &Params) -> Result<(image::RgbImage, St
                 }
             }
 
-            Ok((start, pixels, samples, pyr.cached_blocks(), sky))
+            Ok((start, pixels, depth, samples, pyr.cached_blocks(), sky))
         })
         .collect::<Result<Vec<_>>>()?;
 
     let mut img = image::RgbImage::new(out_w as u32, out_h as u32);
+    let mut depth_img =
+        image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::new(out_w as u32, out_h as u32);
     let mut samples = 0usize;
     let mut blocks = 0usize;
     let mut sky = 0usize;
     let mut cells = 0usize;
-    for (start, pixels, n, b, s) in parts {
+    for (start, pixels, depth, n, b, s) in parts {
         samples += n;
         blocks += b;
         sky += s;
@@ -622,8 +836,13 @@ pub fn render(root: &Path, doc: &Doc, p: &Params) -> Result<(image::RgbImage, St
         cells += cols * sub_h * ssx as usize;
         for orow in 0..out_h {
             for local in 0..cols {
-                let px = pixels[orow * cols + local];
-                img.put_pixel((start + local) as u32, orow as u32, image::Rgb(px));
+                let x = (start + local) as u32;
+                img.put_pixel(x, orow as u32, image::Rgb(pixels[orow * cols + local]));
+                depth_img.put_pixel(
+                    x,
+                    orow as u32,
+                    image::Luma([depth[orow * cols + local]]),
+                );
             }
         }
     }
@@ -637,6 +856,7 @@ pub fn render(root: &Path, doc: &Doc, p: &Params) -> Result<(image::RgbImage, St
             samples,
             blocks,
             sky_fraction: sky as f64 / cells.max(1) as f64,
+            depth: depth_img,
         },
     ))
 }
