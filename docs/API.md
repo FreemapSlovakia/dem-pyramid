@@ -226,9 +226,11 @@ cols are hidden behind nearer ground it reads whatever hides them, and comes
 out low — under-labelling being the safer failure.
 
 **The peak count depends on render resolution.** Visibility is decided against
-the depth buffer, so a finer `step` resolves more tops: the same viewpoint
-returns ~136 peaks at `step: 0.1` and ~273 at `0.05`. Dominance shifts
-slightly with it too, for the same reason. This is not a filter bug — if you
+the marched column, so a finer `step` resolves more tops: with no dominance
+filter the same viewpoint returns ~540 peaks at `step: 0.1` and ~650 at
+`0.05`. Dominance shifts slightly with it too, for the same reason. Under the
+default `min_dominance: 30` that viewpoint yields 69 — the filter, not the
+resolution, is what you tune for label density. This is not a filter bug — if you
 need a stable set across zoom levels, pin `step` for the peak query.
 
 Metres, not degrees, because degrees are not comparable across distance: a 2 km

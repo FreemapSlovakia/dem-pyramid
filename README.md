@@ -185,9 +185,11 @@ construction, so neighbouring rays sample different cells and need averaging.
 ### Peaks and depth
 
 `--peaks <gpkg>` writes a JSON sidecar: each visible summit's position in the
-image, distance, azimuth, elevation angle, DTM elevation and angular
-prominence. Costs no extra rays -- projection is arithmetic and visibility is
-one ray per occupied azimuth bucket.
+image, distance, azimuth, elevation angle, DTM elevation and **dominance** --
+metres above the terrain beside it at its own depth, signed, so a top its own
+ridge stands over scores below zero. Costs no extra rays: projection is
+arithmetic, and each summit is answered from the render's own column at its
+bearing, which the marcher walked anyway.
 
 `--depth-raw` writes a per-pixel distance buffer, log-encoded to 16 bits,
 quantised, row delta-coded and gzipped. At matched precision that is about half

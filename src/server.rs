@@ -46,6 +46,12 @@ pub struct Request {
     /// served at priority 0, with nothing to show why.
     #[serde(default)]
     priority: Option<i32>,
+    /// Accepted only to warn about it. Renamed to `min_dominance` when the
+    /// measure became signed; ignored here it would silently fall back to the
+    /// 30 m default, which drops every negative-dominance peak -- the whole
+    /// near field, and the reason the rename happened.
+    #[serde(default)]
+    min_prominence: Option<f64>,
     #[serde(default = "d_az")]
     az: f64,
     #[serde(default = "d_fov")]
@@ -161,6 +167,14 @@ async fn panorama_route(
         eprintln!(
             "warning: request carried a body `priority` field, which is ignored; \
              set the X-Priority header instead"
+        );
+    }
+    if let Some(v) = req.min_prominence {
+        eprintln!(
+            "warning: request carried `min_prominence: {v}`, which is ignored; \
+             the field is now `min_dominance`, in metres and signed. \
+             Effective min_dominance for this request: {} m",
+            req.min_dominance
         );
     }
 

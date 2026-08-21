@@ -427,8 +427,10 @@ fn main() -> Result<()> {
                     let mut prev = 0i32;
                     for col in 0..stats.width {
                         let v = stats.depth.get_pixel(col as u32, row as u32)[0];
-                        // Keep 0 meaning sky rather than rounding it away.
-                        let q = if v == 0 { 0 } else { (v / step) * step };
+                        // Keep 0 meaning sky rather than rounding it away --
+                        // integer division sends everything below `step`
+                        // there, and ground within DEPTH_NEAR encodes as 1.
+                        let q = if v == 0 { 0 } else { ((v / step) * step).max(step) };
                         let d = (i32::from(q) - prev) as i16;
                         bytes.extend_from_slice(&d.to_le_bytes());
                         prev = i32::from(q);

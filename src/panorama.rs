@@ -654,13 +654,30 @@ fn peak_is_visible(
         return false;
     }
     // A summit is its own terrain, so it ties with the surface rather than
-    // beating it; allow a little slack.
-    let tolerance = 1.0 - p.step_deg * 0.002;
+    // beating it; allow a little slack. Scaled to the marcher's sample
+    // spacing, which is what quantises the recorded distance: the sample that
+    // wins a broad summit's row can sit a full step short of the summit
+    // itself. Tying it to step_deg instead gave 0.01% at the default step,
+    // several times tighter than the ~0.087% spacing, so flat-topped summits
+    // in plain view reported as hidden -- and did so differently at each
+    // resolution, since the slack moved with the step but the spacing did not.
+    let tolerance = 1.0 - CELL_PER_METRE;
     match col.dist[row as usize] {
         // Pokes into sky: sharper than the averaged DEM the ray walked.
         d if !d.is_finite() => true,
         d => d >= distance * tolerance,
     }
+}
+
+/// What every peak's dominance walk shares: the frame it reads and the
+/// geometry needed to turn a pixel back into an elevation.
+struct Frame<'a> {
+    depth: &'a image::ImageBuffer<image::Luma<u16>, Vec<u16>>,
+    eye: f64,
+    /// Tangent of each output row's altitude, precomputed per frame.
+    tan_alt: Vec<f64>,
+    /// Ground radius the neighbourhood spans, metres.
+    radius: f64,
 }
 
 /// Highest ground *elevation* visible in one column within a distance band, or
@@ -675,17 +692,6 @@ fn peak_is_visible(
 /// The band test runs in encoded space -- the depth encoding is monotone in
 /// distance -- so only rows that pass it are ever decoded. 0 is sky and must
 /// be excluded explicitly: it encodes below every real distance.
-/// What every peak's dominance walk shares: the frame it reads and the
-/// geometry needed to turn a pixel back into an elevation.
-struct Frame<'a> {
-    depth: &'a image::ImageBuffer<image::Luma<u16>, Vec<u16>>,
-    eye: f64,
-    /// Tangent of each output row's altitude, precomputed per frame.
-    tan_alt: Vec<f64>,
-    /// Ground radius the neighbourhood spans, metres.
-    radius: f64,
-}
-
 fn profile_at(f: &Frame, col: u32, band: (u16, u16)) -> Option<f64> {
     let mut best = f64::NEG_INFINITY;
     for row in 0..f.depth.height() {
@@ -836,8 +842,16 @@ pub fn render(
             let off = (pk.azimuth - p.az_start).rem_euclid(360.0);
             pk.x = off / p.step_deg;
             pk.y = (p.alt_max - pk.altitude) / p.step_deg;
-            pk.column = if off <= p.az_span && pk.ele.is_some() {
-                (off / az_step).floor() as isize // sub-column, not output column
+            // Sub-column, not output column. Bounded against the ray count
+            // rather than against az_span: out_w truncates, so the rays cover
+            // out_w * step_deg, which for a fov that is not a whole number of
+            // steps is less than az_span. A peak in that sliver -- or exactly
+            // on the far edge -- used to land one past the last ray, match no
+            // ray at all, and silently never be seen.
+            let sub = (off / az_step).floor();
+            let sub_cols = (out_w * ssx as usize) as f64;
+            pk.column = if sub >= 0.0 && sub < sub_cols && pk.ele.is_some() {
+                sub as isize
             } else {
                 -1
             };
@@ -1001,6 +1015,12 @@ pub fn render(
         radius: DOMINANCE_RADIUS,
     };
     for pk in peaks.iter_mut() {
+        // This pass is not free: every peak rescans `window` full columns, and
+        // the 20-degree clamp applies to everything within ~8 km, so a
+        // viewpoint ringed by close summits can spend longer here than the
+        // marching did. It holds the render permit throughout, so a client
+        // that has already hung up must not be made to wait for it.
+        cancel.check()?;
         pk.dominance = match (pk.visible && pk.column >= 0, pk.ele) {
             (true, Some(ele)) => {
                 let out_col = (pk.column as usize / ssx as usize).min(out_w.saturating_sub(1));
