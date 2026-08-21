@@ -644,6 +644,7 @@ impl Cancel {
 fn peak_is_visible(
     altitude: f64,
     distance: f64,
+    spacing: f64,
     col: &Column,
     p: &Params,
     alt_step: f64,
@@ -654,14 +655,21 @@ fn peak_is_visible(
         return false;
     }
     // A summit is its own terrain, so it ties with the surface rather than
-    // beating it; allow a little slack. Scaled to the marcher's sample
-    // spacing, which is what quantises the recorded distance: the sample that
-    // wins a broad summit's row can sit a full step short of the summit
-    // itself. Tying it to step_deg instead gave 0.01% at the default step,
-    // several times tighter than the ~0.087% spacing, so flat-topped summits
-    // in plain view reported as hidden -- and did so differently at each
-    // resolution, since the slack moved with the step but the spacing did not.
-    let tolerance = 1.0 - CELL_PER_METRE;
+    // beating it; allow a little slack. It has to be the step the marcher
+    // actually took at this distance, which quantises the recorded value: the
+    // sample winning a broad summit's row can sit a full step short of the
+    // summit itself.
+    //
+    // Two wrong constants preceded this. step_deg * 0.002 gave 0.01% at the
+    // default step, several times tighter than the spacing, and moved with
+    // resolution while the spacing did not. CELL_PER_METRE is right only
+    // beyond ~7.2 km: nearer than that level_for is pinned to the finest
+    // level, so the step stops shrinking with distance and its *relative*
+    // size grows -- 0.31% at 2 km, 1.25% at 500 m. A near summit filling the
+    // frame still reported as hidden, in exactly the near field these labels
+    // matter most for. The floor keeps the long-range case where the chosen
+    // level is finer than the distance strictly needs.
+    let tolerance = 1.0 - (spacing / distance).max(CELL_PER_METRE);
     match col.dist[row as usize] {
         // Pokes into sky: sharper than the averaged DEM the ray walked.
         d if !d.is_finite() => true,
@@ -843,11 +851,13 @@ pub fn render(
             pk.x = off / p.step_deg;
             pk.y = (p.alt_max - pk.altitude) / p.step_deg;
             // Sub-column, not output column. Bounded against the ray count
-            // rather than against az_span: out_w truncates, so the rays cover
-            // out_w * step_deg, which for a fov that is not a whole number of
-            // steps is less than az_span. A peak in that sliver -- or exactly
-            // on the far edge -- used to land one past the last ray, match no
-            // ray at all, and silently never be seen.
+            // rather than against az_span, because out_w *rounds*: when it
+            // rounds up the image covers slightly more than az_span, and a
+            // peak in that sliver -- or one landing exactly on az_span -- used
+            // to be admitted by `off <= az_span` and then assigned a column
+            // past the last ray, matching nothing and silently never being
+            // seen. Testing against the rays themselves is right either way,
+            // and now also guarantees pk.x < out_w.
             let sub = (off / az_step).floor();
             let sub_cols = (out_w * ssx as usize) as f64;
             pk.column = if sub >= 0.0 && sub < sub_cols && pk.ele.is_some() {
@@ -919,8 +929,12 @@ pub fn render(
                     if let Some(idxs) = by_sub.get(&((oc * ssx as usize + k as usize) as isize)) {
                         for &i in idxs {
                             let (altitude, distance) = peak_geom[i];
-                            let vis =
-                                peak_is_visible(altitude, distance, &column, p, alt_step, sub_h);
+                            // The marcher's own step at that distance.
+                            let spacing =
+                                ground_res(level_for(distance, p.lat, coarsest, finest), p.lat);
+                            let vis = peak_is_visible(
+                                altitude, distance, spacing, &column, p, alt_step, sub_h,
+                            );
                             peak_results.push((i, vis));
                         }
                     }

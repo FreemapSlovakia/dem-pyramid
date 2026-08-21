@@ -169,13 +169,16 @@ async fn panorama_route(
              set the X-Priority header instead"
         );
     }
+    // Rejected rather than warned about. A warning goes to our stderr, where
+    // the caller cannot see it, and they would get a 200 carrying peaks
+    // filtered at the 30 m default -- the whole negative range gone, with
+    // nothing in the response to say why. That silent failure is the thing the
+    // rename existed to prevent, so it has to be visible from the client side.
     if let Some(v) = req.min_prominence {
-        eprintln!(
-            "warning: request carried `min_prominence: {v}`, which is ignored; \
-             the field is now `min_dominance`, in metres and signed. \
-             Effective min_dominance for this request: {} m",
-            req.min_dominance
-        );
+        return bad(format!(
+            "`min_prominence` was removed; use `min_dominance` (metres, signed, \
+             may be negative). You sent {v}"
+        ));
     }
 
     // Validate before arithmetic. `as usize` saturates rather than failing and
@@ -204,8 +207,12 @@ async fn panorama_route(
 
     let step = req.step.max(MIN_STEP);
     let fov = req.fov.clamp(0.1, 360.0);
-    let width = (fov / step) as usize;
-    let height = ((req.alt_max - req.alt_min) / step) as usize;
+    // Rounded, not truncated, to match what `render` will actually allocate --
+    // otherwise the dimensions validated here are up to a row and a column
+    // short of the buffers the limit is meant to bound, and the message quotes
+    // a size the caller never asked for.
+    let width = (fov / step).round() as usize;
+    let height = ((req.alt_max - req.alt_min) / step).round() as usize;
     if width.checked_mul(height).is_none_or(|n| n > MAX_PIXELS) {
         return bad(format!(
             "{width}x{height} exceeds the {MAX_PIXELS} pixel limit; raise step or narrow fov"
