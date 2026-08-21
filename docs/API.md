@@ -42,7 +42,8 @@ All fields except `lon` and `lat` are optional.
 | `depth` | bool | `false` | include the distance buffer |
 | `depth_step` | int | `4` | depth quantisation; see [Depth](#depth) |
 | `peaks` | bool | `true` | include peak labels |
-| `min_prominence` | number | `0.05` | drop peaks below this angular prominence, degrees |
+| `min_prominence` | number | `30` | drop peaks standing less than this above their surroundings, metres |
+| `max_peaks` | int | `0` | keep at most this many, most dominant first; 0 is no cap |
 
 Image dimensions follow from the angles:
 
@@ -162,7 +163,10 @@ already including `eye`.
 ### Peaks
 
 Only peaks that are **visible and pass `min_prominence`** are returned, sorted
-by `prominence` descending.
+by `prominence` descending and then cut to `max_peaks`. Because the cut comes
+after the sort, a small `max_peaks` keeps the summits that dominate the view
+rather than an arbitrary slice — it is the cheapest way to control label
+density, and it costs the server nothing.
 
 ```json
 {
@@ -177,7 +181,7 @@ by `prominence` descending.
   "altitude": -1.09,
   "x": 326.4, "y": 181.8,
   "visible": true,
-  "prominence": 0.34
+  "prominence": 412.8
 }
 ```
 
@@ -190,22 +194,25 @@ by `prominence` descending.
 | `azimuth` | degrees clockwise from north |
 | `altitude` | degrees above horizontal from the eye, including curvature and refraction |
 | `x`, `y` | position in the image, **output pixels**, origin top-left |
-| `prominence` | degrees the summit stands clear of the skyline **beside** it |
+| `prominence` | **metres** the summit stands above the terrain around it |
 
-`prominence` is angular, not metric, and it is the right thing to rank labels
-by: a summit standing clear of its neighbours reads as a peak, one on a long
-level ridge does not, however tall it is.
+This is what makes a summit worth a label: one standing clear of its
+neighbours reads as a peak, one on a long level ridge does not, however tall
+it is. Measured within 3 km of the summit, walking out each way until the
+ground rises above it and taking the higher of the two lowest points — the
+shape of topographic prominence, and close to it in practice: Slavkovský štít
+measures 338 m against a true 370 m, Východná Vysoká 207 m against ~180 m.
 
-Measured sideways rather than backwards, and not by choice — height above the
-terrain *behind* a peak cannot be known, because that terrain is exactly what a
-skyline peak hides. So it walks out along the skyline each way until the ground
-rises above the summit, and takes the higher of the two lowest points found:
-the same shape as topographic prominence, in degrees.
+Two honest limits. Where a valley runs alongside a peak rather than a ridge,
+the figure reads the valley depth and comes out high. Where the surrounding
+cols are hidden behind nearer ground it reads whatever hides them, and comes
+out low — under-labelling being the safer failure.
 
-Typical values are small. From one viewpoint in central Slovakia the visible
-peaks ranged 0.09° to 0.52°, so `min_prominence` around 0.02–0.05 is a
-meaningful filter. Sort by it rather than testing it against a fixed idea of
-what a "prominent" peak scores.
+Metres, not degrees, because degrees are not comparable across distance: a 2 km
+hill subtends more than the whole High Tatra range and would outrank every
+summit in it. Beware that the reverse also holds — ranking purely by metres
+puts a big distant massif above a nearby hill that fills far more of the frame.
+For label placement, weigh `prominence` against `distance`.
 
 `x` and `y` are fractional — place labels at sub-pixel positions.
 

@@ -604,6 +604,14 @@ pub fn encode_depth(d: f64) -> u16 {
     1 + (t.clamp(0.0, 1.0) * 65_534.0).round() as u16
 }
 
+/// Inverse of `encode_depth`. 0 is sky and has no distance.
+pub fn decode_depth(v: u16) -> Option<f64> {
+    (v != 0).then(|| {
+        let t = (v - 1) as f64 / 65_534.0;
+        (DEPTH_NEAR.ln() + t * (DEPTH_FAR.ln() - DEPTH_NEAR.ln())).exp()
+    })
+}
+
 /// Cooperative cancellation.
 ///
 /// A blocking task cannot be killed from outside -- dropping its JoinHandle
@@ -655,40 +663,113 @@ fn peak_is_visible(
     }
 }
 
-/// How far a summit rises above the skyline to either side of it, in degrees.
+/// Highest ground *elevation* visible in one column within a distance band, or
+/// `None` if the column holds nothing at that depth.
+///
+/// Elevation, not image altitude, because altitude confounds height with
+/// distance: looking down from a summit, the terrain highest in the frame is
+/// merely the farthest, so an altitude comparison calls every distant thing
+/// higher ground. Inverting the projection removes the distance term and
+/// leaves metres above sea level, which is what "higher ground" has to mean.
+///
+/// The band test runs in encoded space -- the depth encoding is monotone in
+/// distance -- so only rows that pass it are ever decoded. 0 is sky and must
+/// be excluded explicitly: it encodes below every real distance.
+/// What every peak's prominence walk shares: the frame it reads and the
+/// geometry needed to turn a pixel back into an elevation.
+struct Frame<'a> {
+    depth: &'a image::ImageBuffer<image::Luma<u16>, Vec<u16>>,
+    eye: f64,
+    /// Tangent of each output row's altitude, precomputed per frame.
+    tan_alt: Vec<f64>,
+    /// Ground radius the neighbourhood spans, metres.
+    radius: f64,
+}
+
+fn profile_at(f: &Frame, col: u32, band: (u16, u16)) -> Option<f64> {
+    let mut best = f64::NEG_INFINITY;
+    for row in 0..f.depth.height() {
+        let v = f.depth.get_pixel(col, row).0[0];
+        if v < band.0 || v > band.1 || v == 0 {
+            continue;
+        }
+        let Some(d) = decode_depth(v) else { continue };
+        let drop = d * d * (1.0 - REFRACTION_K) / (2.0 * EARTH_R);
+        best = best.max(f.eye + drop + d * f.tan_alt[row as usize]);
+    }
+    best.is_finite().then_some(best)
+}
+
+/// How far a summit rises above the terrain beside it *at its own depth*, in
+/// metres.
 ///
 /// The obvious measure -- height above the terrain *behind* the peak -- cannot
-/// come from the distance buffer, because terrain behind a skyline peak is
-/// exactly what the peak hides. Measuring sideways is both computable and a
-/// truer statement of what makes a summit worth labelling: one standing clear
-/// of its neighbours reads as a peak, one on a long level ridge does not.
+/// come from the distance buffer, because terrain behind a peak is exactly
+/// what the peak hides. Measuring sideways is both computable and a truer
+/// statement of what makes a summit worth labelling: one standing clear of its
+/// neighbours reads as a peak, one on a long level ridge does not.
 ///
-/// Follows topographic prominence in shape: walk out each way to the col where
-/// the skyline rises above the summit, and take the higher of the two lowest
-/// points found.
-fn angular_prominence(skyline: &[f64], col: usize, altitude: f64, window: usize) -> f64 {
+/// Comparing against the skyline was wrong, and silently discarded the whole
+/// foreground. A hill 2 km away with a mountain range behind it is not on the
+/// skyline at all, so the walk hit higher ground immediately on both sides and
+/// returned zero -- every near peak scored exactly 0 and was filtered out.
+/// What a peak must stand clear of is its *neighbours*, not the backdrop, so
+/// the profile is built per peak from terrain at a comparable depth: a band
+/// around the peak's own distance, wide enough to hold a ridge running
+/// obliquely away, narrow enough to drop what stands behind.
+///
+/// Follows topographic prominence in shape: walk out each way to where the
+/// ground rises above the summit, and take the higher of the two lowest points
+/// found. In metres rather than degrees, because that is what the comparison
+/// is made in, and because metres stay comparable between a foreground hill
+/// and a distant range while an angle does not -- a 2 km hill would otherwise
+/// outrank every summit in the Tatras.
+///
+/// Occlusion makes this a lower bound: a col hidden behind nearer ground reads
+/// as whatever hides it, which is higher, so prominence comes out too small
+/// rather than too large. Under-labelling a peak is the safer failure.
+fn prominence_m(f: &Frame, col: usize, elevation: f64, distance: f64, window: usize) -> f64 {
+    let radius = f.radius;
+    // The neighbourhood is a ball of ground around the summit, so it is as
+    // deep as it is wide -- the same radius the column window uses. A ratio
+    // instead of a difference looks reasonable and is not: at 25 km it spans
+    // 17 to 38 km, sweeping whole other ranges in as "higher ground beside
+    // this peak", and every summit in the middle distance scores zero.
+    //
+    // Held to within a factor of two either way, because near the viewer the
+    // ball reaches back past their own feet: for a hill 1.8 km off, a 3 km
+    // ball includes the slope they are standing on, which is higher than the
+    // hill and settles both cols at once.
+    let band = (
+        encode_depth((distance - radius).max(distance * 0.5)),
+        encode_depth((distance + radius).min(distance * 2.0)),
+    );
     let mut key_col = f64::NEG_INFINITY;
     for dir in [-1isize, 1] {
         let mut lowest = f64::INFINITY;
         let mut c = col as isize;
         for _ in 0..window {
             c += dir;
-            let Some(&s) = usize::try_from(c).ok().and_then(|c| skyline.get(c)) else {
+            let Ok(c) = u32::try_from(c) else { break };
+            if c >= f.depth.width() {
                 break;
+            }
+            // Nothing at this depth: the ridge has ended and we are seeing
+            // past it. Not a col -- keep walking, in case it resumes.
+            let Some(s) = profile_at(f, c, band) else {
+                continue;
             };
-            if s > altitude {
-                break; // higher ground: this side's col is settled
+            if s > elevation {
+                break; // higher ground at this depth: this side's col is settled
             }
-            if s.is_finite() {
-                lowest = lowest.min(s);
-            }
+            lowest = lowest.min(s);
         }
         if lowest.is_finite() {
             key_col = key_col.max(lowest);
         }
     }
     if key_col.is_finite() {
-        (altitude - key_col).max(0.0)
+        (elevation - key_col).max(0.0)
     } else {
         0.0
     }
@@ -770,7 +851,6 @@ pub fn render(
         usize,
         usize,
         Vec<(usize, bool)>,
-        Vec<f64>,
     );
     let parts: Vec<ChunkOut> = (0..out_w)
         .step_by(chunk)
@@ -782,7 +862,6 @@ pub fn render(
             let mut pixels = vec![[0u8; 3]; cols * out_h];
             let mut depth = vec![0u16; cols * out_h];
             let mut peak_results: Vec<(usize, bool)> = Vec::new();
-            let mut skyline = vec![f64::NEG_INFINITY; cols];
             let mut samples = 0usize;
             let mut sky = 0usize;
 
@@ -812,14 +891,6 @@ pub fn render(
                             let vis =
                                 peak_is_visible(altitude, distance, &column, p, alt_step, sub_h);
                             peak_results.push((i, vis));
-                        }
-                    }
-
-                    // Skyline angle for this column, for prominence later.
-                    if let Some(r) = (0..sub_h).find(|&r| column.dist[r].is_finite()) {
-                        let a = p.alt_max - (r as f64 + 0.5) * alt_step;
-                        if a > skyline[local] {
-                            skyline[local] = a;
                         }
                     }
 
@@ -865,7 +936,6 @@ pub fn render(
                 pyr.cached_blocks(),
                 sky,
                 peak_results,
-                skyline,
             ))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -877,15 +947,13 @@ pub fn render(
     let mut blocks = 0usize;
     let mut sky = 0usize;
     let mut cells = 0usize;
-    let mut skyline = vec![f64::NEG_INFINITY; out_w];
-    for (start, pixels, depth, n, b, s, answers, sky_chunk) in parts {
+    for (start, pixels, depth, n, b, s, answers) in parts {
         samples += n;
         blocks += b;
         sky += s;
         for (i, visible) in answers {
             peaks[i].visible = visible;
         }
-        skyline[start..start + sky_chunk.len()].copy_from_slice(&sky_chunk);
         let cols = pixels.len() / out_h;
         cells += cols * sub_h * ssx as usize;
         for orow in 0..out_h {
@@ -901,16 +969,32 @@ pub fn render(
         }
     }
 
-    // Prominence needs the whole skyline, so it waits until the columns are
-    // merged. Bounded to five degrees either side: beyond that the comparison
-    // stops being about this summit and starts being about the range.
-    let window = (5.0 / p.step_deg).round() as usize;
+    // Prominence reads across columns, so it waits until they are merged.
+    // Bounded by ground distance rather than by angle: the question is whether
+    // a summit dominates its surroundings, and a fixed angle would ask that
+    // over 170 m of ground for a near hill and 12 km for a far one. Clamped
+    // because at close range the equivalent angle runs to tens of degrees.
+    const PROMINENCE_RADIUS: f64 = 3000.0;
+    let frame = Frame {
+        depth: &depth_img,
+        eye,
+        tan_alt: (0..out_h)
+            .map(|row| (p.alt_max - (row as f64 + 0.5) * p.step_deg).to_radians().tan())
+            .collect(),
+        radius: PROMINENCE_RADIUS,
+    };
     for pk in peaks.iter_mut() {
-        pk.prominence = if pk.visible && pk.column >= 0 {
-            let out_col = (pk.column as usize / ssx as usize).min(out_w.saturating_sub(1));
-            angular_prominence(&skyline, out_col, pk.altitude, window)
-        } else {
-            0.0
+        pk.prominence = match (pk.visible && pk.column >= 0, pk.ele) {
+            (true, Some(ele)) => {
+                let out_col = (pk.column as usize / ssx as usize).min(out_w.saturating_sub(1));
+                let span = (PROMINENCE_RADIUS / pk.distance)
+                    .atan()
+                    .to_degrees()
+                    .clamp(1.0, 20.0);
+                let window = (span / p.step_deg).round() as usize;
+                prominence_m(&frame, out_col, ele, pk.distance, window)
+            }
+            _ => 0.0,
         };
     }
 

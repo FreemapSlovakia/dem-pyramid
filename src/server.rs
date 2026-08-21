@@ -76,6 +76,9 @@ pub struct Request {
     peaks: bool,
     #[serde(default = "d_min_prom")]
     min_prominence: f64,
+    /// Keep at most this many peaks, the most dominant first. 0 is no cap.
+    #[serde(default)]
+    max_peaks: usize,
 }
 
 fn d_az() -> f64 { 0.0 }
@@ -89,7 +92,7 @@ fn d_range() -> f64 { 300_000.0 }
 fn d_ss() -> u32 { 9 }
 fn d_depth_step() -> u16 { 4 }
 fn d_peaks() -> bool { true }
-fn d_min_prom() -> f64 { 0.05 }
+fn d_min_prom() -> f64 { 30.0 }
 
 #[derive(Clone)]
 pub struct Ctx {
@@ -249,6 +252,7 @@ async fn panorama_route(
     let depth_step = req.depth_step.max(1);
     let want_depth = req.depth;
     let min_prom = req.min_prominence;
+    let max_peaks = req.max_peaks;
 
     let render_cancel = cancel.clone();
     let built = tokio::task::spawn_blocking(move || -> Result<Vec<(String, Option<String>, Vec<u8>)>> {
@@ -276,6 +280,11 @@ async fn panorama_route(
                 && k.y <= stats.height as f64
         });
         found.sort_by(|a, b| b.prominence.partial_cmp(&a.prominence).unwrap());
+        // After sorting, so a cap keeps the most dominant summits rather than
+        // an arbitrary slice. Zero means no cap.
+        if max_peaks > 0 {
+            found.truncate(max_peaks);
+        }
 
         let meta = serde_json::json!({
             "width": stats.width,

@@ -167,9 +167,12 @@ enum Command {
         /// .json extension.
         #[arg(long)]
         peaks_out: Option<PathBuf>,
-        /// Drop peaks whose angular prominence is below this, degrees.
-        #[arg(long, default_value_t = 0.05)]
+        /// Drop peaks standing less than this above their surroundings, metres.
+        #[arg(long, default_value_t = 30.0)]
         min_prominence: f64,
+        /// Keep at most this many peaks, most dominant first. 0 is no cap.
+        #[arg(long, default_value_t = 0)]
+        max_peaks: usize,
         /// Rays per output pixel horizontally, averaged down.
         ///
         /// This is where supersampling earns its cost. At long range several
@@ -337,6 +340,7 @@ fn main() -> Result<()> {
             peaks: peaks_path,
             peaks_out,
             min_prominence,
+            max_peaks,
             supersample_x,
             supersample_y,
         } => {
@@ -451,7 +455,7 @@ fn main() -> Result<()> {
 
             if peaks_path.is_some() {
                 // In frame, not hidden, and standing far enough above what is
-                // behind it to be worth a label. Visibility was decided during
+                // around it to be worth a label. Visibility was decided during
                 // the render, from the columns it marched anyway.
                 cands.retain(|k| {
                     k.visible
@@ -461,6 +465,9 @@ fn main() -> Result<()> {
                         && k.y <= f64::from(stats.height as u32)
                 });
                 cands.sort_by(|a, b| b.prominence.partial_cmp(&a.prominence).unwrap());
+                if max_peaks > 0 {
+                    cands.truncate(max_peaks);
+                }
 
                 let dst = peaks_out.unwrap_or_else(|| out.with_extension("json"));
                 serde_json::to_writer_pretty(
