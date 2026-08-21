@@ -70,10 +70,6 @@ pub struct Request {
     peaks: bool,
     #[serde(default = "d_min_prom")]
     min_prominence: f64,
-    /// Queue priority; higher goes first. Set by whoever authenticates the
-    /// caller -- this service does not know what premium means.
-    #[serde(default)]
-    priority: i32,
 }
 
 fn d_az() -> f64 { 0.0 }
@@ -132,7 +128,26 @@ fn bad(msg: impl std::fmt::Display) -> Response {
     (StatusCode::BAD_REQUEST, msg.to_string()).into_response()
 }
 
-async fn panorama_route(State(ctx): State<Ctx>, Json(req): Json<Request>) -> Response {
+/// Queue priority, from a header rather than the body.
+///
+/// A body field would be client-controlled: anyone could POST
+/// `priority: 2147483647` and outrank every real premium user for ever. The
+/// public vhost sets `X-Priority: 0` unconditionally, which overwrites
+/// whatever a caller sent, so only something reaching the service on loopback
+/// -- freemap-v3-api, having authenticated the user -- can raise it.
+fn priority_of(headers: &header::HeaderMap) -> i32 {
+    headers
+        .get("x-priority")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .unwrap_or(0)
+}
+
+async fn panorama_route(
+    State(ctx): State<Ctx>,
+    headers: header::HeaderMap,
+    Json(req): Json<Request>,
+) -> Response {
     let step = req.step.max(MIN_STEP);
     let fov = req.fov.clamp(0.1, 360.0);
     if req.alt_max <= req.alt_min {
@@ -178,13 +193,13 @@ async fn panorama_route(State(ctx): State<Ctx>, Json(req): Json<Request>) -> Res
     let cancel = Cancel::default();
     let guard = Guard(cancel.clone());
 
-    let queued = ctx.queue.depth();
-    let _permit = ctx.queue.acquire(req.priority).await;
-
-    // Whoever was waiting may have given up by the time the slot came free.
-    if cancel.is_cancelled() {
-        return StatusCode::REQUEST_TIMEOUT.into_response();
-    }
+    let Ok((permit, queued)) = ctx.queue.acquire(priority_of(&headers)).await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "render queue is full; try again shortly",
+        )
+            .into_response();
+    };
 
     // Rendering is CPU-bound and blocking; keep it off the async runtime.
     let want_peaks = req.peaks && ctx.peaks_file.is_some();
@@ -197,8 +212,23 @@ async fn panorama_route(State(ctx): State<Ctx>, Json(req): Json<Request>) -> Res
 
     let render_cancel = cancel.clone();
     let built = tokio::task::spawn_blocking(move || -> Result<Vec<(String, Option<String>, Vec<u8>)>> {
+        // The permit lives here, not in the handler. Handler locals drop in
+        // reverse declaration order, so a permit held there would be released
+        // the instant the client hung up -- admitting the next render while
+        // this one is still marching at full width and has not yet noticed the
+        // cancel flag. Holding it until the blocking task actually returns is
+        // what keeps "one render at a time" true.
+        let _permit = permit;
         let cancel = render_cancel;
-        let (img, stats) = panorama::render(&root, &doc, &p, &cancel)?;
+        let started = std::time::Instant::now();
+        let (img, stats) = panorama::render(&root, &doc, &p, &cancel).inspect_err(|_| {
+            if cancel.is_cancelled() {
+                eprintln!(
+                    "render abandoned after {:.1} s: client hung up",
+                    started.elapsed().as_secs_f64()
+                );
+            }
+        })?;
 
         let mut found = Vec::new();
         if want_peaks {
@@ -272,24 +302,23 @@ async fn panorama_route(State(ctx): State<Ctx>, Json(req): Json<Request>) -> Res
     })
     .await;
 
+    // Only reachable while the client is still connected: if it hangs up, axum
+    // drops this future and none of the code below runs. Cancellation is
+    // therefore reported by the blocking task's own logging, not from here.
     let parts = match built {
         Ok(Ok(p)) => p,
-        Ok(Err(e)) if cancel.is_cancelled() => {
-            // Nobody is listening; the status is for the log, not the client.
-            let _ = e;
-            return StatusCode::REQUEST_TIMEOUT.into_response();
-        }
         Ok(Err(e)) => {
+            eprintln!("render failed: {e:#}");
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
         Err(e) => {
+            eprintln!("render task failed: {e}");
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     };
 
-    // The render finished, so the work is no longer abandonable; keeping the
-    // guard alive until here is what makes the cancellation window cover both
-    // queueing and rendering.
+    // Held until here so the cancellation window covers queueing and rendering
+    // alike.
     drop(guard);
 
     let boundary = "dempyramid7f3a9c2e";

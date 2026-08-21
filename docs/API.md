@@ -43,7 +43,6 @@ All fields except `lon` and `lat` are optional.
 | `depth_step` | int | `4` | depth quantisation; see [Depth](#depth) |
 | `peaks` | bool | `true` | include peak labels |
 | `min_prominence` | number | `0.05` | drop peaks below this angular prominence, degrees |
-| `priority` | int | `0` | queue priority, higher goes first — see below |
 
 Image dimensions follow from the angles:
 
@@ -77,23 +76,41 @@ default, because one already saturates nine cores.
 **One render at a time.** A single render already saturates nine of twelve
 cores, so overlapping them would trade latency for nothing. Requests queue.
 
-**Priority, not FIFO.** The waiting request with the highest `priority` goes
-next; equal priorities stay first-come-first-served. Set it from whatever the
-proxy knows about the caller — the service has no notion of premium. Verified:
-three requests submitted anonymous → plus → premium were served premium →
-plus → anonymous.
+**Priority, not FIFO.** Among requests *already waiting*, the one with the
+highest priority goes next. There is no preemption: a request arriving at an
+idle service starts immediately whatever its priority, and a render in progress
+is never interrupted. With one render already occupying the slot, three
+requests submitted anonymous → plus → premium were served premium → plus →
+anonymous.
+
+Priority comes from the **`X-Priority` header, not the request body**, and the
+public vhost sets it to `0` unconditionally. A caller cannot promote itself;
+only something reaching the service on loopback, having authenticated the user,
+can raise it.
+
+Waiting also counts: a waiter gains 0.2 priority per second, so it overtakes a
+fresh request ten points above it after fifty seconds. Without that, a steady
+trickle of premium requests would starve anonymous ones indefinitely.
+
+**Queue depth is capped.** Beyond 32 waiting, the service returns `503` rather
+than accepting work nobody will reach.
 
 **Aborting the connection cancels the work.** Hang up — `AbortController`,
 navigation, a closed tab — and the render stops within about a second, whether
 it was queued or already running. Measured: 11.3 cores in use, 0.3 two seconds
 after the client died, rather than grinding on for the remaining 24 s.
 
-This matters more than usual here. A user who reframes a view while the first
-render is in flight would otherwise queue behind their own abandoned work, so
-**abort the previous request before issuing a new one**.
+So **abort the previous request before issuing a new one**, or a user
+reframing a view queues behind their own abandoned work.
 
-`X-Queue-Depth` on the response reports how many were waiting when the request
-was admitted, which is a reasonable basis for a "busy" hint in the UI.
+But **debounce reframes too**. The public vhost rate-limits per IP, and while
+the burst allowance is sized for the abort-and-resubmit pattern, a user
+dragging continuously can still exhaust it and get `503` from nginx instead of
+a render. Wait for the interaction to settle before submitting.
+
+`X-Queue-Depth` on the response reports how many requests were ahead on
+arrival, counting the one already rendering — so `0` genuinely means the
+service was idle.
 
 ## Response
 
