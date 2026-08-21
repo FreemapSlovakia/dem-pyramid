@@ -182,7 +182,29 @@ level, so the DEM is finer than the ray spacing and adjacent rays land in the
 same cell; above it the chosen cell size equals the ray spacing by
 construction, so neighbouring rays sample different cells and need averaging.
 
-Not yet done: SVG output, peak labels, sun path.
+### Peaks and depth
+
+`--peaks <gpkg>` writes a JSON sidecar: each visible summit's position in the
+image, distance, azimuth, elevation angle, DTM elevation and angular
+prominence. Costs no extra rays -- projection is arithmetic and visibility is
+one ray per occupied azimuth bucket.
+
+`--depth-raw` writes a per-pixel distance buffer, log-encoded to 16 bits,
+quantised, row delta-coded and gzipped. At matched precision that is about half
+the size of LERC, which is why LERC is not used despite the client already
+decoding it.
+
+### Serving
+
+```sh
+./target/release/dem-tool serve --listen 127.0.0.1:3100 \
+    --peaks /fm/storage2/dem/peaks.gpkg
+```
+
+One `POST /panorama` returning image, depth and peaks in a single
+multipart/form-data body. See [docs/API.md](docs/API.md).
+
+Not yet done: sun path, caching/precomputation, a systemd unit.
 
 ## Known source hazards
 
