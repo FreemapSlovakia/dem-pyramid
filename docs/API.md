@@ -42,7 +42,7 @@ All fields except `lon` and `lat` are optional.
 | `depth` | bool | `false` | include the distance buffer |
 | `depth_step` | int | `4` | depth quantisation; see [Depth](#depth) |
 | `peaks` | bool | `true` | include peak labels |
-| `min_prominence` | number | `30` | drop peaks standing less than this above their surroundings, metres; may be negative |
+| `min_dominance` | number | `30` | drop peaks standing less than this above their surroundings, metres; may be negative |
 | `max_peaks` | int | `0` | keep at most this many, most dominant first; 0 is no cap |
 
 Image dimensions follow from the angles:
@@ -162,8 +162,8 @@ already including `eye`.
 
 ### Peaks
 
-Only peaks that are **visible and pass `min_prominence`** are returned, sorted
-by `prominence` descending and then cut to `max_peaks`. Because the cut comes
+Only peaks that are **visible and pass `min_dominance`** are returned, sorted
+by `dominance` descending and then cut to `max_peaks`. Because the cut comes
 after the sort, a small `max_peaks` keeps the summits that dominate the view
 rather than an arbitrary slice — it is the cheapest way to control label
 density, and it costs the server nothing.
@@ -181,7 +181,7 @@ density, and it costs the server nothing.
   "altitude": -1.09,
   "x": 326.4, "y": 181.8,
   "visible": true,
-  "prominence": 412.8
+  "dominance": 412.8
 }
 ```
 
@@ -194,22 +194,31 @@ density, and it costs the server nothing.
 | `azimuth` | degrees clockwise from north |
 | `altitude` | degrees above horizontal from the eye, including curvature and refraction |
 | `x`, `y` | position in the image, **output pixels**, origin top-left |
-| `prominence` | **metres** the summit stands above the terrain around it, **signed** |
+| `dominance` | **metres** the summit stands above the terrain around it, **signed** |
 
 This is what makes a summit worth a label: one standing clear of its
 neighbours reads as a peak, one on a long level ridge does not, however tall
 it is. Measured within 3 km of the summit, walking out each way until the
 ground rises above it and taking the higher of the two lowest points — the
-shape of topographic prominence, and close to it in practice: Slavkovský štít
-measures 338 m against a true 370 m, Východná Vysoká 207 m against ~180 m.
+shape of topographic prominence, and close to it where positive: Slavkovský
+štít measures 338 m against a true 370 m, Východná Vysoká 207 m against ~180 m.
 
-**Negative is normal and useful.** A top that never rises clear of its own
-ridge scores how far the ridge stands over it: −37 m for a shoulder, −281 m
-for a bump inside a massif. In ridge country most visible tops are like this —
-from one viewpoint above Krompachy, 167 of 219. They are still real, still
-worth labelling when there is room, and the sign is what lets you order them.
-Rank on the value; do not treat it as a magnitude. `prominence: 0` now means
-only that nothing at the peak's own depth was found to compare it against.
+**Not called prominence, because it is signed and prominence is not.**
+Topographic prominence is non-negative by definition, so a field promising it
+would invite comparison against published figures for tops that score below
+zero. A top that never rises clear of its own ridge scores how far the ridge
+stands over it: −37 m for a shoulder, −281 m for a bump inside a massif. In
+ridge country most visible tops are like this — from one viewpoint above
+Krompachy, 167 of 219. They are still real, still worth labelling when there
+is room, and the sign is what lets you order them.
+
+The two halves are one continuous scale in metres, not two quantities glued
+together: flatten a top until its col rises to the summit and it passes
+through zero; drop it a metre below the ground beside it and it reads −1. So
+rank on the value, but do not treat it as a magnitude — `Math.abs` or a
+`size ∝ dominance` rule will put the least significant tops on top.
+`dominance: 0` means only that nothing at the peak's own depth was found to
+compare it against.
 
 Two honest limits. Where a valley runs alongside a peak rather than a ridge,
 the figure reads the valley depth and comes out high. Where the surrounding
@@ -218,7 +227,7 @@ out low — under-labelling being the safer failure.
 
 **The peak count depends on render resolution.** Visibility is decided against
 the depth buffer, so a finer `step` resolves more tops: the same viewpoint
-returns ~136 peaks at `step: 0.1` and ~273 at `0.05`. Prominence shifts
+returns ~136 peaks at `step: 0.1` and ~273 at `0.05`. Dominance shifts
 slightly with it too, for the same reason. This is not a filter bug — if you
 need a stable set across zoom levels, pin `step` for the peak query.
 
@@ -226,7 +235,7 @@ Metres, not degrees, because degrees are not comparable across distance: a 2 km
 hill subtends more than the whole High Tatra range and would outrank every
 summit in it. Beware that the reverse also holds — ranking purely by metres
 puts a big distant massif above a nearby hill that fills far more of the frame.
-For label placement, weigh `prominence` against `distance`.
+For label placement, weigh `dominance` against `distance`.
 
 `x` and `y` are fractional — place labels at sub-pixel positions.
 

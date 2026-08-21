@@ -168,8 +168,9 @@ enum Command {
         #[arg(long)]
         peaks_out: Option<PathBuf>,
         /// Drop peaks standing less than this above their surroundings, metres.
+        /// Negative for tops their own ridge stands over.
         #[arg(long, default_value_t = 30.0)]
-        min_prominence: f64,
+        min_dominance: f64,
         /// Keep at most this many peaks, most dominant first. 0 is no cap.
         #[arg(long, default_value_t = 0)]
         max_peaks: usize,
@@ -339,7 +340,7 @@ fn main() -> Result<()> {
             depth_step,
             peaks: peaks_path,
             peaks_out,
-            min_prominence,
+            min_dominance,
             max_peaks,
             supersample_x,
             supersample_y,
@@ -460,11 +461,11 @@ fn main() -> Result<()> {
                 cands.retain(|k| {
                     k.visible
                         && k.column >= 0
-                        && k.prominence >= min_prominence
+                        && k.dominance >= min_dominance
                         && k.y >= 0.0
                         && k.y <= f64::from(stats.height as u32)
                 });
-                cands.sort_by(|a, b| b.prominence.partial_cmp(&a.prominence).unwrap());
+                cands.sort_by(|a, b| b.dominance.partial_cmp(&a.dominance).unwrap());
                 if max_peaks > 0 {
                     cands.truncate(max_peaks);
                 }

@@ -39,7 +39,12 @@ pub struct Peak {
     /// How far the summit stands above the terrain beside it at its own depth,
     /// in metres, negative where its own ridge stands over it. Measured from
     /// what the render saw, so it is a lower bound where the cols are hidden.
-    pub prominence: f64,
+    ///
+    /// Not called prominence, because topographic prominence is non-negative
+    /// by definition and this is not: where it is positive the two agree
+    /// closely, but a name that promised the textbook measure would invite
+    /// comparison against published figures for tops that score below zero.
+    pub dominance: f64,
 
     /// Output column, used while rendering; not part of the API.
     #[serde(skip)]
@@ -98,7 +103,7 @@ pub fn load(path: &Path, lon: f64, lat: f64, range: f64) -> Result<Vec<Peak>> {
             x: 0.0,
             y: 0.0,
             visible: false,
-            prominence: 0.0,
+            dominance: 0.0,
             column: -1,
         });
     }

@@ -675,7 +675,7 @@ fn peak_is_visible(
 /// The band test runs in encoded space -- the depth encoding is monotone in
 /// distance -- so only rows that pass it are ever decoded. 0 is sky and must
 /// be excluded explicitly: it encodes below every real distance.
-/// What every peak's prominence walk shares: the frame it reads and the
+/// What every peak's dominance walk shares: the frame it reads and the
 /// geometry needed to turn a pixel back into an elevation.
 struct Frame<'a> {
     depth: &'a image::ImageBuffer<image::Luma<u16>, Vec<u16>>,
@@ -725,18 +725,22 @@ fn profile_at(f: &Frame, col: u32, band: (u16, u16)) -> Option<f64> {
 /// and a distant range while an angle does not -- a 2 km hill would otherwise
 /// outrank every summit in the Tatras.
 ///
-/// Signed. A top that never rises clear of its ridge returns how far the ridge
-/// stands *over* it, negative. Clamping those to zero looked tidy and cost the
-/// client the whole near field: in ridge country 60% of visible peaks never
-/// stand clear of anything, so they all tied at zero and could not be ordered
-/// at all -- exactly where a panorama most needs to choose which names to
-/// show. Zero now means only that nothing at the peak's own depth was found to
-/// compare against.
+/// Signed, and so deliberately *not* called prominence: topographic prominence
+/// is non-negative by definition, and a name promising it would invite
+/// comparison against published figures. A top that never rises clear of its
+/// ridge returns how far the ridge stands over it, negative. Clamping those to
+/// zero looked tidy and cost the client the whole near field: in ridge country
+/// 60% of visible peaks never stand clear of anything, so they all tied at
+/// zero and could not be ordered at all -- exactly where a panorama most needs
+/// to choose which names to show. The two halves are one continuous scale:
+/// flatten a top until its col reaches the summit and it passes through zero.
+/// Zero itself now means only that nothing at the peak's own depth was found
+/// to compare against.
 ///
 /// Occlusion makes this a lower bound: a col hidden behind nearer ground reads
-/// as whatever hides it, which is higher, so prominence comes out too small
+/// as whatever hides it, which is higher, so the figure comes out too small
 /// rather than too large. Under-labelling a peak is the safer failure.
-fn prominence_m(f: &Frame, col: usize, elevation: f64, distance: f64, window: usize) -> f64 {
+fn dominance_m(f: &Frame, col: usize, elevation: f64, distance: f64, window: usize) -> f64 {
     let radius = f.radius;
     // The neighbourhood is a ball of ground around the summit, so it is as
     // deep as it is wide -- the same radius the column window uses. A ratio
@@ -982,30 +986,30 @@ pub fn render(
         }
     }
 
-    // Prominence reads across columns, so it waits until they are merged.
+    // Dominance reads across columns, so it waits until they are merged.
     // Bounded by ground distance rather than by angle: the question is whether
     // a summit dominates its surroundings, and a fixed angle would ask that
     // over 170 m of ground for a near hill and 12 km for a far one. Clamped
     // because at close range the equivalent angle runs to tens of degrees.
-    const PROMINENCE_RADIUS: f64 = 3000.0;
+    const DOMINANCE_RADIUS: f64 = 3000.0;
     let frame = Frame {
         depth: &depth_img,
         eye,
         tan_alt: (0..out_h)
             .map(|row| (p.alt_max - (row as f64 + 0.5) * p.step_deg).to_radians().tan())
             .collect(),
-        radius: PROMINENCE_RADIUS,
+        radius: DOMINANCE_RADIUS,
     };
     for pk in peaks.iter_mut() {
-        pk.prominence = match (pk.visible && pk.column >= 0, pk.ele) {
+        pk.dominance = match (pk.visible && pk.column >= 0, pk.ele) {
             (true, Some(ele)) => {
                 let out_col = (pk.column as usize / ssx as usize).min(out_w.saturating_sub(1));
-                let span = (PROMINENCE_RADIUS / pk.distance)
+                let span = (DOMINANCE_RADIUS / pk.distance)
                     .atan()
                     .to_degrees()
                     .clamp(1.0, 20.0);
                 let window = (span / p.step_deg).round() as usize;
-                prominence_m(&frame, out_col, ele, pk.distance, window)
+                dominance_m(&frame, out_col, ele, pk.distance, window)
             }
             _ => 0.0,
         };

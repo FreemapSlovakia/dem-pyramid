@@ -74,8 +74,8 @@ pub struct Request {
     depth_step: u16,
     #[serde(default = "d_peaks")]
     peaks: bool,
-    #[serde(default = "d_min_prom")]
-    min_prominence: f64,
+    #[serde(default = "d_min_dom")]
+    min_dominance: f64,
     /// Keep at most this many peaks, the most dominant first. 0 is no cap.
     #[serde(default)]
     max_peaks: usize,
@@ -92,7 +92,7 @@ fn d_range() -> f64 { 300_000.0 }
 fn d_ss() -> u32 { 9 }
 fn d_depth_step() -> u16 { 4 }
 fn d_peaks() -> bool { true }
-fn d_min_prom() -> f64 { 30.0 }
+fn d_min_dom() -> f64 { 30.0 }
 
 #[derive(Clone)]
 pub struct Ctx {
@@ -251,7 +251,7 @@ async fn panorama_route(
     let doc = ctx.doc.clone();
     let depth_step = req.depth_step.max(1);
     let want_depth = req.depth;
-    let min_prom = req.min_prominence;
+    let min_dom = req.min_dominance;
     let max_peaks = req.max_peaks;
 
     let render_cancel = cancel.clone();
@@ -275,11 +275,11 @@ async fn panorama_route(
         found.retain(|k| {
             k.visible
                 && k.column >= 0
-                && k.prominence >= min_prom
+                && k.dominance >= min_dom
                 && k.y >= 0.0
                 && k.y <= stats.height as f64
         });
-        found.sort_by(|a, b| b.prominence.partial_cmp(&a.prominence).unwrap());
+        found.sort_by(|a, b| b.dominance.partial_cmp(&a.dominance).unwrap());
         // After sorting, so a cap keeps the most dominant summits rather than
         // an arbitrary slice. Zero means no cap.
         if max_peaks > 0 {
