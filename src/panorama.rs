@@ -1292,25 +1292,33 @@ fn sky_colour(alt: f64) -> (f64, f64, f64) {
     )
 }
 
-/// Ordered dither, plus or minus half a level, from an 8x8 Bayer matrix.
+/// Triangular dither, plus or minus one level, from a hash of the position.
 ///
 /// A sky gradient crosses few levels over many pixels -- blue runs 238 to 214
 /// across the whole frame, so one level lasts 25 rows at the default step and
-/// the eye reads the steps as stripes. Displacing each pixel by under half a
-/// level breaks the step into a boundary that scatters across two values, and
-/// the mean over any 8x8 block is unchanged.
+/// the eye reads the steps as stripes.
+///
+/// Two properties matter, and an ordered matrix at half a level gives only the
+/// first. Zero mean removes the banding's *position*; a triangular
+/// distribution one level wide removes its *visibility*, because the
+/// proportion of pixels that round up then varies smoothly with the value
+/// instead of switching on and off as the ramp crosses each boundary. That
+/// residual switching is noise modulation, and it is what a Bayer dither
+/// leaves behind as softened steps rather than no steps.
+///
+/// Hashed rather than tiled because an 8x8 matrix repeats often enough for the
+/// eye to find the grid and read it as structure. Deterministic all the same,
+/// so a given pixel always dithers identically and renders stay reproducible.
 fn dither(x: usize, y: usize) -> f64 {
-    const BAYER: [[u8; 8]; 8] = [
-        [0, 32, 8, 40, 2, 34, 10, 42],
-        [48, 16, 56, 24, 50, 18, 58, 26],
-        [12, 44, 4, 36, 14, 46, 6, 38],
-        [60, 28, 52, 20, 62, 30, 54, 22],
-        [3, 35, 11, 43, 1, 33, 9, 41],
-        [51, 19, 59, 27, 49, 17, 57, 25],
-        [15, 47, 7, 39, 13, 45, 5, 37],
-        [63, 31, 55, 23, 61, 29, 53, 21],
-    ];
-    (f64::from(BAYER[y & 7][x & 7]) + 0.5) / 64.0 - 0.5
+    // Two decorrelated uniforms; their difference is triangular on [-1, 1].
+    let mut h = (x as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ (y as u64).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 32;
+    let a = (h & 0xff_ffff) as f64 / f64::from(0xff_ffffu32);
+    let b = ((h >> 32) & 0xff_ffff) as f64 / f64::from(0xff_ffffu32);
+    a - b
 }
 
 fn lerp(a: f64, b: f64, t: f64) -> f64 {
@@ -1605,16 +1613,31 @@ mod tests {
 
     // ---- dithering --------------------------------------------------------
 
-    /// Dither must not shift the picture, only spread each step's boundary:
-    /// over one tile of the matrix the offsets cancel.
+    /// Dither must not shift the picture, only spread each step's boundary.
     #[test]
     fn dither_has_no_bias() {
-        let sum: f64 = (0..8).flat_map(|y| (0..8).map(move |x| dither(x, y))).sum();
-        assert!(sum.abs() < 1e-12, "dither is biased by {sum}");
-        for y in 0..8 {
-            for x in 0..8 {
-                assert!(dither(x, y).abs() <= 0.5, "dither exceeds half a level");
-            }
+        let vals: Vec<f64> = (0..200)
+            .flat_map(|y| (0..200).map(move |x| dither(x, y)))
+            .collect();
+        let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+        assert!(mean.abs() < 0.005, "dither is biased by {mean}");
+        assert!(
+            vals.iter().all(|d| d.abs() <= 1.0),
+            "dither exceeds one level"
+        );
+        // Triangular, not uniform: values bunch towards zero, so the middle
+        // half of the range holds well over half the samples.
+        let near = vals.iter().filter(|d| d.abs() < 0.5).count();
+        let frac = near as f64 / vals.len() as f64;
+        assert!((0.7..0.8).contains(&frac), "not triangular: {frac} within +-0.5");
+    }
+
+    /// Deterministic: the same pixel must dither the same way every render,
+    /// or repeat requests would differ and caching would be unsound.
+    #[test]
+    fn dither_is_reproducible() {
+        for (x, y) in [(0, 0), (7, 3), (1024, 768), (12_345, 54_321)] {
+            assert_eq!(dither(x, y), dither(x, y));
         }
     }
 
