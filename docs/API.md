@@ -44,7 +44,7 @@ All fields except `lon` and `lat` are optional.
 | `peaks` | bool | `true` | include peak labels |
 | `min_dominance` | number | `30` | drop peaks standing less than this above their surroundings, metres; may be negative |
 | `max_peaks` | int | `0` | keep at most this many, most dominant first; 0 is no cap |
-| `ridge_strength` | number | `1` | multiplier on the ridge silhouettes; 0 removes them (0–4) |
+| `ridge_strength` | number | `1` | multiplier on the silhouettes' alpha; 0 removes them, no upper bound |
 | `ridge_color` | string | `#000000` | silhouette colour, `#rrggbb` or `#rgb` |
 | `ground_color` | string | `#3a4a34` | near-terrain colour, before haze |
 
@@ -93,9 +93,23 @@ a floor rather than a promise.
 Three knobs, all optional, all defaulting to exactly what the renderer drew
 before they existed — omit them and nothing changes.
 
-`ridge_strength` scales the silhouettes the renderer strokes along ridge
-lines. `0` removes them, leaving pure shaded terrain; `2` gives a drawn,
-map-like look. Above about `3` the strokes start to merge on busy horizons.
+`ridge_strength` is a gain on the alpha of the silhouettes the renderer
+strokes along ridge lines. It is a multiplier, not an opacity: the geometry
+inks a near ridge at about 0.55 alpha and a distant one at 0.15, so `1` is
+translucent already and there would be no way to draw a solid line if the
+field stopped there.
+
+| value | effect |
+|---|---|
+| `0` | no linework — plain shaded relief |
+| `1` | default |
+| ~1.8 | nearest ridges reach full ink |
+| ~4 | mid-distance ridges solid, strokes start merging |
+| ~6.7 | even the haziest distant ridges saturate |
+
+There is no upper limit — alpha is clamped at composite time, so a large value
+simply makes everything solid. Negative is rejected, since it would brighten
+rather than ink.
 
 `ridge_color` is what those strokes are drawn in. Black is the default and
 reads as shading, since inking towards black is a plain multiply. A colour

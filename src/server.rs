@@ -205,10 +205,14 @@ async fn panorama_route(
         ("step", req.step),
         ("alt_min", req.alt_min),
         ("alt_max", req.alt_max),
+        ("ridge_strength", req.ridge_strength),
     ] {
         if !v.is_finite() {
             return bad(format!("{name} must be a finite number"));
         }
+    }
+    if req.ridge_strength < 0.0 {
+        return bad("ridge_strength must not be negative");
     }
     if !(-90.0..=90.0).contains(&req.alt_min) || !(-90.0..=90.0).contains(&req.alt_max) {
         return bad("alt_min and alt_max must lie within -90..90");
@@ -259,7 +263,11 @@ async fn panorama_route(
         eye_level: false,
         supersample_x: req.supersample_x.clamp(1, MAX_SUPERSAMPLE),
         supersample_y: req.supersample_y.clamp(1, MAX_SUPERSAMPLE),
-        ridge_strength: req.ridge_strength.clamp(0.0, 4.0),
+        // Unbounded above: the composite clamps alpha to 1 anyway, so a large
+        // value only makes the linework solid and costs nothing. A ceiling
+        // here would silently rewrite the caller's number instead -- negative
+        // is rejected outright above, since it would brighten rather than ink.
+        ridge_strength: req.ridge_strength,
         ridge_colour,
         ground_colour,
     };
