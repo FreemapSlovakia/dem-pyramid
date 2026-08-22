@@ -171,6 +171,16 @@ pub async fn serve(
     Ok(())
 }
 
+/// Media type for a part, from the name it is sent under.
+fn content_type(filename: &str) -> &'static str {
+    match filename.rsplit('.').next() {
+        Some("avif") => "image/avif",
+        Some("png") => "image/png",
+        Some("gz") => "application/gzip",
+        _ => "application/octet-stream",
+    }
+}
+
 fn bad(msg: impl std::fmt::Display) -> Response {
     (StatusCode::BAD_REQUEST, msg.to_string()).into_response()
 }
@@ -433,10 +443,15 @@ async fn panorama_route(
         match &filename {
             // A part with a filename arrives as a Blob; without one, as a
             // string. That is what lets `meta` come back parseable directly.
+            // Typed, so the Blob the client receives carries its own type and
+            // can be used directly. Left as octet-stream this happened to work
+            // only because <img> sniffs its content, and any client wrapping
+            // the bytes in a Blob of the declared type got an unusable one.
             Some(f) => body.extend_from_slice(
                 format!(
                     "Content-Disposition: form-data; name=\"{name}\"; filename=\"{f}\"\r\n\
-                     Content-Type: application/octet-stream\r\n\r\n"
+                     Content-Type: {}\r\n\r\n",
+                    content_type(f)
                 )
                 .as_bytes(),
             ),
