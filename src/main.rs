@@ -361,6 +361,7 @@ fn main() -> Result<()> {
             supersample_x,
             supersample_y,
         } => {
+            panorama::validate_style(ridge_strength, ridge_width)?;
             let p = panorama::Params {
                 lon,
                 lat,

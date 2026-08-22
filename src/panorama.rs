@@ -1351,6 +1351,37 @@ pub fn parse_colour(s: &str) -> Result<(f64, f64, f64)> {
     }
 }
 
+/// Widest stroke the renderer will draw, output pixels.
+///
+/// Unlike `ridge_strength`, width has a cost: every stroke inks a band of
+/// rows, so an unbounded value would have one request painting the full
+/// column height for every edge in the frame.
+pub const MAX_RIDGE_WIDTH: f64 = 20.0;
+
+/// Reject styling the renderer cannot draw, before it reaches the hot loop.
+///
+/// Shared so the CLI cannot do what the server refuses: `--ridge-width 1e9`
+/// used to make the ink pass span the whole column for every edge, which reads
+/// as a hang and paints a solid slab, while the same value over HTTP was a
+/// clean 400.
+pub fn validate_style(ridge_strength: f64, ridge_width: f64) -> Result<()> {
+    for (name, v) in [
+        ("ridge_strength", ridge_strength),
+        ("ridge_width", ridge_width),
+    ] {
+        anyhow::ensure!(v.is_finite(), "{name} must be a finite number");
+    }
+    anyhow::ensure!(
+        ridge_strength >= 0.0,
+        "ridge_strength must not be negative"
+    );
+    anyhow::ensure!(
+        (0.0..=MAX_RIDGE_WIDTH).contains(&ridge_width),
+        "ridge_width must lie within 0..{MAX_RIDGE_WIDTH}"
+    );
+    Ok(())
+}
+
 /// Terrain as it renders without haze: a muted green.
 pub const DEFAULT_GROUND: (f64, f64, f64) = (58.0, 74.0, 52.0);
 /// Silhouettes darken what they cross, which is a multiply towards black.

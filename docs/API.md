@@ -91,7 +91,7 @@ a floor rather than a promise.
 
 ### Styling
 
-Three knobs, all optional, all defaulting to exactly what the renderer drew
+Four knobs, all optional, all defaulting to exactly what the renderer drew
 before they existed — omit them and nothing changes.
 
 `ridge_strength` is a gain on the alpha of the silhouettes the renderer
@@ -109,8 +109,8 @@ field stopped there.
 | ~6.7 | even the haziest distant ridges saturate |
 
 There is no upper limit — alpha is clamped at composite time, so a large value
-simply makes everything solid. Negative is rejected, since it would brighten
-rather than ink.
+simply makes everything solid. Negative is rejected as meaningless: alpha is
+clamped at zero too, so it would draw exactly what `0` draws.
 
 `ridge_width` is thickness in **output pixels**, so a line looks the same
 weight whatever `step` you render at — sub-rows are only how it is drawn.
