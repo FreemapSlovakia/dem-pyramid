@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use crate::config::Doc;
 use crate::panorama::Cancel;
+use crate::progress::{Job, Jobs, Phase, Registration};
 use crate::queue::{Queue, Rejected};
 use crate::{avif, panorama, peaks, viewshed};
 
@@ -40,6 +41,12 @@ const MAX_VIEWSHED_RADIUS: f64 = 200_000.0;
 /// A warm tint that reads over both map and imagery; opacity carries the
 /// detail, so the colour is deliberately flat.
 const DEFAULT_VIEWSHED_COLOUR: (f64, f64, f64) = (255.0, 214.0, 102.0);
+/// How often progress is sent. Fast enough to feel live, slow enough that a
+/// queued client is not woken four times a second to be told nothing changed.
+const TICK_MS: u64 = 250;
+/// How long an unknown token is given to appear before the stream gives up --
+/// the client may well subscribe before its own request has been accepted.
+const UNKNOWN_TICKS: u32 = 40;
 
 /// One multipart part: field name, optional filename, bytes.
 type Part = (String, Option<String>, Vec<u8>);
@@ -183,6 +190,22 @@ pub struct Ctx {
     /// overlapping them trades latency for nothing. Priority-ordered, so a
     /// premium request does not queue behind anonymous ones.
     queue: Queue,
+    jobs: Jobs,
+}
+
+/// Register the caller's `X-Job` token, if it sent one.
+///
+/// The token is the client's to invent; the server only needs it to be short
+/// and unique. Absent, everything works exactly as before -- progress is
+/// something a caller opts into.
+fn job_for(jobs: &Jobs, headers: &header::HeaderMap) -> (Option<Arc<Job>>, Option<Registration>) {
+    let Some(token) = headers.get("x-job").and_then(|v| v.to_str().ok()) else {
+        return (None, None);
+    };
+    match jobs.register(token.trim()) {
+        Some((job, reg)) => (Some(job), Some(reg)),
+        None => (None, None),
+    }
 }
 
 pub async fn serve(
@@ -196,11 +219,13 @@ pub async fn serve(
         doc: Arc::new(doc),
         peaks_file,
         queue: Queue::new(),
+        jobs: Jobs::new(),
     };
 
     let app = Router::new()
         .route("/panorama", post(panorama_route))
         .route("/viewshed", post(viewshed_route))
+        .route("/progress/{token}", axum::routing::get(progress_route))
         .route("/health", axum::routing::get(|| async { "ok" }))
         .with_state(ctx);
 
@@ -229,6 +254,72 @@ fn content_type(filename: &str) -> &'static str {
         Some("gz") => "application/gzip",
         _ => "application/octet-stream",
     }
+}
+
+/// Live progress for a token, as server-sent events.
+///
+/// Opened alongside the request rather than instead of it: the render still
+/// answers on its own connection, and this only reports. It may be opened
+/// before the request lands, so an unknown token waits rather than 404s --
+/// otherwise the client would have to race its own two connections.
+async fn progress_route(
+    State(ctx): State<Ctx>,
+    axum::extract::Path(token): axum::extract::Path<String>,
+) -> Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+
+    struct Watch {
+        waited: u32,
+        seen: bool,
+        finished: bool,
+    }
+
+    let jobs = ctx.jobs.clone();
+    let stream = futures_util::stream::unfold(
+        Watch {
+            waited: 0,
+            seen: false,
+            finished: false,
+        },
+        move |mut st| {
+            let jobs = jobs.clone();
+            let token = token.clone();
+            async move {
+                if st.finished {
+                    return None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(TICK_MS)).await;
+                let body = match jobs.get(&token) {
+                    Some(job) => {
+                        st.seen = true;
+                        let snap = job.snapshot();
+                        st.finished = snap.phase == Phase::Done;
+                        snap.to_json()
+                    }
+                    // Gone after having been seen: the request finished and
+                    // took its registration with it. That is the ordinary
+                    // ending, and it usually arrives before the last tick can
+                    // catch the job reporting `done` itself.
+                    None if st.seen => {
+                        st.finished = true;
+                        serde_json::json!({ "phase": "done", "percent": 100 })
+                    }
+                    // Never seen: it may not have arrived yet, since a client
+                    // has to subscribe before or alongside its own request.
+                    // Wait a while, then stop rather than hold the connection.
+                    None => {
+                        st.waited += 1;
+                        st.finished = st.waited > UNKNOWN_TICKS;
+                        serde_json::json!({ "phase": "unknown" })
+                    }
+                };
+                let event = Event::default().data(body.to_string());
+                Some((Ok::<_, std::convert::Infallible>(event), st))
+            }
+        },
+    );
+
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
 }
 
 /// Cancellation has to be cooperative: a blocking task cannot be killed, and
@@ -369,8 +460,9 @@ async fn panorama_route(
 
     let cancel = Cancel::default();
     let guard = CancelOnDrop(cancel.clone());
+    let (job, _registration) = job_for(&ctx.jobs, &headers);
 
-    let (permit, queued) = match ctx.queue.acquire(priority_of(&headers)).await {
+    let (permit, queued) = match ctx.queue.acquire(priority_of(&headers), job.clone()).await {
         Ok(v) => v,
         Err(Rejected::Full) => {
             return (
@@ -406,13 +498,19 @@ async fn panorama_route(
         // what keeps "one render at a time" true.
         let _permit = permit;
         let cancel = render_cancel;
+        if let Some(job) = &job {
+            job.set_phase(Phase::Rendering);
+        }
         // Candidates go in before marching, so the render answers them from
         // the columns it produces anyway.
         let mut found = match (want_peaks, &peaks_file) {
             (true, Some(pf)) => peaks::load(pf, p.lon, p.lat, p.max_range)?,
             _ => Vec::new(),
         };
-        let (img, stats) = panorama::render(&root, &doc, &p, &cancel, &mut found)?;
+        let (img, stats) = panorama::render(&root, &doc, &p, &cancel, &mut found, job.as_deref())?;
+        if let Some(job) = &job {
+            job.set_phase(Phase::Encoding);
+        }
 
         peaks::select(&mut found, min_dom, max_peaks, stats.height);
 
@@ -458,6 +556,9 @@ async fn panorama_route(
                 Some("depth.bin.gz".into()),
                 panorama::depth_bytes(&stats.depth, depth_step)?,
             ));
+        }
+        if let Some(job) = &job {
+            job.set_phase(Phase::Done);
         }
         Ok(parts)
     })
@@ -551,7 +652,8 @@ async fn viewshed_route(
 
     let cancel = Cancel::default();
     let _guard = CancelOnDrop(cancel.clone());
-    let (permit, queued) = match ctx.queue.acquire(priority_of(&headers)).await {
+    let (job, _registration) = job_for(&ctx.jobs, &headers);
+    let (permit, queued) = match ctx.queue.acquire(priority_of(&headers), job.clone()).await {
         Ok(v) => v,
         Err(Rejected::Full) => {
             return (StatusCode::SERVICE_UNAVAILABLE, "queue full").into_response();
@@ -565,8 +667,14 @@ async fn viewshed_route(
     let work = cancel.clone();
     let built = tokio::task::spawn_blocking(move || -> Result<Vec<Part>> {
         let _permit = permit;
-        let out = viewshed::render(&root, &doc, &p, &work)?;
+        if let Some(job) = &job {
+            job.set_phase(Phase::Rendering);
+        }
+        let out = viewshed::render(&root, &doc, &p, &work, job.as_deref())?;
         anyhow::ensure!(!work.is_cancelled(), "cancelled");
+        if let Some(job) = &job {
+            job.set_phase(Phase::Encoding);
+        }
 
         let meta = serde_json::json!({
             "width": out.image.width(),
@@ -593,6 +701,9 @@ async fn viewshed_route(
                 ("viewshed.png", png.into_inner())
             }
         };
+        if let Some(job) = &job {
+            job.set_phase(Phase::Done);
+        }
         Ok(vec![
             ("meta".into(), None, serde_json::to_vec(&meta)?),
             ("image".into(), Some(name.into()), bytes),

@@ -56,7 +56,13 @@ pub fn extent(radius: f64, scale: f64) -> usize {
     ((2.0 * radius / scale).round() as usize).max(1)
 }
 
-pub fn render(root: &Path, doc: &Doc, p: &Params, cancel: &Cancel) -> Result<Out> {
+pub fn render(
+    root: &Path,
+    doc: &Doc,
+    p: &Params,
+    cancel: &Cancel,
+    progress: Option<&crate::progress::Job>,
+) -> Result<Out> {
     let (coarsest, finest) = (doc.grid.coarsest_level, doc.grid.finest_level);
     let px = extent(p.radius, p.scale);
 
@@ -78,6 +84,9 @@ pub fn render(root: &Path, doc: &Doc, p: &Params, cancel: &Cancel) -> Result<Out
     // one ray per pixel the far field comes out stippled rather than solid --
     // measured 31% of the outer annulus covered against 96% near the middle.
     let rays = ((4.0 * std::f64::consts::PI * p.radius / p.scale).ceil() as usize).max(8);
+    if let Some(job) = progress {
+        job.set_total(rays);
+    }
 
     // Alpha only. Every ray that reaches a pixel proposes an opacity and the
     // brightest wins, which is what `fetch_max` gives without a lock -- rays
@@ -94,6 +103,9 @@ pub fn render(root: &Path, doc: &Doc, p: &Params, cancel: &Cancel) -> Result<Out
             let mut n = 0usize;
             for i in start..(start + chunk).min(rays) {
                 cancel.check()?;
+                if let Some(job) = progress {
+                    job.tick();
+                }
                 let az = 360.0 * i as f64 / rays as f64;
                 n += cast(&mut pyr, p, &alpha, px, (x0, y0), proj, eye, az, coarsest, finest);
             }

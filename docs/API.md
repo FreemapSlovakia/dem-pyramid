@@ -538,6 +538,59 @@ can see more than you can, sometimes much more.
 GEDTM30 elsewhere. The [coverage](#where-it-runs) applies here as it does to
 panoramas.
 
+## `GET /progress/{token}` — live progress
+
+A render takes tens of seconds and the response arrives all at once at the end,
+so progress comes over a side channel. Invent a token, send it with the
+request, and subscribe to it separately. Nothing about the request or the
+response changes; progress is opt-in.
+
+```js
+const token = crypto.randomUUID();
+
+const events = new EventSource(`${BASE}/progress/${token}`);
+events.onmessage = (e) => {
+  const { phase, ahead, percent } = JSON.parse(e.data);
+  // queued  -> "waiting, N ahead"
+  // rendering / encoding -> percent
+  // done    -> close it
+  if (phase === "done") events.close();
+};
+
+const res = await fetch(`${BASE}/panorama`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json", "X-Job": token },
+  body: JSON.stringify({ lon, lat }),
+});
+```
+
+| field | meaning |
+|---|---|
+| `phase` | `queued`, `rendering`, `encoding`, `done`, or `unknown` |
+| `ahead` | renders that must finish before yours starts; 0 means next |
+| `percent` | 0–100 through the current render |
+
+Both `/panorama` and `/viewshed` accept `X-Job`.
+
+**Subscribe first, then post.** The stream tolerates either order — an unknown
+token reports `phase: "unknown"` and keeps waiting for about ten seconds rather
+than 404ing — but subscribing first means you never miss the queued phase.
+
+**`percent` is a percentage, not a clock.** It counts output columns for a
+panorama and rays for a viewshed, and those are not equal work: a column of sky
+costs less than one of near terrain, so the rate drifts a few percent. Deriving
+an ETA is left to the client, which knows when it started and can smooth as it
+likes.
+
+**The stream always ends.** `done` is the last event, whether the render
+finished, failed or the client hung up, and the server closes the connection
+after it. A browser reconnects an `EventSource` automatically, so close it on
+`done` or it will reopen and sit in `unknown` for ten seconds.
+
+It needs a second connection alongside the one the render is using. That is
+fine in a browser — six per origin — but progress will not work behind anything
+that serialises requests per client.
+
 ## Coordinates
 
 - **Azimuth** — degrees clockwise from north. `az` is the *left edge* of the

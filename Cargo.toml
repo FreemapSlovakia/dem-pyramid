@@ -20,6 +20,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 rayon = "1"
 flate2 = "1"
 axum = "0.8"
+futures-util = { version = "0.3", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
 clap = { version = "4", features = ["derive", "env"] }
 quick-xml = "0.37"

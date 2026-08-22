@@ -990,6 +990,7 @@ pub fn render(
     p: &Params,
     cancel: &Cancel,
     peaks: &mut [Peak],
+    progress: Option<&crate::progress::Job>,
 ) -> Result<(image::RgbImage, Stats)> {
     let (coarsest, finest) = (doc.grid.coarsest_level, doc.grid.finest_level);
     let (ssx, ssy) = (p.supersample_x.max(1), p.supersample_y.max(1));
@@ -997,6 +998,13 @@ pub fn render(
 
     let out_w = (p.az_span / p.step_deg).round() as usize;
     let out_h = ((p.alt_max - p.alt_min) / p.step_deg).round() as usize;
+    // Columns, because the marcher already pauses at each one to check for
+    // cancellation. They are not equal work -- a column of sky is cheaper than
+    // one of near terrain -- so the percentage drifts a little from the truth
+    // and is honest about being a percentage rather than a time.
+    if let Some(job) = progress {
+        job.set_total(out_w);
+    }
     let sub_h = out_h * ssy as usize;
     let az_step = p.step_deg / f64::from(ssx);
     let alt_step = p.step_deg / f64::from(ssy);
@@ -1125,6 +1133,9 @@ pub fn render(
 
             for local in 0..cols {
                 cancel.check()?;
+                if let Some(job) = progress {
+                    job.tick();
+                }
                 let oc = start + local;
                 shaded.clear();
                 nearest.fill(f64::INFINITY);

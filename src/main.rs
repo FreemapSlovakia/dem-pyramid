@@ -16,6 +16,7 @@ mod gdal_cli;
 mod grid;
 mod panorama;
 mod peaks;
+mod progress;
 mod queue;
 mod server;
 mod viewshed;
@@ -404,7 +405,7 @@ fn main() -> Result<()> {
                 None => Vec::new(),
             };
             let found = cands.len();
-            let (img, stats) = panorama::render(&cli.root, &doc, &p, &cancel, &mut cands)?;
+            let (img, stats) = panorama::render(&cli.root, &doc, &p, &cancel, &mut cands, None)?;
             let elapsed = t0.elapsed();
             img.save(&out)
                 .with_context(|| format!("writing {}", out.display()))?;

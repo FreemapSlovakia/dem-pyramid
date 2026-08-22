@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::oneshot;
 
+use crate::progress::Job;
+
 /// How fast waiting converts into priority, per second.
 ///
 /// Strict priority starves: with a steady trickle of premium requests an
@@ -42,6 +44,8 @@ struct Waiter {
     /// for ever, because the waiter that was told to proceed never built a
     /// permit to release.
     wake: oneshot::Sender<Permit>,
+    /// Told where it stands whenever the queue changes.
+    job: Option<Arc<Job>>,
 }
 
 impl Waiter {
@@ -55,6 +59,29 @@ struct Inner {
     busy: bool,
     waiting: Vec<Waiter>,
     next_seq: u64,
+}
+
+impl Inner {
+    /// Tell every waiter how many renders must finish before its own starts.
+    ///
+    /// Recomputed whenever the queue changes rather than on demand, because
+    /// the ranking depends on ageing and only the queue holds the lock that
+    /// makes reading it consistent. At ten waiters the sort is free.
+    fn publish_positions(&self) {
+        let now = Instant::now();
+        let mut order: Vec<(f64, u64, Option<&Arc<Job>>)> = self
+            .waiting
+            .iter()
+            .map(|w| (w.effective(now), w.seq, w.job.as_ref()))
+            .collect();
+        // Highest standing first; equal standing, first come.
+        order.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)));
+        for (i, (_, _, job)) in order.iter().enumerate() {
+            if let Some(job) = job {
+                job.set_ahead(i + usize::from(self.busy));
+            }
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -83,7 +110,11 @@ impl Queue {
     /// in progress -- a caller who arrives to a busy service with nobody
     /// queued still waits a full render, and reporting 0 there would tell the
     /// client the opposite of the truth.
-    pub async fn acquire(&self, priority: i32) -> Result<(Permit, usize), Rejected> {
+    pub async fn acquire(
+        &self,
+        priority: i32,
+        job: Option<Arc<Job>>,
+    ) -> Result<(Permit, usize), Rejected> {
         let (rx, depth) = {
             let mut inner = self.0.lock().unwrap();
 
@@ -111,7 +142,9 @@ impl Queue {
                 seq,
                 since: Instant::now(),
                 wake: tx,
+                job,
             });
+            inner.publish_positions();
             (rx, depth)
         };
 
@@ -143,7 +176,10 @@ impl Queue {
                     let w = inner.waiting.swap_remove(i);
                     match w.wake.send(Permit(self.clone())) {
                         // Handed over; the slot stays taken by its new owner.
-                        Ok(()) => return,
+                        Ok(()) => {
+                            inner.publish_positions();
+                            return;
+                        }
                         // That waiter hung up while queued. Forget the permit
                         // rather than dropping it, which would re-enter
                         // release() while this lock is held, and keep looking.
