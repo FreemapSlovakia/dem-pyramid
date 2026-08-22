@@ -46,6 +46,7 @@ All fields except `lon` and `lat` are optional.
 | `max_peaks` | int | `0` | keep at most this many, most dominant first; 0 is no cap |
 | `format` | string | `avif` | image encoding: `avif` or `png` |
 | `quality` | int | `95` | AVIF quality, 1–100; ignored for PNG |
+| `dither_strength` | number | `1.5` | 8-bit dither amplitude, levels; 0 disables |
 | `ridge_strength` | number | `1` | multiplier on the silhouettes' alpha; 0 removes them, no upper bound |
 | `ridge_width` | number | `1` | silhouette thickness in output pixels (0–20) |
 | `ridge_color` | string | `#000000` | silhouette colour, `#rrggbb` or `#rgb` |
@@ -126,6 +127,29 @@ of 100 sky rows, and lossless AVIF is 2.5 MB — worse than lossless WebP.
 
 Encoding costs about 3 seconds on a 25-second render. Depth is unaffected: it
 travels as its own lossless part whatever the image format.
+
+### Dithering
+
+The sky is a very slow gradient — about one 8-bit level per twenty rows — so it
+is dithered before quantisation, or it bands. `dither_strength` is the
+amplitude in levels, and it is worth knowing why the default is not the
+textbook 1:
+
+| strength | longest flat run in the sky | image |
+|---|---|---|
+| 0 | 25 px | 216 KB |
+| 1 | 18 px | 216 KB |
+| **1.5** | **3 px** | **292 KB** |
+| 2 | 2 px | 760 KB |
+
+At 1, where the true value sits near a whole number the dither almost never
+flips it, so the sky alternates between flat stretches and dithered ones —
+banding that has been half-fixed rather than fixed. 1.5 is where that stops,
+and where the size curve turns: noise is exactly what an image codec cannot
+compress, so going further costs a great deal for one more pixel of flatness.
+
+Set `0` to see the undithered gradient — useful for telling a dithering
+problem apart from anything else in the picture.
 
 ### Styling
 

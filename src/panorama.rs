@@ -101,6 +101,10 @@ pub struct Params {
     pub ridge_colour: (f64, f64, f64),
     /// Colour of near terrain, before haze washes it towards the sky.
     pub ground_colour: (f64, f64, f64),
+    /// Multiplier on the dither applied at the final 8-bit quantisation; see
+    /// `DEFAULT_DITHER`. 0 turns it off, which is how to tell dithering apart
+    /// from anything else in a gradient.
+    pub dither_strength: f64,
 }
 
 /// One pyramid level, with a block cache over its GTI index.
@@ -1145,10 +1149,11 @@ pub fn render(
                     // Dither by absolute position, not by position within the
                     // chunk, or the pattern restarts at every worker boundary.
                     let (dx, dy) = (start + local, orow);
+                    let ds = p.dither_strength;
                     pixels[orow * cols + local] = [
-                        clamp(r / n, dx, dy),
-                        clamp(g / n, dx, dy),
-                        clamp(b / n, dx, dy),
+                        clamp(r / n, dx, dy, ds),
+                        clamp(g / n, dx, dy, ds),
+                        clamp(b / n, dx, dy, ds),
                     ];
                 }
             }
@@ -1382,14 +1387,26 @@ pub fn validate_style(ridge_strength: f64, ridge_width: f64) -> Result<()> {
     Ok(())
 }
 
+/// How much dither the 8-bit output needs, in levels either way.
+///
+/// The textbook amount is 1 and it is not enough here: this sky crosses one
+/// level per twenty rows, and where the true value sits near a whole number a
+/// one-level dither almost never flips it. The picture then alternates between
+/// flat stretches and dithered ones, which is what banding looks like once you
+/// have half-fixed it. Measured on a real sky, the longest flat run is 25 px
+/// undithered, 18 at 1, 3 at 1.5 and 2 at 2 -- while the encoded size runs
+/// 216 KB, 292 KB and 760 KB, since noise is precisely what compresses worst.
+/// 1.5 is where the curve turns.
+pub const DEFAULT_DITHER: f64 = 1.5;
+
 /// Terrain as it renders without haze: a muted green.
 pub const DEFAULT_GROUND: (f64, f64, f64) = (58.0, 74.0, 52.0);
 /// Silhouettes darken what they cross, which is a multiply towards black.
 pub const DEFAULT_RIDGE: (f64, f64, f64) = (0.0, 0.0, 0.0);
 
 /// Quantise to a byte, dithered by position and rounded rather than truncated.
-fn clamp(v: f64, x: usize, y: usize) -> u8 {
-    (v + dither(x, y)).clamp(0.0, 255.0).round() as u8
+fn clamp(v: f64, x: usize, y: usize, strength: f64) -> u8 {
+    (v + dither(x, y) * strength).clamp(0.0, 255.0).round() as u8
 }
 
 /// Degrees of the compass, for the summary line.
@@ -1684,15 +1701,20 @@ mod tests {
     /// value tens of rows long is exactly what banded the picture.
     #[test]
     fn a_slow_gradient_does_not_band() {
-        // One level over 32 rows, the shallowest the sky ever gets.
+        // One level over 32 rows, the shallowest the sky ever gets. At the
+        // textbook strength of 1 this leaves flat runs of a dozen rows, which
+        // is the alternating flat-then-dithered look the sky had; the default
+        // is higher for that reason, and this is what pins it.
         let value = |row: usize| 238.0 - row as f64 / 32.0;
-        let column: Vec<u8> = (0..64).map(|row| clamp(value(row), 0, row)).collect();
+        let column: Vec<u8> = (0..64)
+            .map(|row| clamp(value(row), 0, row, DEFAULT_DITHER))
+            .collect();
         let longest = column
             .chunk_by(|a, b| a == b)
             .map(<[u8]>::len)
             .max()
             .unwrap();
-        assert!(longest <= 16, "a flat run of {longest} rows is a visible band");
+        assert!(longest <= 6, "a flat run of {longest} rows is a visible band");
         // And it still tracks the underlying ramp.
         let mean = column.iter().map(|&v| f64::from(v)).sum::<f64>() / 64.0;
         let want = (0..64).map(value).sum::<f64>() / 64.0;

@@ -106,6 +106,10 @@ pub struct Request {
     /// AVIF quality, 1-100. Ignored for PNG, which is lossless.
     #[serde(default = "d_quality")]
     quality: u8,
+    /// Multiplier on the 8-bit dither. 0 disables it, which is how to tell
+    /// whether a gradient artefact is dithering or something else.
+    #[serde(default = "d_dither")]
+    dither_strength: f64,
 }
 
 #[derive(Deserialize, Clone, Copy, Default, PartialEq)]
@@ -131,6 +135,7 @@ fn d_min_dom() -> f64 { 30.0 }
 fn d_ridge_strength() -> f64 { 1.0 }
 fn d_ridge_width() -> f64 { 1.0 }
 fn d_quality() -> u8 { avif::QUALITY }
+fn d_dither() -> f64 { panorama::DEFAULT_DITHER }
 
 #[derive(Clone)]
 pub struct Ctx {
@@ -301,6 +306,7 @@ async fn panorama_route(
         ridge_width: req.ridge_width,
         ridge_colour,
         ground_colour,
+        dither_strength: req.dither_strength.clamp(0.0, 8.0),
     };
 
     // Cancellation has to be cooperative: a blocking task cannot be killed,

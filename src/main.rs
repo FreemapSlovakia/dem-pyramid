@@ -141,6 +141,9 @@ enum Command {
         /// Silhouette thickness, output pixels.
         #[arg(long, default_value_t = 1.0)]
         ridge_width: f64,
+        /// Multiplier on the 8-bit dither; 0 turns it off.
+        #[arg(long, default_value_t = panorama::DEFAULT_DITHER)]
+        dither_strength: f64,
         /// Silhouette colour, #rrggbb. Black reads as shading.
         #[arg(long)]
         ridge_color: Option<String>,
@@ -350,6 +353,7 @@ fn main() -> Result<()> {
             eye_level,
             ridge_strength,
             ridge_width,
+            dither_strength,
             ridge_color,
             ground_color,
             depth_out,
@@ -381,6 +385,7 @@ fn main() -> Result<()> {
                 supersample_y,
                 ridge_strength,
                 ridge_width,
+                dither_strength,
                 ridge_colour: match &ridge_color {
                     Some(s) => panorama::parse_colour(s)?,
                     None => panorama::DEFAULT_RIDGE,
