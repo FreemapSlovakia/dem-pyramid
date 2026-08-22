@@ -294,7 +294,7 @@ async fn progress_route(
                         st.seen = true;
                         let snap = job.snapshot();
                         st.finished = snap.phase == Phase::Done;
-                        snap.to_json()
+                        snap.to_json(st.finished)
                     }
                     // Gone after having been seen: the request finished and
                     // took its registration with it. That is the ordinary
@@ -302,15 +302,22 @@ async fn progress_route(
                     // catch the job reporting `done` itself.
                     None if st.seen => {
                         st.finished = true;
-                        serde_json::json!({ "phase": "done", "percent": 100 })
+                        serde_json::json!({
+                            "phase": "done", "ahead": 0, "percent": 100, "final": true
+                        })
                     }
                     // Never seen: it may not have arrived yet, since a client
                     // has to subscribe before or alongside its own request.
-                    // Wait a while, then stop rather than hold the connection.
+                    // Wait a while, then give up -- and say so, because the
+                    // request may have been rejected before it ever
+                    // registered, and a client waiting for `done` would
+                    // reconnect for ever.
                     None => {
                         st.waited += 1;
                         st.finished = st.waited > UNKNOWN_TICKS;
-                        serde_json::json!({ "phase": "unknown" })
+                        serde_json::json!({
+                            "phase": "unknown", "ahead": 0, "percent": 0, "final": st.finished
+                        })
                     }
                 };
                 let event = Event::default().data(body.to_string());
@@ -710,11 +717,7 @@ async fn viewshed_route(
         ])
     })
     .await
-    .inspect(|outcome| {
-        if let Err(e) = outcome {
-            eprintln!("viewshed failed: {e:#}");
-        }
-    });
+    ;
 
     let parts = match built {
         Ok(Ok(p)) => p,
@@ -722,9 +725,15 @@ async fn viewshed_route(
             return (StatusCode::REQUEST_TIMEOUT, "cancelled").into_response();
         }
         Ok(Err(e)) => {
+            // Logged here rather than in an `inspect` on `built`: that sees
+            // only the JoinError, so a panic was reported and an ordinary
+            // failure -- no elevation at the viewpoint, avifenc missing --
+            // went out as a 500 with nothing in the log.
+            eprintln!("viewshed failed: {e:#}");
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
         }
         Err(e) => {
+            eprintln!("viewshed panicked: {e}");
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response();
         }
     };

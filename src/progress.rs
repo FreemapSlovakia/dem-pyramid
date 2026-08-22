@@ -99,11 +99,18 @@ pub struct Snapshot {
 impl Snapshot {
     /// The wire form. Deliberately small -- no ETA, because the client knows
     /// when it started and can work that out better than the server can.
-    pub fn to_json(&self) -> serde_json::Value {
+    ///
+    /// `final` rather than a phase the client must recognise: a stream can end
+    /// for reasons that are not "the render finished" -- the request was
+    /// rejected before it ever registered, or nothing arrived under this token
+    /// at all -- and a client that only closes on `done` would reconnect for
+    /// ever in those cases.
+    pub fn to_json(&self, last: bool) -> serde_json::Value {
         serde_json::json!({
             "phase": self.phase.as_str(),
             "ahead": self.ahead,
             "percent": (self.fraction * 100.0).round() as u32,
+            "final": last,
         })
     }
 }
@@ -139,15 +146,23 @@ impl Jobs {
             if map.len() >= MAX_JOBS {
                 return None;
             }
+            // Refused rather than replaced. Tokens come from callers, so two
+            // requests can arrive under one -- a retry, a panorama and a
+            // viewshed sharing it, or another client guessing. Overwriting
+            // would leave the first request's guard to unregister the second,
+            // whose subscriber would then be told the render had finished
+            // while it was still queued.
+            if map.contains_key(token) {
+                return None;
+            }
             map.insert(token.to_owned(), job.clone());
         }
-        Some((
-            job,
-            Registration {
-                jobs: self.clone(),
-                token: token.to_owned(),
-            },
-        ))
+        let registration = Registration {
+            jobs: self.clone(),
+            token: token.to_owned(),
+            job: job.clone(),
+        };
+        Some((job, registration))
     }
 
     pub fn get(&self, token: &str) -> Option<Arc<Job>> {
@@ -158,10 +173,18 @@ impl Jobs {
 pub struct Registration {
     jobs: Jobs,
     token: String,
+    job: Arc<Job>,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        self.jobs.0.lock().unwrap().remove(&self.token);
+        let mut map = self.jobs.0.lock().unwrap();
+        // Only if the entry is still this request's own. Registration refuses
+        // duplicates, so it should always be -- and removing by name alone
+        // would be the one way a later request could lose its entry to an
+        // earlier one's guard.
+        if map.get(&self.token).is_some_and(|j| Arc::ptr_eq(j, &self.job)) {
+            map.remove(&self.token);
+        }
     }
 }

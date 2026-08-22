@@ -68,10 +68,25 @@ pub fn render(
 
     // Mercator metres are ground metres divided by cos(lat), and the raster is
     // in Mercator so it lines up with the map without resampling.
-    let cos_lat = p.lat.to_radians().cos();
-    let proj = p.scale / cos_lat;
+    //
+    // The half-width comes from where the rim actually lands, not from
+    // cos(lat) at the centre. Mercator stretches with latitude, so a ray of a
+    // given ground length reaches further north than that assumption allows:
+    // at 49 degrees and 200 km, 312 km of Mercator against a 305 km half-width,
+    // which quietly clipped the outer 2% of the northern rim. Taking the
+    // furthest of the four cardinals makes the disc fit whatever the latitude,
+    // at the cost of `scale` being nominal rather than exact away from the
+    // centre -- which it always was, Mercator being what it is.
     let (cx, cy) = lonlat_to_merc(p.lon, p.lat);
-    let half = px as f64 / 2.0 * proj;
+    let half = [0.0, 90.0, 180.0, 270.0]
+        .into_iter()
+        .map(|az| {
+            let (lon, lat) = panorama::destination(p.lon, p.lat, az, p.radius);
+            let (x, y) = lonlat_to_merc(lon, lat);
+            (x - cx).abs().max((y - cy).abs())
+        })
+        .fold(0.0f64, f64::max);
+    let proj = half * 2.0 / px as f64;
     let (x0, y0) = (cx - half, cy + half);
 
     let mut pyr = Pyramid::open(root, doc)?;
@@ -115,7 +130,16 @@ pub fn render(
         .iter()
         .sum();
 
-    let mut image = image::RgbaImage::new(px as u32, px as u32);
+    // Colour everywhere, visibility in alpha alone. Leaving unseen pixels
+    // black would put a hard edge along every visibility boundary in a colour
+    // plane that carries no information -- bits spent on nothing, and ringing
+    // that dirties the faint grazing pixels beside it once a lossy codec and
+    // an un-premultiplied composite have had their turn.
+    let mut image = image::RgbaImage::from_pixel(
+        px as u32,
+        px as u32,
+        image::Rgba([p.colour.0, p.colour.1, p.colour.2, 0]),
+    );
     for (i, a) in alpha.iter().enumerate() {
         let a = a.load(Ordering::Relaxed);
         if a > 0 {
@@ -246,17 +270,29 @@ mod tests {
     /// compass looks like terrain occlusion until you plot the coverage.
     #[test]
     fn every_bearing_lands_where_it_should() {
-        let (lon, lat, radius, scale): (f64, f64, f64, f64) =
-            (20.133, 49.164, 20_000.0, 50.0);
+        // Far north and a large radius, because that is where Mercator's
+        // stretch is worst and where a half-width taken from cos(lat) at the
+        // centre used to push the rim out of the raster.
+        for (lon, lat, radius, scale) in [
+            (20.133_f64, 49.164_f64, 20_000.0_f64, 50.0_f64),
+            (20.0, 69.0, 200_000.0, 100.0),
+        ] {
         let px = extent(radius, scale);
-        let proj = scale / lat.to_radians().cos();
         let (cx, cy) = lonlat_to_merc(lon, lat);
-        let half = px as f64 / 2.0 * proj;
+        let half = [0.0, 90.0, 180.0, 270.0]
+            .into_iter()
+            .map(|az| {
+                let (plon, plat) = panorama::destination(lon, lat, az, radius);
+                let (x, y) = lonlat_to_merc(plon, plat);
+                (x - cx).abs().max((y - cy).abs())
+            })
+            .fold(0.0f64, f64::max);
+        let proj = half * 2.0 / px as f64;
         let (x0, y0) = (cx - half, cy + half);
         let centre = px as f64 / 2.0;
 
         for (az, name) in [(0.0, "N"), (90.0, "E"), (180.0, "S"), (270.0, "W")] {
-            for d in [scale * 4.0, radius * 0.5, radius * 0.9] {
+            for d in [scale * 4.0, radius * 0.5, radius] {
                 let (plon, plat) = panorama::destination(lon, lat, az, d);
                 let (sx, sy) = lonlat_to_merc(plon, plat);
                 let ix = (sx - x0) / proj;
@@ -272,6 +308,7 @@ mod tests {
                     _ => assert!(ix < centre, "{name} at {d} m mapped east"),
                 }
             }
+        }
         }
     }
 }

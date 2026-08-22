@@ -506,11 +506,16 @@ the measure can take distance into account as well.
 
 ### Cost
 
-Rays are derived from the rim, one per pixel of circumference, so they stay
-within a pixel of each other where they are furthest apart — fewer would leave
-radial gaps in the far field. A 30 km radius at 20 m is 3000 × 3000 px, 9425
-rays, 33 M samples, about 14 s. A 10 km radius at 10 m is 6.6 s. It shares the
-render queue with panoramas, one at a time.
+Rays are derived from the rim — two per pixel of circumference — and each is
+drawn as a line rather than plotted where it lands, since the marcher steps by
+DEM cell and that can exceed a pixel. One ray per pixel and dots instead of
+lines left the far field stippled: 31% of the outer annulus covered against 96%
+near the middle.
+
+A 30 km radius at 20 m is 3000 × 3000 px and 18 850 rays; a 40 km radius at
+25 m is 3200 × 3200 and 20 107 rays, about 3 s warm. Cold, expect several times
+that while the DEM blocks come off disk. It shares the render queue with
+panoramas, one at a time.
 
 ### Put the viewpoint on the summit, not near it
 
@@ -550,11 +555,10 @@ const token = crypto.randomUUID();
 
 const events = new EventSource(`${BASE}/progress/${token}`);
 events.onmessage = (e) => {
-  const { phase, ahead, percent } = JSON.parse(e.data);
+  const { phase, ahead, percent, final } = JSON.parse(e.data);
   // queued  -> "waiting, N ahead"
   // rendering / encoding -> percent
-  // done    -> close it
-  if (phase === "done") events.close();
+  if (final) events.close();
 };
 
 const res = await fetch(`${BASE}/panorama`, {
@@ -569,6 +573,7 @@ const res = await fetch(`${BASE}/panorama`, {
 | `phase` | `queued`, `rendering`, `encoding`, `done`, or `unknown` |
 | `ahead` | renders that must finish before yours starts; 0 means next |
 | `percent` | 0–100 through the current render |
+| `final` | last event on this stream — close on it |
 
 Both `/panorama` and `/viewshed` accept `X-Job`.
 
@@ -582,10 +587,18 @@ costs less than one of near terrain, so the rate drifts a few percent. Deriving
 an ETA is left to the client, which knows when it started and can smooth as it
 likes.
 
-**The stream always ends.** `done` is the last event, whether the render
-finished, failed or the client hung up, and the server closes the connection
-after it. A browser reconnects an `EventSource` automatically, so close it on
-`done` or it will reopen and sit in `unknown` for ten seconds.
+**Close on `final`, not on a phase.** A stream can end for reasons that are not
+"the render finished": the request may have been rejected before it ever
+registered — a 400, or a full queue — or nothing may ever arrive under that
+token, in which case the stream gives up after about ten seconds with
+`phase: "unknown"`. Every one of those endings carries `final: true`. A browser
+reconnects an `EventSource` automatically, so a client watching only for
+`done` would reopen for ever in those cases.
+
+**One token, one request.** A token already in use is refused progress rather
+than taking over the entry, so reusing one across a retry or across a panorama
+and a viewshed gives the second request no progress rather than corrupting the
+first's. Use a fresh token each time.
 
 It needs a second connection alongside the one the render is using. That is
 fine in a browser — six per origin — but progress will not work behind anything

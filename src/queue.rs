@@ -174,6 +174,12 @@ impl Queue {
             match best {
                 Some(i) => {
                     let w = inner.waiting.swap_remove(i);
+                    // Its turn: nothing is ahead of it any more. Without this
+                    // the last value it was told stands, and a client sees
+                    // "rendering, 1 ahead" for the whole render.
+                    if let Some(job) = &w.job {
+                        job.set_ahead(0);
+                    }
                     match w.wake.send(Permit(self.clone())) {
                         // Handed over; the slot stays taken by its new owner.
                         Ok(()) => {
