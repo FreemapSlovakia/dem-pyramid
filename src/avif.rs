@@ -23,11 +23,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Below about 93 the encoder starts smoothing the sky dither away and the
-/// banding it exists to prevent comes back -- at q90 on a supersampled render,
-/// 42 of 100 sky rows collapse to a single flat value. The threshold moves
-/// with the picture, because rate allocation gives a smooth frame fewer bits,
-/// so 95 leaves margin rather than sitting on the edge.
+/// Paired with 10-bit encoding, 95 puts the worst step in a soft sky at about
+/// a quarter of a level -- under what 8-bit output can show. At 8 bits the
+/// same setting leaves steps of a full level, and no quality setting fixes
+/// that: q99 is larger and still visibly worse.
+///
+/// Below about 93 the encoder also starts smoothing the sky dither away
+/// outright, and the banding it exists to prevent comes back. That threshold
+/// moves with the picture, since rate allocation gives a smooth frame fewer
+/// bits, so this leaves margin rather than sitting on the edge.
 pub const QUALITY: u8 = 95;
 /// 1..10, coarser being faster. 6 costs about a quarter second on a render
 /// that takes twenty, and buys a third off the file against 10.
@@ -69,6 +73,14 @@ pub fn encode(img: &image::RgbImage, quality: u8, speed: u8) -> Result<Vec<u8>> 
             // default and are the point of the picture.
             "-y",
             "444",
+            // Encode at 10 bits even though the picture is 8 and the display
+            // almost certainly is too. The headroom is for the *encoder*: its
+            // quantisation error then lands below what 8-bit output can show,
+            // and the browser rounds back down on decode. It beats spending
+            // the same bytes on quality -- q99 at 8 bits is larger than q95 at
+            // 10 and still leaves steps of a full level in a soft sky.
+            "-d",
+            "10",
             "--jobs",
             &threads.to_string(),
             src.to_str().context("non-utf8 temp path")?,

@@ -93,7 +93,7 @@ a floor rather than a promise.
 
 ### Image format
 
-AVIF by default, and by a wide margin: a 7200×600 render is **125 KB against
+AVIF by default, and by a wide margin: a 7200×600 render is **216 KB against
 3.7 MB** as PNG. `format: "png"` is still there for callers written before it.
 
 The reason PNG is so poor here is the sky dither. This renderer draws nothing
@@ -104,18 +104,25 @@ what PNG cannot pack. The same render was ~600 KB before dithering.
 `quality` therefore matters more than it usually would, because it decides
 whether the dither survives:
 
-| quality | size | dither |
+| setting | size | worst step in a soft sky |
 |---|---|---|
-| 90 | 64 KB | **lost** — 42 of 100 sky rows go flat, banding returns |
-| 93 | 84 KB | intact, no margin |
-| **95** | **125 KB** | intact — the default |
-| 99 | 358 KB | intact, diminishing returns |
+| PNG | 3708 KB | 0.04 levels |
+| q95, 8-bit | 125 KB | 1.12 — visible |
+| q99, 8-bit | 358 KB | 0.63 |
+| **q95, 10-bit** | **216 KB** | **0.28** — the default |
+| q97, 10-bit | 411 KB | 0.19 |
 
-The threshold moves with the picture: rate allocation gives a smooth frame
-fewer bits, so a plain sky is where the noise gets discarded first. Below 93,
-expect the banding back. Lossy alternatives were measured and are worse — JPEG
-at q85 flattens 91 of 100 rows, and lossless AVIF is 2.5 MB, worse than
-lossless WebP.
+Encoding is 10-bit even though the picture and your display are both 8-bit.
+The headroom is for the encoder: its quantisation error then lands below what
+8-bit output can show, and the decoder rounds back down. It beats spending the
+same bytes on quality — q99 at 8 bits is larger than q95 at 10 and still steps
+a full level.
+
+Below q93 the encoder stops preserving the sky dither at all and the banding
+comes back outright. That threshold moves with the picture, since rate
+allocation gives a smooth frame fewer bits, so a plain sky is where the noise
+goes first. Other codecs were measured and are worse: JPEG at q85 flattens 91
+of 100 sky rows, and lossless AVIF is 2.5 MB — worse than lossless WebP.
 
 Encoding costs about 3 seconds on a 25-second render. Depth is unaffected: it
 travels as its own lossless part whatever the image format.
