@@ -27,13 +27,19 @@ use std::sync::Arc;
 use crate::config::Doc;
 use crate::panorama::Cancel;
 use crate::queue::{Queue, Rejected};
-use crate::{avif, panorama, peaks};
+use crate::{avif, panorama, peaks, viewshed};
 
 /// Caps on what a single request may cost. Not entitlement -- that belongs to
 /// the caller -- just a bound on how much work one request can demand.
 const MAX_PIXELS: usize = 24_000_000;
 const MAX_SUPERSAMPLE: u32 = 9;
 const MIN_STEP: f64 = 0.02;
+/// Beyond this a viewshed is mostly answering questions about the curvature of
+/// the earth, and the cost grows with the square of it.
+const MAX_VIEWSHED_RADIUS: f64 = 200_000.0;
+/// A warm tint that reads over both map and imagery; opacity carries the
+/// detail, so the colour is deliberately flat.
+const DEFAULT_VIEWSHED_COLOUR: (f64, f64, f64) = (255.0, 214.0, 102.0);
 
 /// One multipart part: field name, optional filename, bytes.
 type Part = (String, Option<String>, Vec<u8>);
@@ -120,6 +126,37 @@ pub enum Format {
     Png,
 }
 
+#[derive(Deserialize)]
+pub struct ViewshedRequest {
+    lon: f64,
+    lat: f64,
+    /// How far to look, ground metres.
+    #[serde(default = "d_vs_radius")]
+    radius: f64,
+    /// Ground metres per pixel. With `radius` this fixes the image size, and
+    /// the two are checked together -- either alone looks harmless.
+    #[serde(default = "d_vs_scale")]
+    scale: f64,
+    #[serde(default = "d_eye")]
+    eye: f64,
+    #[serde(default = "d_eye_radius")]
+    eye_search_radius: f64,
+    /// Height above ground of what is being looked at; 0 is the ground.
+    #[serde(default)]
+    target_height: f64,
+    /// `#rrggbb` for the visible area. Opacity carries the detail, so a flat
+    /// colour is the point.
+    #[serde(default)]
+    color: Option<String>,
+    #[serde(default)]
+    format: Format,
+    #[serde(default = "d_quality")]
+    quality: u8,
+}
+
+fn d_vs_radius() -> f64 { 30_000.0 }
+fn d_vs_scale() -> f64 { 20.0 }
+
 fn d_az() -> f64 { 0.0 }
 fn d_fov() -> f64 { 360.0 }
 fn d_alt_min() -> f64 { -18.0 }
@@ -163,6 +200,7 @@ pub async fn serve(
 
     let app = Router::new()
         .route("/panorama", post(panorama_route))
+        .route("/viewshed", post(viewshed_route))
         .route("/health", axum::routing::get(|| async { "ok" }))
         .with_state(ctx);
 
@@ -190,6 +228,19 @@ fn content_type(filename: &str) -> &'static str {
         Some("png") => "image/png",
         Some("gz") => "application/gzip",
         _ => "application/octet-stream",
+    }
+}
+
+/// Cancellation has to be cooperative: a blocking task cannot be killed, and
+/// dropping its JoinHandle only detaches it. This guard is owned by the
+/// handler future, so if the client hangs up -- while queued or mid-render --
+/// axum drops the future, the guard drops, and the work sees the flag and
+/// abandons itself.
+struct CancelOnDrop(Cancel);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -316,19 +367,8 @@ async fn panorama_route(
         dither_strength: req.dither_strength.clamp(0.0, 8.0),
     };
 
-    // Cancellation has to be cooperative: a blocking task cannot be killed,
-    // and dropping its JoinHandle only detaches it. This guard is owned by the
-    // handler future, so if the client hangs up -- while queued or mid-render
-    // -- axum drops the future, the guard drops, and the render sees the flag
-    // and abandons the work.
-    struct Guard(Cancel);
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            self.0.cancel();
-        }
-    }
     let cancel = Cancel::default();
-    let guard = Guard(cancel.clone());
+    let guard = CancelOnDrop(cancel.clone());
 
     let (permit, queued) = match ctx.queue.acquire(priority_of(&headers)).await {
         Ok(v) => v,
@@ -452,6 +492,136 @@ async fn panorama_route(
     // alike.
     drop(guard);
 
+    multipart(parts, queued)
+}
+
+async fn viewshed_route(
+    State(ctx): State<Ctx>,
+    headers: header::HeaderMap,
+    Json(req): Json<ViewshedRequest>,
+) -> Response {
+    for (name, v) in [
+        ("lon", req.lon),
+        ("lat", req.lat),
+        ("radius", req.radius),
+        ("scale", req.scale),
+        ("eye", req.eye),
+        ("target_height", req.target_height),
+    ] {
+        if !v.is_finite() {
+            return bad(format!("{name} must be a finite number"));
+        }
+    }
+    if req.radius <= 0.0 || req.radius > MAX_VIEWSHED_RADIUS {
+        return bad(format!("radius must lie within 0..{MAX_VIEWSHED_RADIUS} m"));
+    }
+    if req.scale <= 0.0 {
+        return bad("scale must be positive");
+    }
+
+    // Checked together, because neither is alarming alone: a 100 km radius is
+    // reasonable, 5 m per pixel is reasonable, and asking for both is a
+    // 40000 x 40000 raster.
+    let px = viewshed::extent(req.radius, req.scale);
+    if px.checked_mul(px).is_none_or(|n| n > MAX_PIXELS) {
+        return bad(format!(
+            "{px}x{px} exceeds the {MAX_PIXELS} pixel limit; raise scale or reduce radius"
+        ));
+    }
+
+    let colour = match &req.color {
+        Some(s) => match panorama::parse_colour(s) {
+            Ok(c) => c,
+            Err(e) => return bad(format!("color: {e}")),
+        },
+        None => DEFAULT_VIEWSHED_COLOUR,
+    };
+
+    let p = viewshed::Params {
+        lon: req.lon,
+        lat: req.lat,
+        eye_height: req.eye,
+        eye_search_radius: req.eye_search_radius.clamp(0.0, 200.0),
+        radius: req.radius,
+        scale: req.scale,
+        target_height: req.target_height.clamp(0.0, 1000.0),
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        colour: (colour.0 as u8, colour.1 as u8, colour.2 as u8),
+    };
+
+    let cancel = Cancel::default();
+    let _guard = CancelOnDrop(cancel.clone());
+    let (permit, queued) = match ctx.queue.acquire(priority_of(&headers)).await {
+        Ok(v) => v,
+        Err(Rejected::Full) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, "queue full").into_response();
+        }
+        Err(Rejected::ShuttingDown) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, "shutting down").into_response();
+        }
+    };
+
+    let (root, doc, format, quality) = (ctx.root.clone(), ctx.doc.clone(), req.format, req.quality);
+    let work = cancel.clone();
+    let built = tokio::task::spawn_blocking(move || -> Result<Vec<Part>> {
+        let _permit = permit;
+        let out = viewshed::render(&root, &doc, &p, &work)?;
+        anyhow::ensure!(!work.is_cancelled(), "cancelled");
+
+        let meta = serde_json::json!({
+            "width": out.image.width(),
+            "height": out.image.height(),
+            // West, south, east, north -- the order Leaflet's LatLngBounds
+            // wants once you pair them up.
+            "bounds": out.bounds,
+            "eye_elevation": out.eye_elevation,
+            "radius": p.radius,
+            "scale": p.scale,
+            "target_height": p.target_height,
+            "rays": out.rays,
+            "samples": out.samples,
+        });
+
+        let mut png = std::io::Cursor::new(Vec::new());
+        let (name, bytes) = match format {
+            Format::Avif => (
+                "viewshed.avif",
+                avif::encode_rgba(&out.image, quality.clamp(1, 100), avif::SPEED)?,
+            ),
+            Format::Png => {
+                out.image.write_to(&mut png, image::ImageFormat::Png)?;
+                ("viewshed.png", png.into_inner())
+            }
+        };
+        Ok(vec![
+            ("meta".into(), None, serde_json::to_vec(&meta)?),
+            ("image".into(), Some(name.into()), bytes),
+        ])
+    })
+    .await
+    .inspect(|outcome| {
+        if let Err(e) = outcome {
+            eprintln!("viewshed failed: {e:#}");
+        }
+    });
+
+    let parts = match built {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) if e.to_string() == "cancelled" => {
+            return (StatusCode::REQUEST_TIMEOUT, "cancelled").into_response();
+        }
+        Ok(Err(e)) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
+        }
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response();
+        }
+    };
+    multipart(parts, queued)
+}
+
+/// Pack the parts into one multipart/form-data body.
+fn multipart(parts: Vec<Part>, queued: usize) -> Response {
     let boundary = "dempyramid7f3a9c2e";
     let mut body = Vec::new();
     for (name, filename, data) in parts {

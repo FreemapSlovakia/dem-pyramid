@@ -255,12 +255,12 @@ impl Level {
 }
 
 /// The pyramid, coarsest-first so fallback is a forward scan.
-struct Pyramid {
+pub(crate) struct Pyramid {
     levels: Vec<Level>, // ascending z
 }
 
 impl Pyramid {
-    fn open(root: &Path, doc: &Doc) -> Result<Self> {
+    pub(crate) fn open(root: &Path, doc: &Doc) -> Result<Self> {
         let mut levels = Vec::new();
         for z in doc.grid.coarsest_level..=doc.grid.finest_level {
             if let Some(l) = Level::open(root, z)? {
@@ -273,7 +273,7 @@ impl Pyramid {
 
     /// Sample at the requested level, falling back to coarser levels where the
     /// finer ones are sparse (national data absent, GEDTM30 present).
-    fn sample(&mut self, want_z: u32, x: f64, y: f64) -> Option<f64> {
+    pub(crate) fn sample(&mut self, want_z: u32, x: f64, y: f64) -> Option<f64> {
         let mut idx = self
             .levels
             .iter()
@@ -291,7 +291,7 @@ impl Pyramid {
     }
 
     /// Finest available elevation at a point, for the eye position.
-    fn sample_finest(&mut self, x: f64, y: f64) -> Option<f64> {
+    pub(crate) fn sample_finest(&mut self, x: f64, y: f64) -> Option<f64> {
         let top = self.levels.last().map(|l| l.z)?;
         self.sample(top, x, y)
     }
@@ -302,7 +302,7 @@ impl Pyramid {
 }
 
 /// Coarsest level whose ground cell still resolves the angular step at `d`.
-fn level_for(d: f64, lat: f64, coarsest: u32, finest: u32) -> u32 {
+pub(crate) fn level_for(d: f64, lat: f64, coarsest: u32, finest: u32) -> u32 {
     let target = d * CELL_PER_METRE;
     for z in coarsest..=finest {
         if ground_res(z, lat) <= target {
@@ -326,7 +326,7 @@ pub fn great_circle(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
 /// geometry, the elevation the dominance walk reads back -- and those three
 /// must agree or a summit is measured in a different geometry than it was
 /// drawn in.
-fn curvature_drop(d: f64) -> f64 {
+pub(crate) fn curvature_drop(d: f64) -> f64 {
     d * d * (1.0 - REFRACTION_K) / (2.0 * EARTH_R)
 }
 
@@ -340,7 +340,7 @@ pub fn initial_bearing(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
 }
 
 /// Great-circle destination, degrees in and out.
-fn destination(lon: f64, lat: f64, az_deg: f64, d: f64) -> (f64, f64) {
+pub(crate) fn destination(lon: f64, lat: f64, az_deg: f64, d: f64) -> (f64, f64) {
     let (lat1, lon1) = (lat.to_radians(), lon.to_radians());
     let theta = az_deg.to_radians();
     let delta = d / EARTH_R;
@@ -884,7 +884,7 @@ impl Cancel {
         self.0.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         anyhow::ensure!(!self.is_cancelled(), "cancelled");
         Ok(())
     }

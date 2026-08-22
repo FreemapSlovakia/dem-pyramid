@@ -87,7 +87,40 @@ pub fn available() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// As `encode`, for an image with an alpha channel.
+///
+/// A viewshed overlay is mostly transparent, which both PNG and AVIF handle
+/// well; AVIF still wins because what is *not* transparent is a gradient.
+pub fn encode_rgba(img: &image::RgbaImage, quality: u8, speed: u8) -> Result<Vec<u8>> {
+    encode_bytes(
+        img.as_raw(),
+        img.width(),
+        img.height(),
+        image::ExtendedColorType::Rgba8,
+        quality,
+        speed,
+    )
+}
+
 pub fn encode(img: &image::RgbImage, quality: u8, speed: u8) -> Result<Vec<u8>> {
+    encode_bytes(
+        img.as_raw(),
+        img.width(),
+        img.height(),
+        image::ExtendedColorType::Rgb8,
+        quality,
+        speed,
+    )
+}
+
+fn encode_bytes(
+    raw: &[u8],
+    width: u32,
+    height: u32,
+    colour: image::ExtendedColorType,
+    quality: u8,
+    speed: u8,
+) -> Result<Vec<u8>> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = scratch_dir()?;
     let stamp = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -95,7 +128,7 @@ pub fn encode(img: &image::RgbImage, quality: u8, speed: u8) -> Result<Vec<u8>> 
     let dst = dir.join(format!("{stamp}.avif"));
     let _scratch = Scratch(vec![src.clone(), dst.clone()]);
 
-    write_fast_png(&src, img)?;
+    write_fast_png(&src, raw, width, height, colour)?;
 
     let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let out = Command::new("avifenc")
@@ -143,18 +176,19 @@ pub fn encode(img: &image::RgbImage, quality: u8, speed: u8) -> Result<Vec<u8>> 
 /// full disk would leave a truncated PNG and return `Ok`, and the request
 /// would fail later as an unexplained avifenc decode error rather than as the
 /// write error it is.
-fn write_fast_png(path: &Path, img: &image::RgbImage) -> Result<()> {
+fn write_fast_png(
+    path: &Path,
+    raw: &[u8],
+    width: u32,
+    height: u32,
+    colour: image::ExtendedColorType,
+) -> Result<()> {
     let mut buf = Vec::new();
     image::codecs::png::PngEncoder::new_with_quality(
         &mut buf,
         image::codecs::png::CompressionType::Fast,
         image::codecs::png::FilterType::NoFilter,
     )
-    .write_image(
-        img.as_raw(),
-        img.width(),
-        img.height(),
-        image::ExtendedColorType::Rgb8,
-    )?;
+    .write_image(raw, width, height, colour)?;
     std::fs::write(path, &buf).with_context(|| format!("writing {}", path.display()))
 }

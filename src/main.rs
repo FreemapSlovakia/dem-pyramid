@@ -18,6 +18,7 @@ mod panorama;
 mod peaks;
 mod queue;
 mod server;
+mod viewshed;
 
 #[derive(Parser)]
 #[command(about, version)]

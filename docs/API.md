@@ -453,6 +453,74 @@ function distanceAt(x, y) {
 
 `DecompressionStream` is native in current browsers; no library is needed.
 
+## `POST /viewshed`
+
+What can be seen from a point, as a map overlay: a square RGBA image in Web
+Mercator, centred on the viewpoint, transparent where nothing is visible.
+
+```jsonc
+{ "lon": 20.888781, "lat": 48.878479, "radius": 30000, "scale": 20 }
+```
+
+| field | type | default | meaning |
+|---|---|---|---|
+| `lon`, `lat` | number | — | viewpoint |
+| `radius` | number | `30000` | how far to look, ground metres (max 200 000) |
+| `scale` | number | `20` | ground metres per pixel |
+| `eye` | number | `1.7` | eye height above ground |
+| `eye_search_radius` | number | `10` | as for panoramas |
+| `target_height` | number | `0` | height of the thing looked *at* |
+| `color` | string | `#ffd666` | overlay colour, `#rrggbb` |
+| `format` | string | `avif` | `avif` or `png` |
+| `quality` | int | `95` | AVIF quality |
+
+`radius` and `scale` together fix the image size — `2 × radius / scale` on a
+side — and are **validated together**, because neither looks unreasonable
+alone: a 100 km radius is fine, 5 m per pixel is fine, and asking for both is a
+40000 × 40000 raster. The pair must come to no more than 24 M pixels.
+
+The response is the same multipart shape as a panorama: `meta` plus `image`.
+`meta.bounds` is `[west, south, east, north]` in degrees, which is what a
+Leaflet `ImageOverlay` wants:
+
+```js
+const { bounds } = meta;
+L.imageOverlay(URL.createObjectURL(image), [
+  [bounds[1], bounds[0]],
+  [bounds[3], bounds[2]],
+]).addTo(map);
+```
+
+### What the opacity means
+
+Not a flat stencil. Opacity is the **projected area** of each patch of ground —
+the sine of the angle between the line of sight and the surface — so a slope
+facing you is solid and one seen edge-on fades out. That is what you actually
+see of it: a hillside at five degrees of grazing shows under a tenth of its
+area.
+
+One consequence worth expecting: ground close to the viewpoint on a convex
+summit reads faint, because you are looking along it rather than at it, even
+though it is unmistakably visible. If that reads wrong in the app, say so and
+the measure can take distance into account as well.
+
+### Cost
+
+Rays are derived from the rim, one per pixel of circumference, so they stay
+within a pixel of each other where they are furthest apart — fewer would leave
+radial gaps in the far field. A 30 km radius at 20 m is 3000 × 3000 px, 9425
+rays, 33 M samples, about 14 s. A 10 km radius at 10 m is 6.6 s. It shares the
+render queue with panoramas, one at a time.
+
+### Two limits worth telling users
+
+**It is bare earth.** No trees, no buildings. In forest or town it will say you
+can see more than you can, sometimes much more.
+
+**It is only as good as the DEM** — 1 m LiDAR in the surveyed countries, 30 m
+GEDTM30 elsewhere. The [coverage](#where-it-runs) applies here as it does to
+panoramas.
+
 ## Coordinates
 
 - **Azimuth** — degrees clockwise from north. `az` is the *left edge* of the
