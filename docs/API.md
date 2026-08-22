@@ -94,8 +94,15 @@ a floor rather than a promise.
 
 ### Image format
 
-AVIF by default, and by a wide margin: a 7200×600 render is **216 KB against
-3.7 MB** as PNG. `format: "png"` is still there for callers written before it.
+AVIF by default, and by a wide margin: at the shipped defaults a 7200×600
+render is **292 KB against 4.6 MB** as PNG. `format: "png"` is still there for
+callers written before it.
+
+> **The default changed, so a client that sends no `format` now receives AVIF**
+> — and the `image` part's filename changes from `panorama.png` to
+> `panorama.avif`. Read the part by its field name, `image`, not by filename,
+> and it does not matter. If you need the old bytes, send `format: "png"`
+> explicitly rather than relying on the default.
 
 The reason PNG is so poor here is the sky dither. This renderer draws nothing
 but smooth gradients, which PNG compresses beautifully — until a level of

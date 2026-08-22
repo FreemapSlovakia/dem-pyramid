@@ -166,6 +166,13 @@ pub async fn serve(
         .route("/health", axum::routing::get(|| async { "ok" }))
         .with_state(ctx);
 
+    if !avif::available() {
+        eprintln!(
+            "warning: avifenc not found, so every request will fail unless it \
+             asks for format=png -- install libavif-bin"
+        );
+    }
+
     let listener = tokio::net::TcpListener::bind(listen).await?;
     println!("listening on {listen}");
     axum::serve(listener, app)
@@ -392,6 +399,9 @@ async fn panorama_route(
         let mut parts: Vec<Part> = Vec::new();
         parts.push(("meta".into(), None, serde_json::to_vec(&meta)?));
 
+        // Encoding is seconds of work holding the render permit, so a client
+        // that hung up during the march must not buy the next one a wait.
+        anyhow::ensure!(!cancel.is_cancelled(), "cancelled");
         let (name, bytes) = match format {
             Format::Avif => ("panorama.avif", avif::encode(&img, quality, avif::SPEED)?),
             Format::Png => {

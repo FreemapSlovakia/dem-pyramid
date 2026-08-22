@@ -22,6 +22,11 @@ ExecStart=/fm/storage2/dem/build/target/release/dem-tool serve \
 # Loopback only; nginx is the only thing that should reach it.
 Environment=GDAL_CACHEMAX=1024
 
+# AVIF encoding writes an intermediate through /tmp. The service creates its
+# own 0700 directory there, so this is belt and braces rather than the fix --
+# but a private /tmp means a local user cannot even see the names.
+PrivateTmp=yes
+
 # A render saturates most of the box. Leave the tile servers and the API
 # responsive: renders are a background nicety, serving maps is not.
 Nice=10

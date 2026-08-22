@@ -1297,7 +1297,11 @@ fn sky_colour(alt: f64) -> (f64, f64, f64) {
     )
 }
 
-/// Triangular dither, plus or minus one level, from a hash of the position.
+/// Triangular dither of one level either way, from a hash of the position.
+///
+/// Scaled by `Params::dither_strength` at the point of use, so the amplitude
+/// that actually ships is `DEFAULT_DITHER` levels, not one -- see there for
+/// why one is not enough on a gradient this slow.
 ///
 /// A sky gradient crosses few levels over many pixels -- blue runs 238 to 214
 /// across the whole frame, so one level lasts 25 rows at the default step and
@@ -1701,10 +1705,11 @@ mod tests {
     /// value tens of rows long is exactly what banded the picture.
     #[test]
     fn a_slow_gradient_does_not_band() {
-        // One level over 32 rows, the shallowest the sky ever gets. At the
-        // textbook strength of 1 this leaves flat runs of a dozen rows, which
-        // is the alternating flat-then-dithered look the sky had; the default
-        // is higher for that reason, and this is what pins it.
+        // One level over 32 rows, the shallowest the sky ever gets. Undithered
+        // that is a flat run of 32; at the textbook strength of 1 it is still
+        // 7, which on a real sky reads as the alternating flat-then-dithered
+        // look it had. The default is higher for that reason, and this pins
+        // it -- it drops to 3.
         let value = |row: usize| 238.0 - row as f64 / 32.0;
         let column: Vec<u8> = (0..64)
             .map(|row| clamp(value(row), 0, row, DEFAULT_DITHER))
