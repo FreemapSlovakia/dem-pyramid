@@ -114,7 +114,18 @@ struct Level {
     gt: [f64; 6],
     w: usize,
     h: usize,
-    cache: HashMap<(i64, i64), Option<Vec<u16>>>,
+    /// Blocks in arrival order; `None` where the index has no tile.
+    blocks: Vec<Option<Vec<u16>>>,
+    /// Where each block landed, so a repeat visit finds it.
+    index: HashMap<(i64, i64), usize>,
+    /// The block the last lookup wanted.
+    ///
+    /// A ray walks continuously and bilinear reads four neighbouring corners,
+    /// so successive lookups nearly always want the block the previous one
+    /// did. Without this every corner of every sample hashes its key -- and
+    /// the default hasher is SipHash, which is cryptographic. It measured 45%
+    /// of an entire render, against 1% for all the trigonometry.
+    last: Option<((i64, i64), usize)>,
 }
 
 impl Level {
@@ -133,21 +144,45 @@ impl Level {
             gt,
             w,
             h,
-            cache: HashMap::new(),
+            blocks: Vec::new(),
+            index: HashMap::new(),
+            last: None,
         }))
     }
 
     /// Elevation at integer pixel coordinates, or None for nodata / off-grid.
+    /// The block covering `key`, reading it in on first use.
+    ///
+    /// One hash at most, and usually none: the previous key is checked first,
+    /// and the old code hashed twice per corner -- `contains_key` then `get` --
+    /// so eight times per bilinear sample.
+    fn block_at(&mut self, key: (i64, i64)) -> Option<&[u16]> {
+        let slot = match self.last {
+            Some((k, i)) if k == key => i,
+            _ => {
+                let i = match self.index.get(&key) {
+                    Some(&i) => i,
+                    None => {
+                        let block = self.read_block(key);
+                        self.blocks.push(block);
+                        let i = self.blocks.len() - 1;
+                        self.index.insert(key, i);
+                        i
+                    }
+                };
+                self.last = Some((key, i));
+                i
+            }
+        };
+        self.blocks[slot].as_deref()
+    }
+
     fn value_at(&mut self, px: usize, py: usize) -> Option<f64> {
         if px >= self.w || py >= self.h {
             return None;
         }
         let key = ((px / BLOCK) as i64, (py / BLOCK) as i64);
-        if !self.cache.contains_key(&key) {
-            let block = self.read_block(key);
-            self.cache.insert(key, block);
-        }
-        let block = self.cache.get(&key)?.as_ref()?;
+        let block = self.block_at(key)?;
 
         let v = block[(py % BLOCK) * BLOCK + (px % BLOCK)];
         // 0 is the reserved nodata of the uint16 decimetre encoding.
@@ -262,7 +297,7 @@ impl Pyramid {
     }
 
     fn cached_blocks(&self) -> usize {
-        self.levels.iter().map(|l| l.cache.len()).sum()
+        self.levels.iter().map(|l| l.blocks.len()).sum()
     }
 }
 
