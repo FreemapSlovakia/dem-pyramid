@@ -512,6 +512,23 @@ radial gaps in the far field. A 30 km radius at 20 m is 3000 × 3000 px, 9425
 rays, 33 M samples, about 14 s. A 10 km radius at 10 m is 6.6 s. It shares the
 render queue with panoramas, one at a time.
 
+### Put the viewpoint on the summit, not near it
+
+A viewshed is far more sensitive to the exact viewpoint than a panorama is, and
+the difference is not subtle. From Gerlachovský štít's nominal coordinates the
+DEM reads 2575 m, while the true summit is 2653 m about 75 metres away — so the
+eye sits below the ridge beside it, which blocks that whole side:
+
+| viewpoint | eye | coverage |
+|---|---|---|
+| nominal coordinates | 2587 m | **10%**, nothing at all to the north or east |
+| DEM maximum, 75 m away | 2654 m | **37%**, all quadrants |
+
+`eye_search_radius` helps but only samples a ring of eight points at that exact
+radius, not the disc inside it, so widening it can miss a summit it steps over.
+If the viewpoint comes from a peak database rather than from the user's finger
+on the map, snap it to the local DEM maximum first.
+
 ### Two limits worth telling users
 
 **It is bare earth.** No trees, no buildings. In forest or town it will say you
