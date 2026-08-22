@@ -27,7 +27,7 @@ use std::sync::Arc;
 use crate::config::Doc;
 use crate::panorama::Cancel;
 use crate::queue::{Queue, Rejected};
-use crate::{panorama, peaks};
+use crate::{avif, panorama, peaks};
 
 /// Caps on what a single request may cost. Not entitlement -- that belongs to
 /// the caller -- just a bound on how much work one request can demand.
@@ -99,6 +99,21 @@ pub struct Request {
     /// `#rrggbb` for near terrain, before haze washes it towards the sky.
     #[serde(default)]
     ground_color: Option<String>,
+    /// `avif` or `png`. AVIF is fifteen to thirty times smaller for the same
+    /// picture; PNG is here for callers that predate it.
+    #[serde(default)]
+    format: Format,
+    /// AVIF quality, 1-100. Ignored for PNG, which is lossless.
+    #[serde(default = "d_quality")]
+    quality: u8,
+}
+
+#[derive(Deserialize, Clone, Copy, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Format {
+    #[default]
+    Avif,
+    Png,
 }
 
 fn d_az() -> f64 { 0.0 }
@@ -115,6 +130,7 @@ fn d_peaks() -> bool { true }
 fn d_min_dom() -> f64 { 30.0 }
 fn d_ridge_strength() -> f64 { 1.0 }
 fn d_ridge_width() -> f64 { 1.0 }
+fn d_quality() -> u8 { avif::QUALITY }
 
 #[derive(Clone)]
 pub struct Ctx {
@@ -312,6 +328,8 @@ async fn panorama_route(
     let doc = ctx.doc.clone();
     let depth_step = req.depth_step.max(1);
     let want_depth = req.depth;
+    let format = req.format;
+    let quality = req.quality.clamp(1, 100);
     let min_dom = req.min_dominance;
     let max_peaks = req.max_peaks;
 
@@ -358,13 +376,15 @@ async fn panorama_route(
         let mut parts: Vec<Part> = Vec::new();
         parts.push(("meta".into(), None, serde_json::to_vec(&meta)?));
 
-        let mut png = std::io::Cursor::new(Vec::new());
-        img.write_to(&mut png, image::ImageFormat::Png)?;
-        parts.push((
-            "image".into(),
-            Some("panorama.png".into()),
-            png.into_inner(),
-        ));
+        let (name, bytes) = match format {
+            Format::Avif => ("panorama.avif", avif::encode(&img, quality, avif::SPEED)?),
+            Format::Png => {
+                let mut png = std::io::Cursor::new(Vec::new());
+                img.write_to(&mut png, image::ImageFormat::Png)?;
+                ("panorama.png", png.into_inner())
+            }
+        };
+        parts.push(("image".into(), Some(name.into()), bytes));
 
         if want_depth {
             parts.push((

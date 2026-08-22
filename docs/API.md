@@ -44,6 +44,8 @@ All fields except `lon` and `lat` are optional.
 | `peaks` | bool | `true` | include peak labels |
 | `min_dominance` | number | `30` | drop peaks standing less than this above their surroundings, metres; may be negative |
 | `max_peaks` | int | `0` | keep at most this many, most dominant first; 0 is no cap |
+| `format` | string | `avif` | image encoding: `avif` or `png` |
+| `quality` | int | `95` | AVIF quality, 1–100; ignored for PNG |
 | `ridge_strength` | number | `1` | multiplier on the silhouettes' alpha; 0 removes them, no upper bound |
 | `ridge_width` | number | `1` | silhouette thickness in output pixels (0–20) |
 | `ridge_color` | string | `#000000` | silhouette colour, `#rrggbb` or `#rgb` |
@@ -88,6 +90,35 @@ Three things multiply those figures, and they compound:
 
 So budget for several times the table under real conditions, and treat these as
 a floor rather than a promise.
+
+### Image format
+
+AVIF by default, and by a wide margin: a 7200×600 render is **125 KB against
+3.7 MB** as PNG. `format: "png"` is still there for callers written before it.
+
+The reason PNG is so poor here is the sky dither. This renderer draws nothing
+but smooth gradients, which PNG compresses beautifully — until a level of
+noise lands on every pixel to stop the sky banding, and that noise is exactly
+what PNG cannot pack. The same render was ~600 KB before dithering.
+
+`quality` therefore matters more than it usually would, because it decides
+whether the dither survives:
+
+| quality | size | dither |
+|---|---|---|
+| 90 | 64 KB | **lost** — 42 of 100 sky rows go flat, banding returns |
+| 93 | 84 KB | intact, no margin |
+| **95** | **125 KB** | intact — the default |
+| 99 | 358 KB | intact, diminishing returns |
+
+The threshold moves with the picture: rate allocation gives a smooth frame
+fewer bits, so a plain sky is where the noise gets discarded first. Below 93,
+expect the banding back. Lossy alternatives were measured and are worse — JPEG
+at q85 flattens 91 of 100 rows, and lossless AVIF is 2.5 MB, worse than
+lossless WebP.
+
+Encoding costs about 3 seconds on a 25-second render. Depth is unaffected: it
+travels as its own lossless part whatever the image format.
 
 ### Styling
 
@@ -190,7 +221,7 @@ service was idle.
 | part | filename | arrives as | contents |
 |---|---|---|---|
 | `meta` | — | string | JSON, see below |
-| `image` | `panorama.png` | `Blob` | RGB PNG, `width × height` |
+| `image` | `panorama.avif` | `Blob` | RGB image, `width × height`; `panorama.png` when `format: "png"` |
 | `depth` | `depth.bin.gz` | `Blob` | gzip, only when `depth: true` |
 
 A part with a filename arrives as a `Blob`; one without arrives as a string.
