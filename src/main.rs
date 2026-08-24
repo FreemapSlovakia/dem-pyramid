@@ -545,6 +545,7 @@ fn main() -> Result<()> {
                         keep_revealed: !no_revealed_peaks,
                         rank_power: peak_rank_power,
                         rank: None,
+                        filter: None,
                     },
                 );
 

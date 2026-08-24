@@ -305,6 +305,17 @@ impl Program {
             _ => f64::NEG_INFINITY,
         }
     }
+
+    /// Whether a peak survives this expression used as a filter.
+    ///
+    /// Null is not a yes, the same rule `case` uses for its conditions. So
+    /// `[">", ["get","prominence"], 100]` drops every peak with no prominence
+    /// -- two thirds of them -- rather than keeping them on the grounds that
+    /// nothing disproved the test. `coalesce` is how a caller says what an
+    /// absence should count as.
+    pub fn keeps(&self, v: &Vars) -> bool {
+        truthy(self.eval(v))
+    }
 }
 
 /// Emits ops while tracking what they do to the stack.

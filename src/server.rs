@@ -167,6 +167,13 @@ pub struct Request {
     /// a test pins that -- so two parameters were doing one job.
     #[serde(default)]
     peak_rank: Option<serde_json::Value>,
+    /// Which peaks come back at all, as the same kind of expression.
+    ///
+    /// Supersedes `min_dominance` and `revealed_peaks`, which can each see one
+    /// field. Those still work and are applied alongside this one, so a
+    /// request sending both gets the intersection.
+    #[serde(default)]
+    peak_filter: Option<serde_json::Value>,
 }
 
 fn d_true() -> bool { true }
@@ -591,6 +598,13 @@ async fn panorama_route(
         },
         None => None,
     };
+    let filter = match &req.peak_filter {
+        Some(j) => match crate::rank::Program::compile(j) {
+            Ok(p) => Some(p),
+            Err(e) => return bad(format!("peak_filter: {e}")),
+        },
+        None => None,
+    };
 
     let render_cancel = cancel.clone();
     let built = tokio::task::spawn_blocking(move || -> Result<Vec<Part>> {
@@ -625,6 +639,7 @@ async fn panorama_route(
                 keep_revealed,
                 rank_power,
                 rank,
+                filter,
             },
         );
 

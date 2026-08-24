@@ -68,6 +68,17 @@ mod round {
             None => s.serialize_none(),
         }
     }
+
+    /// Three decimals for `rank`, whose scale is whatever the caller's formula
+    /// produces -- 2.04 for one peak and -11 960 for another in the same
+    /// response -- so a fixed absolute precision has to be fine enough for the
+    /// small end.
+    pub fn opt_d3<S: Serializer>(v: &Option<f64>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(v) => s.serialize_f64(to(*v, 3)),
+            None => s.serialize_none(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -116,6 +127,17 @@ pub struct Peak {
     /// comparison against published figures for tops that score below zero.
     #[serde(serialize_with = "round::d1")]
     pub dominance: f64,
+
+    /// The value this peak was ordered by, so the ordering is inspectable.
+    ///
+    /// Whatever `peak_rank` computed, or the built-in criterion where none was
+    /// given. Returned because an ordering you cannot see is an ordering you
+    /// cannot debug: send a formula, read back what it produced for each peak,
+    /// and the reason a summit sits where it does stops being a guess. A
+    /// client that re-ranks can also reuse the number instead of recomputing
+    /// it.
+    #[serde(serialize_with = "round::opt_d3")]
+    pub rank: Option<f64>,
 
     /// True topographic prominence, metres, or `null` where none is known.
     ///
@@ -209,6 +231,7 @@ pub fn load(path: &Path, lon: f64, lat: f64, range: f64) -> Result<Vec<Peak>> {
             // not eight, and "no prominence known" is not "prominence 0".
             prominence: f.get(6).and_then(|s| s.parse().ok()),
             prom_dist_m: f.get(7).and_then(|s| s.parse().ok()),
+            rank: None,
             column: None,
         });
     }
@@ -272,6 +295,30 @@ pub struct Selection {
     /// own criterion would have kept, and no amount of re-ranking afterwards
     /// gets it back.
     pub rank: Option<crate::rank::Program>,
+    /// Which peaks survive at all, as an expression over the same properties.
+    ///
+    /// It supersedes `min_dominance` and `keep_revealed`, which can only ever
+    /// see one field each. Those still work and are applied alongside it --
+    /// existing clients depend on them -- but everything they express is
+    /// expressible here, and more: "a real mountain however it reads from
+    /// here, or anything standing out locally" needs two properties and a
+    /// disjunction, which no numeric threshold can say.
+    pub filter: Option<crate::rank::Program>,
+}
+
+/// The properties an expression sees for one peak.
+fn vars(k: &Peak) -> crate::rank::Vars {
+    crate::rank::Vars {
+        dominance: k.dominance,
+        distance: k.distance,
+        altitude: k.altitude,
+        ele: k.ele,
+        x: k.x,
+        y: k.y,
+        revealed: k.revealed,
+        prominence: k.prominence,
+        prom_dist: k.prom_dist_m,
+    }
 }
 
 /// How label-worthy a summit is: dominance, discounted by distance.
@@ -326,12 +373,18 @@ pub fn label_rank(dominance: f64, distance: f64, power: f64) -> f64 {
 /// by construction, being the ones that were behind something.
 pub fn select(peaks: &mut Vec<Peak>, s: &Selection) {
     peaks.retain(|k| {
+        // Structural first -- in frame, answered by a ray, actually seen --
+        // then the caller's opinion. `min_dominance` and `keep_revealed` are
+        // the older, single-field way of saying what `filter` says in
+        // general; all three apply, so a client sending both gets the
+        // intersection rather than a surprise.
         k.visible
-            && (s.keep_revealed || !k.revealed)
             && k.column.is_some()
-            && k.dominance >= s.min_dominance
             && k.y >= 0.0
             && k.y <= s.height as f64
+            && (s.keep_revealed || !k.revealed)
+            && k.dominance >= s.min_dominance
+            && s.filter.as_ref().is_none_or(|f| f.keeps(&vars(k)))
     });
     // `min_dominance` still filters on raw dominance, deliberately: it is a
     // statement about the landscape -- "nothing flatter than this is a summit"
@@ -342,22 +395,22 @@ pub fn select(peaks: &mut Vec<Peak>, s: &Selection) {
     // guarded finite where it is computed -- but `label_rank` and `Selection`
     // are public with public fields, so that guarantee lives entirely in
     // validators in other files. This costs the same and cannot panic.
-    peaks.sort_by(|a, b| {
-        let rank = |k: &Peak| match &s.rank {
-            Some(p) => p.rank(&crate::rank::Vars {
-                dominance: k.dominance,
-                distance: k.distance,
-                altitude: k.altitude,
-                ele: k.ele,
-                x: k.x,
-                y: k.y,
-                revealed: k.revealed,
-                prominence: k.prominence,
-                prom_dist: k.prom_dist_m,
-            }),
+    // Computed once per peak and kept, rather than recomputed inside the
+    // comparator -- which is both cheaper and the only way the value can be
+    // returned to the caller. An ordering nobody can see is one nobody can
+    // debug.
+    for k in peaks.iter_mut() {
+        k.rank = Some(match &s.rank {
+            Some(p) => p.rank(&vars(k)),
             None => label_rank(k.dominance, k.distance, s.rank_power),
-        };
-        rank(b).total_cmp(&rank(a))
+        });
+    }
+    // `total_cmp`, so a formula producing NaN sorts somewhere definite rather
+    // than wherever the comparison happens to leave it.
+    peaks.sort_by(|a, b| {
+        b.rank
+            .unwrap_or(f64::NEG_INFINITY)
+            .total_cmp(&a.rank.unwrap_or(f64::NEG_INFINITY))
     });
     // After the sort, so a cap keeps the summits worth labelling rather than
     // an arbitrary slice. Zero is no cap.
@@ -389,6 +442,7 @@ mod tests {
             dominance,
             prominence: None,
             prom_dist_m: None,
+            rank: None,
             column,
         }
     }
@@ -403,6 +457,7 @@ mod tests {
             keep_revealed: true,
             rank_power: DEFAULT_RANK_POWER,
             rank: None,
+            filter: None,
         }
     }
 
@@ -494,6 +549,76 @@ mod tests {
             },
         );
         assert_eq!(real.iter().map(|p| p.osm_id).collect::<Vec<_>>(), [3, 4]);
+    }
+
+    /// A filter sees every property, which is the point of it: no numeric
+    /// threshold can say "a real mountain however it reads from here, or
+    /// anything standing out locally", because that needs two properties and
+    /// a disjunction.
+    #[test]
+    fn a_filter_can_say_what_min_dominance_cannot() {
+        use serde_json::json;
+        let mut far_but_major = peak(1, 40.0, true, Some(0), 10.0);
+        far_but_major.prominence = Some(2355.0);
+        let mut near_and_local = peak(2, 200.0, true, Some(0), 10.0);
+        near_and_local.prominence = None;
+        let mut neither = peak(3, 5.0, true, Some(0), 10.0);
+        neither.prominence = Some(20.0);
+
+        let f = crate::rank::Program::compile(&json!([
+            "case",
+            [">", ["coalesce", ["get", "prominence"], 0], 300], 1,
+            [">", ["get", "dominance"], 100]
+        ]))
+        .unwrap();
+
+        let mut peaks = vec![far_but_major, near_and_local, neither];
+        select(
+            &mut peaks,
+            &Selection {
+                filter: Some(f),
+                // Wide open, so only the expression decides.
+                min_dominance: f64::NEG_INFINITY,
+                ..sel(0.0, 0)
+            },
+        );
+        assert_eq!(peaks.iter().map(|p| p.osm_id).collect::<Vec<_>>(), [2, 1]);
+    }
+
+    /// The legacy thresholds and the expression both apply, so a client
+    /// sending both gets the intersection rather than a surprise.
+    #[test]
+    fn the_old_filters_still_bite_alongside_the_new_one() {
+        use serde_json::json;
+        let keep_everything = crate::rank::Program::compile(&json!(1)).unwrap();
+        let mut peaks = vec![
+            peak(1, 100.0, true, Some(0), 10.0),
+            peak(2, 5.0, true, Some(0), 10.0),
+        ];
+        select(
+            &mut peaks,
+            &Selection {
+                filter: Some(keep_everything),
+                ..sel(30.0, 0)
+            },
+        );
+        assert_eq!(peaks.iter().map(|p| p.osm_id).collect::<Vec<_>>(), [1]);
+    }
+
+    /// The ordering value is returned, so an ordering can be inspected rather
+    /// than inferred.
+    #[test]
+    fn the_rank_used_for_ordering_comes_back() {
+        let mut peaks = vec![
+            peak(1, 100.0, true, Some(0), 10.0),
+            peak(2, 900.0, true, Some(0), 10.0),
+        ];
+        select(&mut peaks, &sel(0.0, 0));
+        assert_eq!(peaks[0].osm_id, 2);
+        for p in &peaks {
+            let want = label_rank(p.dominance, p.distance, DEFAULT_RANK_POWER);
+            assert!((p.rank.expect("rank is returned") - want).abs() < 1e-9);
+        }
     }
 
     /// The sign rule, pinned with the numbers that exposed it.
