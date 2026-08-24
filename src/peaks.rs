@@ -117,6 +117,32 @@ pub struct Peak {
     #[serde(serialize_with = "round::d1")]
     pub dominance: f64,
 
+    /// True topographic prominence, metres, or `null` where none is known.
+    ///
+    /// Precomputed from GEDTM30 over the whole continent and stored with the
+    /// peak, so unlike `dominance` it is the same from every viewpoint. That
+    /// is the point of it: measured across two Slovak viewpoints, 20% of the
+    /// summits visible from both flipped the sign of their dominance and 40%
+    /// of those earning a label from one were dropped by the other. Prominence
+    /// does not move.
+    ///
+    /// It answers a different question, though, and cannot replace dominance:
+    /// this says whether something is a mountain, dominance says whether it
+    /// stands out from where you are standing. A summit seen end-on along its
+    /// own ridge really is unremarkable from there, and saying so is correct.
+    #[serde(serialize_with = "round::opt_d1")]
+    pub prominence: Option<f64>,
+    /// How far the DEM summit this came from sat from the OSM node, metres.
+    ///
+    /// Every match is a guess of some size, because 30 m data places a summit
+    /// up to ~75 m from where the LiDAR and OSM agree it is. 42% land within
+    /// 25 m and 74% within 50 m; treat anything past 100 m as suspect. Where
+    /// two real summits sit inside the radius only the nearest keeps a value
+    /// and the others come back `null`, so a missing prominence never means
+    /// "not a mountain" -- only that nothing could be matched to it.
+    #[serde(serialize_with = "round::opt_d1")]
+    pub prom_dist_m: Option<f64>,
+
     /// Sub-column the peak's bearing falls in -- a ray index, not an output
     /// column. `None` when it is out of frame or has no elevation, which is
     /// the same thing as "no ray will answer it". Not part of the API.
@@ -178,6 +204,11 @@ pub fn load(path: &Path, lon: f64, lat: f64, range: f64) -> Result<Vec<Peak>> {
             visible: false,
             revealed: false,
             dominance: 0.0,
+            // Absent rather than zero where the column does not exist: a
+            // peaks file predating `bin/prominence-join.sh` has six fields,
+            // not eight, and "no prominence known" is not "prominence 0".
+            prominence: f.get(6).and_then(|s| s.parse().ok()),
+            prom_dist_m: f.get(7).and_then(|s| s.parse().ok()),
             column: None,
         });
     }
@@ -336,6 +367,8 @@ mod tests {
             visible,
             revealed: false,
             dominance,
+            prominence: None,
+            prom_dist_m: None,
             column,
         }
     }
