@@ -17,6 +17,59 @@ use std::path::Path;
 
 use crate::gdal_cli;
 
+/// Rounding applied on the way out, and only on the way out.
+///
+/// `serde_json` writes the shortest text that round-trips an `f64` exactly,
+/// which for a computed value means every digit it has:
+/// `"distance": 116483.52984247255`. Seventeen significant figures describing
+/// a summit whose position is known to a few metres, repeated over thousands
+/// of peaks, is most of the payload -- 344 bytes each, and a 2631-peak view
+/// runs to 904 KB against a 398 KB image.
+///
+/// It also defeats compression. Those low digits are as close to random as
+/// anything in the response, so gzip cannot pack them: the same peaks
+/// compress to 299 KB as sent and to **153 KB** rounded. Cutting the digits
+/// is worth more after compression than before it, which is why this is not
+/// made redundant by turning gzip on.
+///
+/// Every precision here is far below what the renderer or the DEM can
+/// resolve: 6 decimals of latitude is 11 cm, `x`/`y` to 0.01 output pixels,
+/// angles to 0.001 degrees -- a fiftieth of a pixel at the default `step`.
+/// Nothing observable changes; the numbers stay full precision everywhere
+/// inside the program.
+mod round {
+    use serde::Serializer;
+
+    fn to(v: f64, decimals: i32) -> f64 {
+        if !v.is_finite() {
+            return v;
+        }
+        let m = 10f64.powi(decimals);
+        (v * m).round() / m
+    }
+
+    macro_rules! at {
+        ($name:ident, $decimals:expr) => {
+            pub fn $name<S: Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_f64(to(*v, $decimals))
+            }
+        };
+    }
+
+    at!(d1, 1);
+    at!(d2, 2);
+    at!(d3, 3);
+    at!(d6, 6);
+
+    /// `ele` is optional, and `None` has to stay `null` rather than become 0.
+    pub fn opt_d1<S: Serializer>(v: &Option<f64>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(v) => s.serialize_f64(to(*v, 1)),
+            None => s.serialize_none(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct Peak {
     pub osm_id: i64,
@@ -25,16 +78,24 @@ pub struct Peak {
     pub kind: String,
     /// The `ele` tag as OSM has it, unparsed. Unreliable -- prefer `ele`.
     pub ele_osm: Option<String>,
+    #[serde(serialize_with = "round::d6")]
     pub lon: f64,
+    #[serde(serialize_with = "round::d6")]
     pub lat: f64,
 
     /// Elevation from the DTM, which is what the geometry uses.
+    #[serde(serialize_with = "round::opt_d1")]
     pub ele: Option<f64>,
+    #[serde(serialize_with = "round::d1")]
     pub distance: f64,
+    #[serde(serialize_with = "round::d3")]
     pub azimuth: f64,
+    #[serde(serialize_with = "round::d3")]
     pub altitude: f64,
     /// Position in the rendered image, in output pixels.
+    #[serde(serialize_with = "round::d2")]
     pub x: f64,
+    #[serde(serialize_with = "round::d2")]
     pub y: f64,
     pub visible: bool,
     /// Set where `depth_lift` is what put the summit in view: it is drawn,
@@ -53,6 +114,7 @@ pub struct Peak {
     /// by definition and this is not: where it is positive the two agree
     /// closely, but a name that promised the textbook measure would invite
     /// comparison against published figures for tops that score below zero.
+    #[serde(serialize_with = "round::d1")]
     pub dominance: f64,
 
     /// Sub-column the peak's bearing falls in -- a ray index, not an output
