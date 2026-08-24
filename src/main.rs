@@ -202,8 +202,6 @@ enum Command {
         /// nothing the eye cannot see. Nothing is revealed without a lift.
         #[arg(long, default_value_t = false)]
         no_revealed_peaks: bool,
-        /// Exponent on distance when --max-peaks decides what to keep.
-        /// 0 ranks on dominance alone.
         /// Formula deciding which summits --max-peaks keeps, as a JSON prefix
         /// expression. See docs/API.md; omit for the built-in ranking.
         #[arg(long)]
@@ -217,7 +215,7 @@ enum Command {
         #[arg(long, default_value_t = panorama::DEFAULT_PROFILE_STEP)]
         peak_profile_step: f64,
         /// Keep at most this many peaks, most label-worthy first -- dominance
-        /// discounted by distance, see --peak-rank-power. 0 is no cap.
+        /// discounted by distance, or by --peak-rank. 0 is no cap.
         #[arg(long, default_value_t = 0)]
         max_peaks: usize,
         /// Rays per output pixel horizontally, averaged down.
