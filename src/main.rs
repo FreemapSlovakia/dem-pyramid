@@ -205,6 +205,11 @@ enum Command {
         /// 0 ranks on dominance alone.
         #[arg(long, default_value_t = peaks::DEFAULT_RANK_POWER)]
         peak_rank_power: f64,
+        /// Degrees per column of the grid dominance is measured on, so the
+        /// score does not change with --step or --supersample-x. Held to the
+        /// ray spacing if finer.
+        #[arg(long, default_value_t = panorama::DEFAULT_PROFILE_STEP)]
+        peak_profile_step: f64,
         /// Keep at most this many peaks, most label-worthy first -- dominance
         /// discounted by distance, see --peak-rank-power. 0 is no cap.
         #[arg(long, default_value_t = 0)]
@@ -384,11 +389,12 @@ fn main() -> Result<()> {
             min_dominance,
             no_revealed_peaks,
             peak_rank_power,
+            peak_profile_step,
             max_peaks,
             supersample_x,
             supersample_y,
         } => {
-            panorama::validate_style(ridge_strength, ridge_width, depth_lift)?;
+            panorama::validate_style(ridge_strength, ridge_width, depth_lift, peak_profile_step)?;
             // The server's parser refuses a non-finite before any check sees
             // it; clap's does not, so this is the side where `--range NaN`
             // reaches the geometry and renders an empty frame with exit 0.
@@ -447,6 +453,7 @@ fn main() -> Result<()> {
                 ridge_width,
                 dither_strength,
                 depth_lift,
+                peak_profile_step,
                 ridge_colour: match &ridge_color {
                     Some(s) => panorama::parse_colour(s)?,
                     None => panorama::DEFAULT_RIDGE,

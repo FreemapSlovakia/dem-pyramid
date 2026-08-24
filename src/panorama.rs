@@ -132,6 +132,70 @@ pub struct Params {
     /// horizon moves by exactly this much, so the frame usually wants
     /// `alt_max` raised to match or the far ridges climb out of it.
     pub depth_lift: f64,
+    /// Degrees per column of the grid `dominance` is measured on.
+    ///
+    /// Never finer than the ray spacing, which is what actually limits it; the
+    /// effective value comes back in `meta`. See [`ProfileGrid`].
+    pub peak_profile_step: f64,
+}
+
+/// The fixed angular grid `dominance` is measured on.
+///
+/// Deliberately not the image grid. Dominance asks how far a summit stands
+/// above the ground beside it, and the marcher already answers that at a
+/// resolution set by the DEM -- it steps along each ray by the cell size at
+/// that distance, whatever `step` the caller asked for. What used to track the
+/// image was the *bearing* density: `step: 0.2, ssx: 1` casts 1800 rays where
+/// `step: 0.05, ssx: 3` casts 21 600, and more bearings find more of the
+/// ground beside a summit, so the coarse tier consistently scored higher.
+///
+/// That made dominance a property of the render rather than of the view. A
+/// client showing a fast preview with the real tier behind it got two label
+/// sets for one viewpoint and the names changed under the user as the second
+/// image landed -- measured at one viewpoint, 14 of 40 labels.
+///
+/// So the profile is sampled on its own grid, and each column takes exactly
+/// one ray however many crossed it.
+struct ProfileGrid {
+    /// Degrees per profile column.
+    step: f64,
+    /// Degrees between rays. The floor on `step`: a column no ray falls in
+    /// reads as "no ground at this depth" and silently shortens the sweep.
+    az_step: f64,
+    cols: usize,
+}
+
+impl ProfileGrid {
+    fn new(p: &Params, az_step: f64) -> Self {
+        let step = p.peak_profile_step.max(az_step);
+        // Floored, not rounded, so the grid never claims bearings no ray
+        // covers -- the last column's centre then always has a ray near it.
+        let cols = ((p.az_span / step).floor() as usize).max(1);
+        Self {
+            step,
+            az_step,
+            cols,
+        }
+    }
+
+    /// Profile column a bearing offset from `az_start` falls in.
+    fn col_of(&self, off: f64) -> usize {
+        ((off / self.step).floor().max(0.0) as usize).min(self.cols - 1)
+    }
+
+    /// The column this ray speaks for, if it is the one nearest its centre.
+    ///
+    /// One ray per column at every tier, which is the whole point. Taking the
+    /// max over every ray that crosses a column would put twelve samples in it
+    /// at `step: 0.05, ssx: 3` against one at `step: 0.2, ssx: 1`, and a
+    /// maximum over more samples is never smaller -- so the density would go
+    /// straight back into the score.
+    fn spoken_for_by(&self, sub: usize) -> Option<usize> {
+        let col = self.col_of((sub as f64 + 0.5) * self.az_step);
+        let centre = (col as f64 + 0.5) * self.step;
+        let ideal = (centre / self.az_step - 0.5).round();
+        (ideal >= 0.0 && ideal as usize == sub).then_some(col)
+    }
 }
 
 impl Params {
@@ -439,6 +503,10 @@ pub struct Stats {
     pub samples: usize,
     pub blocks: usize,
     pub sky_fraction: f64,
+    /// Degrees per column the dominance grid actually used, after being held
+    /// to the ray spacing. Two requests agree about their peaks only if they
+    /// agree about this, so the caller has to be able to see it.
+    pub peak_profile_step: f64,
     /// Per-pixel distance, 16-bit log-encoded, 0 for sky. Written only if
     /// asked for; see `encode_depth`.
     pub depth: image::ImageBuffer<image::Luma<u16>, Vec<u16>>,
@@ -1119,6 +1187,7 @@ pub fn render(
     let sub_h = out_h * ssy as usize;
     let az_step = p.step_deg / f64::from(ssx);
     let alt_step = p.step_deg / f64::from(ssy);
+    let grid = ProfileGrid::new(p, az_step);
 
     // Eye elevation, and the peak geometry that depends on it, before any
     // marching. Peaks are then answered from the columns the render produces
@@ -1223,6 +1292,9 @@ pub fn render(
         /// angle at the peak's distance.
         answers: Vec<(usize, u8, Horizon)>,
         profile: Profile,
+        /// Global profile column this chunk's profile starts at. Chunks divide
+        /// the image, and the profile grid does not divide with it.
+        profile_from: usize,
     }
     let parts: Vec<ChunkOut> = (0..out_w)
         .step_by(chunk)
@@ -1236,9 +1308,17 @@ pub fn render(
             let mut peak_results: Vec<(usize, u8, Horizon)> = Vec::new();
             let mut probe_d: Vec<f64> = Vec::new();
             let mut probe_h: Vec<Horizon> = Vec::new();
+            // The slice of the profile grid this chunk's rays can speak for.
+            // Sized from the bearings rather than from `cols`, because the two
+            // grids have no common divisor in general.
+            let (profile_from, profile_cols) = {
+                let first = grid.col_of((start * ssx as usize) as f64 * az_step);
+                let last = grid.col_of(((start + cols) * ssx as usize) as f64 * az_step);
+                (first, last - first + 1)
+            };
             // Only dominance reads it, so a plain image render neither
             // allocates it nor pays a bin lookup per marched sample.
-            let mut profile = Profile::new(if want_peaks { cols } else { 0 });
+            let mut profile = Profile::new(if want_peaks { profile_cols } else { 0 });
             let mut samples = 0usize;
             let mut sky = 0usize;
 
@@ -1265,12 +1345,17 @@ pub fn render(
                     probe_d.clear();
                     probe_d.extend(probes.iter().map(|&(d, _, _)| d));
 
-                    // One profile per output column: the ssx rays inside it
-                    // all contribute, so a narrow gully seen by one ray is not
-                    // lost when its neighbour misses it.
+                    // Most rays record nothing: the profile takes one ray per
+                    // column of its own grid, so that what dominance measures
+                    // does not change with the quality the picture was asked
+                    // for. See `ProfileGrid`.
+                    let records = want_peaks
+                        .then(|| grid.spoken_for_by(sub))
+                        .flatten()
+                        .map(|c| (&mut profile, c - profile_from));
                     samples += march_ray(
                         &mut pyr, p, eye, az, alt_step, sub_h, coarsest, finest, &mut column,
-                        &probe_d, &mut probe_h, want_peaks.then_some((&mut profile, local)),
+                        &probe_d, &mut probe_h, records,
                     );
                     sky += column.dist.iter().filter(|d| d.is_infinite()).count();
 
@@ -1321,6 +1406,7 @@ pub fn render(
 
             Ok(ChunkOut {
                 start,
+                profile_from,
                 pixels,
                 depth,
                 samples,
@@ -1345,7 +1431,7 @@ pub fn render(
         real: f64::NAN,
     };
     let mut horizon = vec![[nowhere; 2]; peaks.len()];
-    let mut profile = Profile::new(if want_peaks { out_w } else { 0 });
+    let mut profile = Profile::new(if want_peaks { grid.cols } else { 0 });
     for part in parts {
         let ChunkOut {
             start,
@@ -1361,8 +1447,13 @@ pub fn render(
         }
         let cols = pixels.len() / out_h;
         if want_peaks {
-            profile.max_h[start * PROFILE_BINS..(start + cols) * PROFILE_BINS]
-                .copy_from_slice(&part.profile.max_h);
+            // Merged by maximum, not copied: a profile column at a chunk
+            // boundary is allocated by both neighbours, and only the one
+            // holding its representative ray has anything to say about it.
+            let from = part.profile_from * PROFILE_BINS;
+            for (dst, &src) in profile.max_h[from..].iter_mut().zip(&part.profile.max_h) {
+                *dst = dst.max(src);
+            }
         }
         cells += cols * sub_h * ssx as usize;
         for orow in 0..out_h {
@@ -1414,13 +1505,24 @@ pub fn render(
         cancel.check()?;
         pk.dominance = match (pk.column, pk.ele) {
             (Some(column), Some(ele)) if pk.visible => {
-                let out_col = (column / ssx as usize).min(out_w.saturating_sub(1));
+                // Both the column and the window are on the profile's grid, so
+                // the sweep covers the same bearings and the same span of
+                // ground whatever the picture was rendered at. `column` is a
+                // ray index; the bearing is what carries across.
+                let off = (column as f64 + 0.5) * az_step;
                 let span = (DOMINANCE_RADIUS / pk.distance)
                     .atan()
                     .to_degrees()
                     .clamp(1.0, 20.0);
-                let window = (span / p.step_deg).round() as usize;
-                dominance_m(&profile, out_w, out_col, ele, pk.distance, window)
+                let window = (span / grid.step).round().max(1.0) as usize;
+                dominance_m(
+                    &profile,
+                    grid.cols,
+                    grid.col_of(off),
+                    ele,
+                    pk.distance,
+                    window,
+                )
             }
             _ => 0.0,
         };
@@ -1436,6 +1538,7 @@ pub fn render(
             samples,
             blocks,
             sky_fraction: sky as f64 / cells.max(1) as f64,
+            peak_profile_step: grid.step,
             depth: depth_img,
         },
     ))
@@ -1535,13 +1638,41 @@ pub const MAX_RIDGE_WIDTH: f64 = 20.0;
 /// falling lift breaks, which is `revealed` rather than the band fill.
 pub const MAX_DEPTH_LIFT: f64 = 45.0;
 
+/// Degrees per column of the dominance grid, unless the caller says otherwise.
+///
+/// Coarse on purpose. The grid can never be finer than the rays that fill it,
+/// so a default fine enough to match the DEM -- around 0.05 degrees, which is
+/// what the marcher's level choice works out to -- would be silently widened
+/// back out for any fast preview and the tiers would disagree again. 0.2 is
+/// the coarsest tier anyone previews at, so it is the finest grid every tier
+/// can actually deliver.
+///
+/// The cost is real and worth stating: a full-quality render measures
+/// dominance on a grid four times coarser than its own rays, and a coarser
+/// neighbourhood finds less of the ground beside a summit, so scores come out
+/// slightly higher than they used to. Consistent beats sharp here -- the
+/// number exists to order labels, and an order that changes when the picture
+/// gets prettier is worth less than a slightly blunt one that does not.
+pub const DEFAULT_PROFILE_STEP: f64 = 0.2;
+
+/// Bounds on the dominance grid. The floor keeps one 360-degree profile inside
+/// a few megabytes; the ceiling is where a 20-degree sweep would have too few
+/// columns left to find a col at all.
+pub const MIN_PROFILE_STEP: f64 = 0.02;
+pub const MAX_PROFILE_STEP: f64 = 2.0;
+
 /// Reject styling the renderer cannot draw, before it reaches the hot loop.
 ///
 /// Shared so the CLI cannot do what the server refuses: `--ridge-width 1e9`
 /// used to make the ink pass span the whole column for every edge, which reads
 /// as a hang and paints a solid slab, while the same value over HTTP was a
 /// clean 400.
-pub fn validate_style(ridge_strength: f64, ridge_width: f64, depth_lift: f64) -> Result<()> {
+pub fn validate_style(
+    ridge_strength: f64,
+    ridge_width: f64,
+    depth_lift: f64,
+    peak_profile_step: f64,
+) -> Result<()> {
     for (name, v) in [
         ("ridge_strength", ridge_strength),
         ("ridge_width", ridge_width),
@@ -1574,6 +1705,14 @@ pub fn validate_style(ridge_strength: f64, ridge_width: f64, depth_lift: f64) ->
     anyhow::ensure!(
         (0.0..=MAX_DEPTH_LIFT).contains(&depth_lift),
         "depth_lift must lie within 0..{MAX_DEPTH_LIFT}"
+    );
+    anyhow::ensure!(
+        peak_profile_step.is_finite(),
+        "peak_profile_step must be a finite number"
+    );
+    anyhow::ensure!(
+        (MIN_PROFILE_STEP..=MAX_PROFILE_STEP).contains(&peak_profile_step),
+        "peak_profile_step must lie within {MIN_PROFILE_STEP}..{MAX_PROFILE_STEP}"
     );
     Ok(())
 }
@@ -2010,6 +2149,7 @@ mod tests {
             ground_colour: DEFAULT_GROUND,
             dither_strength: DEFAULT_DITHER,
             depth_lift,
+            peak_profile_step: DEFAULT_PROFILE_STEP,
         }
     }
 
@@ -2084,15 +2224,89 @@ mod tests {
         assert!(!clears(2.9, 2.0, 4.0, 0.5));
     }
 
+    /// The point of the whole grid: a preview and the render behind it must
+    /// measure dominance on the same bearings, or the label set changes under
+    /// the user as the second image lands.
+    #[test]
+    fn every_tier_samples_the_same_bearings() {
+        let mut p = lift_params(0.0, 300_000.0);
+        p.az_span = 360.0;
+
+        // The two passes a progressive client makes, plus the extremes.
+        let tiers = [(0.2, 1u32), (0.05, 3), (0.05, 1), (0.1, 9), (0.02, 9)];
+        let mut reference: Option<Vec<f64>> = None;
+
+        for (step_deg, ssx) in tiers {
+            p.step_deg = step_deg;
+            let az_step = step_deg / f64::from(ssx);
+            let grid = ProfileGrid::new(&p, az_step);
+            assert_eq!(grid.cols, 1800, "{step_deg}/{ssx} disagreed on width");
+
+            // Exactly one ray speaks for each column, and the bearing it
+            // speaks from is within half a ray of the column centre.
+            let subs = (360.0 / az_step).round() as usize;
+            let mut spoken = vec![None; grid.cols];
+            for sub in 0..subs {
+                if let Some(c) = grid.spoken_for_by(sub) {
+                    assert!(spoken[c].is_none(), "column {c} claimed twice");
+                    spoken[c] = Some((sub as f64 + 0.5) * az_step);
+                }
+            }
+            let bearings: Vec<f64> = spoken
+                .iter()
+                .enumerate()
+                .map(|(c, b)| {
+                    let b = b.unwrap_or_else(|| panic!("column {c} had no ray at {step_deg}/{ssx}"));
+                    let centre = (c as f64 + 0.5) * grid.step;
+                    assert!(
+                        (b - centre).abs() <= az_step / 2.0 + 1e-9,
+                        "column {c} spoken for from {b}, centre {centre}"
+                    );
+                    b
+                })
+                .collect();
+
+            // Not merely the same count -- the same places on the horizon, to
+            // within the finest tier's ray spacing.
+            match &reference {
+                None => reference = Some(bearings),
+                Some(r) => {
+                    for (c, (a, b)) in r.iter().zip(&bearings).enumerate() {
+                        assert!(
+                            (a - b).abs() <= 0.1 + 1e-9,
+                            "column {c}: {step_deg}/{ssx} samples {b}, reference {a}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The grid cannot be finer than the rays that fill it: a column no ray
+    /// falls in reads as "no ground here" and silently shortens the sweep.
+    #[test]
+    fn the_grid_is_held_to_the_ray_spacing() {
+        let mut p = lift_params(0.0, 300_000.0);
+        p.az_span = 360.0;
+        p.peak_profile_step = 0.02;
+
+        // Asked for 0.02 with rays 0.2 apart: the request cannot be honoured.
+        let grid = ProfileGrid::new(&p, 0.2);
+        assert_eq!(grid.step, 0.2);
+        // Asked for 0.02 with rays finer than that: honoured.
+        let grid = ProfileGrid::new(&p, 0.01);
+        assert_eq!(grid.step, 0.02);
+    }
+
     /// A falling lift would report summits the eye can see as hidden, so it
     /// is refused rather than clamped, and both front-ends share the rule.
     #[test]
     fn a_lift_that_falls_with_distance_is_refused() {
-        assert!(validate_style(1.0, 1.0, 0.0).is_ok());
-        assert!(validate_style(1.0, 1.0, MAX_DEPTH_LIFT).is_ok());
-        assert!(validate_style(1.0, 1.0, -0.1).is_err());
-        assert!(validate_style(1.0, 1.0, MAX_DEPTH_LIFT + 0.1).is_err());
-        assert!(validate_style(1.0, 1.0, f64::NAN).is_err());
-        assert!(validate_style(1.0, 1.0, f64::INFINITY).is_err());
+        assert!(validate_style(1.0, 1.0, 0.0, DEFAULT_PROFILE_STEP).is_ok());
+        assert!(validate_style(1.0, 1.0, MAX_DEPTH_LIFT, DEFAULT_PROFILE_STEP).is_ok());
+        assert!(validate_style(1.0, 1.0, -0.1, DEFAULT_PROFILE_STEP).is_err());
+        assert!(validate_style(1.0, 1.0, MAX_DEPTH_LIFT + 0.1, DEFAULT_PROFILE_STEP).is_err());
+        assert!(validate_style(1.0, 1.0, f64::NAN, DEFAULT_PROFILE_STEP).is_err());
+        assert!(validate_style(1.0, 1.0, f64::INFINITY, DEFAULT_PROFILE_STEP).is_err());
     }
 }

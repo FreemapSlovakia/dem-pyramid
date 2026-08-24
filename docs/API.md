@@ -54,6 +54,7 @@ All fields except `lon` and `lat` are optional.
 | `depth_lift` | number | `0` | degrees of extra elevation at `range`, tapering to nothing at the eye (0–45); see [Depth lift](#depth-lift) |
 | `revealed_peaks` | bool | `true` | let summits only `depth_lift` brought into view take label slots |
 | `peak_rank_power` | number | `0.5` | exponent on distance in the `max_peaks` cut (0–4); `0` ranks on raw dominance |
+| `peak_profile_step` | number | `0.2` | degrees per column of the grid `dominance` is measured on (0.02–2), independent of `step` and `supersample_x`; held to the ray spacing if finer |
 
 Image dimensions follow from the angles:
 
@@ -368,6 +369,7 @@ That is why `meta` can be `JSON.parse`d directly.
   "az_start": 300, "fov": 60,
   "alt_min": -8, "alt_max": 8,
   "step_deg": 0.05,
+  "peak_profile_step": 0.2,
   "samples": 26092800,
   "depth": {
     "encoding": "u16-le log, row delta-coded, gzip",
@@ -378,7 +380,9 @@ That is why `meta` can be `JSON.parse`d directly.
 ```
 
 `depth` is `null` unless requested. `eye_elevation` is metres above sea level,
-already including `eye`.
+already including `eye`. `peak_profile_step` is the grid `dominance` was
+measured on — the requested value, or the ray spacing where that was coarser.
+Two requests return the same peaks only if they agree here.
 
 ### Peaks
 
@@ -494,28 +498,45 @@ across `step` 0.2 / `ssx` 1 against `step` 0.05 / `ssx` 3, returned 366 and 363
 visible peaks sharing only 349 — **8% disagreement**. Coarse rays simply miss
 gaps that fine rays find. Do not treat the set as reproducible across tiers.
 
-**`dominance` values still move with quality**, and cannot fully stop while
-they are measured from the render. The marcher is the only thing that knows
-the terrain, and at `step: 0.2` it casts 1,800 rays where `0.05` casts 64,800
-— the coarse tier simply cannot see what lies between its rays, so its
-neighbourhood samples are sparser and its scores come out higher. Across those
-two tiers the median score differs by 8 m, the 90th percentile by 77 m, and
-the top-20 by dominance agree on about half.
+**`dominance` no longer moves with quality.** It used to: it was measured from
+whatever rays the image needed, so `step: 0.2, ssx: 1` sampled a summit's
+neighbourhood along 1800 bearings where `step: 0.05, ssx: 3` used 21 600, and
+more bearings find more of the ground beside it. A client rendering a preview
+and the real tier behind it got two different label sets for one viewpoint —
+**14 of 40 labels changed** at one viewpoint — and watched names swap as the
+second image landed.
 
-So **pin `step` when the label set must be stable** — for a pannable panorama,
-fetch peaks once at a fixed `step` and vary quality only for the image.
+It is now measured on its own angular grid, `peak_profile_step` degrees wide,
+with exactly one ray per column however many crossed it. Same viewpoint, same
+two tiers, capped at 40: **40 of 40 identical.** Across all visible peaks the
+score now differs between those tiers by a median of **1.1 m** (was 10.1), 4.0 m
+at the 90th percentile (was 50.6), and 7.5 m at worst (was 326).
 
-#### Progressive rendering: ask for peaks once
+Not exactly zero, because the ray nearest a column's centre is not at the same
+bearing in both tiers — it is within half a ray spacing, which is metres of
+ground. What is gone is the systematic part.
 
-Rendering a fast preview and the real tier behind it is the obvious way to hide
-a 25-second wait, and it walks straight into this. The two passes differ only
-in `step` and `supersample_x`, but they disagree about the labels, so the user
-watches names swap under them as the second image lands. Measured on one
-viewpoint at `step` 0.2 / `ssx` 1 against 0.05 / `ssx` 3, both capped at 40:
-**14 of 40 labels changed.** That is not a quality preference — it is the same
-view contradicting itself, and it happens on every render above the free tier.
+> **This changed the numbers.** A full-quality render now measures dominance on
+> a 0.2° grid rather than its own 0.017° rays, and scores shift accordingly:
+> median −4.8 m at one viewpoint, but reshaped rather than merely moved, and
+> **52 → 70 peaks cleared the default `min_dominance: 30`**. If your label
+> density was tuned against the old numbers, re-check it.
 
-Ask for peaks on **one** pass only:
+**Visibility is a separate matter and still moves.** It is decided from the two
+rays bracketing each summit, which are 0.2° apart at preview quality and 0.017°
+apart at full — so marginal peaks still appear and disappear. Measured above:
+366 against 363 visible, sharing 349. It did not show in the capped set because
+the disputed peaks rank low, but a client asking for hundreds of labels will
+still see churn in the tail.
+
+#### Progressive rendering
+
+Both passes must agree about `peak_profile_step`, which they do by default. If
+you set it, set it identically — and `meta.peak_profile_step` reports the value
+actually used, so a client can assert rather than assume.
+
+Asking for peaks on **one** pass only is still the strongest guarantee, and it
+takes the peak work off the expensive render:
 
 ```jsonc
 // preview — labels land immediately and never move again
@@ -810,7 +831,7 @@ Most out-of-range numbers are clamped rather than rejected — `range`, `fov`,
 exceptions are the ones where silently rewriting the request would hide a real
 mistake, and they answer `400` naming the field: `alt_min` or `alt_max` outside
 −90–90, `depth_lift` outside 0–45, `peak_rank_power` outside 0–4,
-`ridge_width` outside 0–20, a negative
+`peak_profile_step` outside 0.02–2, `ridge_width` outside 0–20, a negative
 `ridge_strength`, a malformed colour,
 and a non-finite value in any numeric field — though the JSON parser refuses
 `NaN` and `Infinity` before the check ever sees them, so that one is belt and

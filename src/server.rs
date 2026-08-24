@@ -142,10 +142,16 @@ pub struct Request {
     /// 0 ranks on dominance alone, which is what this did before.
     #[serde(default = "d_rank_power")]
     peak_rank_power: f64,
+    /// Degrees per column of the grid `dominance` is measured on, independent
+    /// of `step` and `supersample_x`. Held to the ray spacing if finer; the
+    /// value used comes back as `meta.peak_profile_step`.
+    #[serde(default = "d_profile_step")]
+    peak_profile_step: f64,
 }
 
 fn d_true() -> bool { true }
 fn d_rank_power() -> f64 { peaks::DEFAULT_RANK_POWER }
+fn d_profile_step() -> f64 { panorama::DEFAULT_PROFILE_STEP }
 
 #[derive(Deserialize, Clone, Copy, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -443,7 +449,12 @@ async fn panorama_route(
             return bad(format!("{name} must be a finite number"));
         }
     }
-    if let Err(e) = panorama::validate_style(req.ridge_strength, req.ridge_width, req.depth_lift) {
+    if let Err(e) = panorama::validate_style(
+        req.ridge_strength,
+        req.ridge_width,
+        req.depth_lift,
+        req.peak_profile_step,
+    ) {
         return bad(e.to_string());
     }
     if !(0.0..=peaks::MAX_RANK_POWER).contains(&req.peak_rank_power) {
@@ -514,6 +525,7 @@ async fn panorama_route(
         ground_colour,
         dither_strength: req.dither_strength.clamp(0.0, 8.0),
         depth_lift: req.depth_lift,
+        peak_profile_step: req.peak_profile_step,
     };
 
     let cancel = Cancel::default();
@@ -592,6 +604,11 @@ async fn panorama_route(
             "alt_min": p.alt_min,
             "alt_max": p.alt_max,
             "step_deg": p.step_deg,
+            // What `dominance` was actually measured on, after being held to
+            // the ray spacing. Two requests return the same peaks only if
+            // they agree here, so a client rendering a view twice can check
+            // rather than assume.
+            "peak_profile_step": stats.peak_profile_step,
             "samples": stats.samples,
             "depth": want_depth.then(|| serde_json::json!({
                 "encoding": "u16-le log, row delta-coded, gzip",
