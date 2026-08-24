@@ -485,12 +485,14 @@ the figure reads the valley depth and comes out high. Terrain hidden behind
 nearer ground no longer biases it — the measurement uses every elevation the
 ray marcher sampled, not only the surfaces that ended up drawn.
 
-**Which peaks are visible no longer depends on render quality**, and that is
-deliberate: names should not appear and disappear when a user changes quality
-to make the picture prettier. Visibility is asked of the ray marcher directly,
-against the horizon it already tracks, rather than read back out of the
-finished image. Across `step` 0.2→0.05 and `supersample_x` 1→9 the same
-viewpoint returns 765–778 peaks, agreeing on all but ~1% of the set.
+**Visibility barely depends on render quality, but "barely" is not "not at
+all".** It is asked of the ray marcher directly, against the horizon it already
+tracks, rather than read back out of the finished image, which is what removed
+the large swings. One viewpoint measured across `step` 0.2→0.05 and
+`supersample_x` 1→9 returned 765–778 peaks agreeing on all but ~1%; another,
+across `step` 0.2 / `ssx` 1 against `step` 0.05 / `ssx` 3, returned 366 and 363
+visible peaks sharing only 349 — **8% disagreement**. Coarse rays simply miss
+gaps that fine rays find. Do not treat the set as reproducible across tiers.
 
 **`dominance` values still move with quality**, and cannot fully stop while
 they are measured from the render. The marcher is the only thing that knows
@@ -502,6 +504,41 @@ the top-20 by dominance agree on about half.
 
 So **pin `step` when the label set must be stable** — for a pannable panorama,
 fetch peaks once at a fixed `step` and vary quality only for the image.
+
+#### Progressive rendering: ask for peaks once
+
+Rendering a fast preview and the real tier behind it is the obvious way to hide
+a 25-second wait, and it walks straight into this. The two passes differ only
+in `step` and `supersample_x`, but they disagree about the labels, so the user
+watches names swap under them as the second image lands. Measured on one
+viewpoint at `step` 0.2 / `ssx` 1 against 0.05 / `ssx` 3, both capped at 40:
+**14 of 40 labels changed.** That is not a quality preference — it is the same
+view contradicting itself, and it happens on every render above the free tier.
+
+Ask for peaks on **one** pass only:
+
+```jsonc
+// preview — labels land immediately and never move again
+{ "step": 0.2,  "supersample_x": 1, "peaks": true  }
+// final — image only
+{ "step": 0.05, "supersample_x": 3, "peaks": false }
+```
+
+Then rescale the positions, because `x` and `y` are in **output pixels** and
+the two images are not the same size. Both are the same view, so it is one
+factor:
+
+```js
+const k = stepOfPeaksPass / stepOfImagePass;   // 0.2 / 0.05 = 4
+const px = peak.x * k, py = peak.y * k;
+```
+
+Which pass to take them from is a real trade-off. The preview gives labels at
+once and drops the peak work from the expensive render; the final gives the
+better-measured set, since coarse rays miss ground beside a summit and bias its
+`dominance` upward. What you cannot have, until dominance stops being measured
+from the render, is both — and asking twice guarantees the disagreement is
+visible.
 
 Making this exact needs dominance to stop being a render-time measurement: true
 topographic prominence is a property of the summit, computable once from the
