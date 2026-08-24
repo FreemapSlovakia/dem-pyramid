@@ -146,6 +146,14 @@ enum Command {
         /// Multiplier on the 8-bit dither; 0 turns it off.
         #[arg(long, default_value_t = panorama::DEFAULT_DITHER)]
         dither_strength: f64,
+        /// Degrees of extra elevation for terrain at --range, tapering to
+        /// nothing at the viewpoint. Unfolds distance the true projection
+        /// compresses into the horizon; 0 is the true projection.
+        ///
+        /// Terrain rises clear of what hides it, so concealed ground comes
+        /// into view. Peaks shown only that way are marked `revealed`.
+        #[arg(long, default_value_t = 0.0)]
+        depth_lift: f64,
         /// Silhouette colour, #rrggbb. Black reads as shading.
         #[arg(long)]
         ridge_color: Option<String>,
@@ -356,6 +364,7 @@ fn main() -> Result<()> {
             ridge_strength,
             ridge_width,
             dither_strength,
+            depth_lift,
             ridge_color,
             ground_color,
             depth_out,
@@ -368,7 +377,7 @@ fn main() -> Result<()> {
             supersample_x,
             supersample_y,
         } => {
-            panorama::validate_style(ridge_strength, ridge_width)?;
+            panorama::validate_style(ridge_strength, ridge_width, depth_lift)?;
             let p = panorama::Params {
                 lon,
                 lat,
@@ -388,6 +397,7 @@ fn main() -> Result<()> {
                 ridge_strength,
                 ridge_width,
                 dither_strength,
+                depth_lift,
                 ridge_colour: match &ridge_color {
                     Some(s) => panorama::parse_colour(s)?,
                     None => panorama::DEFAULT_RIDGE,

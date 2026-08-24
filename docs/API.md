@@ -51,6 +51,7 @@ All fields except `lon` and `lat` are optional.
 | `ridge_width` | number | `1` | silhouette thickness in output pixels (0–20) |
 | `ridge_color` | string | `#000000` | silhouette colour, `#rrggbb` or `#rgb` |
 | `ground_color` | string | `#3a4a34` | near-terrain colour, before haze |
+| `depth_lift` | number | `0` | degrees of extra elevation at `range`, tapering to nothing at the eye (0–45); see [Depth lift](#depth-lift) |
 
 Image dimensions follow from the angles:
 
@@ -211,6 +212,54 @@ which is what keeps depth readable whatever colour you choose.
 Both colours take `#rrggbb` or `#rgb`, with or without the `#`. A malformed
 colour is a `400` naming the field, not a silently ignored parameter.
 
+### Depth lift
+
+A true panorama wastes its frame. From Kráľova hoľa the Low Tatra ridge four
+kilometres off fills a third of the picture, while the High Tatras — higher,
+and the reason anyone looks north — get a sliver above it. Distance compresses
+everything towards the horizon, and the interesting part is all at distance.
+
+`depth_lift` unfolds that. Terrain is raised in proportion to how far away it
+is: nothing at the eye, the full amount at `range`, linear in between. Set it
+to 3 with `range: 200000` and a range 100 km out rises 1.5°, one at 200 km
+rises 3°, and the layers separate.
+
+```jsonc
+{ "depth_lift": 1.5, "alt_max": 13.5 }   // gentle; ranges begin to separate
+{ "depth_lift": 3,   "alt_max": 15 }     // strong, drawn-panorama look
+```
+
+**It shows you things you cannot see.** This is not a display trick applied
+after the fact — the lift raises the world, and what is hidden is decided in
+the raised world, so a range lifted clear of the ridge in front of it becomes
+visible. That is the point: it is what makes hand-drawn panoramas legible, and
+without it the lift tears the picture apart (see below). But the result is no
+longer a photograph, and anything built on "the user can see this from here"
+has to account for it. Peaks brought into view this way come back with
+`revealed: true` — see [Peaks](#peaks).
+
+Three things to expect:
+
+- **Raise `alt_max` by roughly `depth_lift`.** The horizon moves up by exactly
+  that much, so far ridges climb out of an unchanged frame.
+- **Pair it with a sensible `range`.** With a strong lift the topmost
+  silhouette becomes *whatever is farthest*, and at 200 km the elevation angle
+  is set almost entirely by curvature drop — the same in every direction. It
+  draws as a dead-flat, fully hazed line across the sky. At `range: 100000`
+  the same view layers cleanly instead.
+- **It is free.** The marcher walks the same rays and reads the same samples
+  either way — measured at 118 566 000 samples for `depth_lift` 0, 1.5 and 3
+  alike, with the render times inside run-to-run noise. Only the arithmetic
+  deciding where a sample lands changes.
+
+There is no variant that lifts the picture while keeping true visibility. It
+was built, and it does not work: the lift opens a vertical gap between a near
+crest and the range behind it, the renderer has nothing to put in that gap but
+a stretched copy of the far surface, and distant ranges come out as flat-topped
+slabs with vertical sides — taller the more lift is asked for. The only honest
+filling for that gap is the terrain genuinely behind the crest, which is what
+the lift does now.
+
 ## Queueing and cancellation
 
 **One render at a time.** A single render already saturates nine of twelve
@@ -307,6 +356,7 @@ density, and it costs the server nothing.
   "altitude": -1.09,
   "x": 326.4, "y": 181.8,
   "visible": true,
+  "revealed": false,
   "dominance": 412.8
 }
 ```
@@ -318,8 +368,9 @@ density, and it costs the server nothing.
 | `ele` | elevation from the DTM — **prefer this**, OSM's `ele` is unreliable |
 | `distance` | metres, great-circle |
 | `azimuth` | degrees clockwise from north |
-| `altitude` | degrees above horizontal from the eye, including curvature and refraction |
-| `x`, `y` | position in the image, **output pixels**, origin top-left |
+| `altitude` | degrees above horizontal from the eye, including curvature and refraction — the true angle, unaffected by `depth_lift` |
+| `x`, `y` | position in the image, **output pixels**, origin top-left — `y` *does* follow `depth_lift`, so place labels by this, not by `altitude` |
+| `revealed` | `true` where `depth_lift` is what brought the summit into view: it is drawn and labelled, but the eye could not see it from here. Always `false` without a lift |
 | `dominance` | **metres** the summit stands above the terrain around it, **signed** |
 
 This is what makes a summit worth a label: one standing clear of its
@@ -646,6 +697,13 @@ radius to 0 to disable, and expect summit views to suffer.
 **Sub-pixel viewpoint accuracy matters on peaks.** A few metres off a summit
 can place terrain above the eye. When a user taps a named peak, resolve to the
 local maximum rather than passing the tapped coordinate through.
+
+**`depth_lift` breaks the "you can see this" promise.** With a lift the render
+is a drawing, not a photograph: labelled peaks marked `revealed` are hidden
+from the actual viewpoint, and the depth buffer describes where terrain was
+*drawn*, so a pixel's distance no longer implies a clear line of sight to it.
+Anything doing "what can I see from here" should ask
+[`/viewshed`](#post-viewshed) or render without a lift.
 
 **A 360° image is 7200 px wide** at the default step, which can exceed texture
 and canvas limits on older mobile GPUs. Either request `step: 0.1` (3600 px) or

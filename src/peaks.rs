@@ -37,6 +37,13 @@ pub struct Peak {
     pub x: f64,
     pub y: f64,
     pub visible: bool,
+    /// Set where `depth_lift` is what put the summit in view: it is drawn,
+    /// and labelled, but the eye could not see it from here.
+    ///
+    /// Separate from `visible` rather than folded into it because the two
+    /// answer different questions and clients want both -- the label has to be
+    /// placed either way, and only this says whether to mark it as inferred.
+    pub revealed: bool,
     /// How far the summit stands above the terrain beside it at its own depth,
     /// in metres, negative where its own ridge stands over it. Measured from
     /// every elevation the marcher sampled, so hidden ground still counts;
@@ -107,6 +114,7 @@ pub fn load(path: &Path, lon: f64, lat: f64, range: f64) -> Result<Vec<Peak>> {
             x: 0.0,
             y: 0.0,
             visible: false,
+            revealed: false,
             dominance: 0.0,
             column: None,
         });
@@ -181,6 +189,7 @@ mod tests {
             x: 0.0,
             y,
             visible,
+            revealed: false,
             dominance,
             column,
         }

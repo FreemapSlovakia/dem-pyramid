@@ -105,6 +105,65 @@ pub struct Params {
     /// `DEFAULT_DITHER`. 0 turns it off, which is how to tell dithering apart
     /// from anything else in a gradient.
     pub dither_strength: f64,
+
+    /// Degrees to raise terrain by, at `max_range`, growing linearly with
+    /// distance. 0 is the true projection.
+    ///
+    /// Distance compresses a panorama into its horizon: from a summit the
+    /// nearest ridge can span twenty degrees while a range four times as far
+    /// away, and just as tall, gets two. Lifting by depth unfolds that, which
+    /// is what hand-drawn panoramas have always done -- the price being that
+    /// the picture stops being a photograph of anything. Ground the eye
+    /// cannot see comes into view, and the peaks standing on it come back
+    /// flagged `revealed`.
+    ///
+    /// It has to decide occlusion, not just placement. The lift is a warp of
+    /// the world -- every point rises in proportion to its distance -- so
+    /// visibility belongs to the warped world too. Displacing pixels while
+    /// leaving visibility in the true world was tried and is incoherent: the
+    /// lift opens a gap between a near crest and the range behind it, the
+    /// band fill has nothing to put there but a stretched copy of the far
+    /// surface, and distant ranges come out as flat-topped slabs with
+    /// vertical sides, growing taller the more lift is asked for.
+    ///
+    /// Linear in distance because the alternative is worse: any curve steep
+    /// near the eye tears the foreground apart, and the eye reads absolute
+    /// separation between ranges rather than the rate it grows at. The
+    /// horizon moves by exactly this much, so the frame usually wants
+    /// `alt_max` raised to match or the far ridges climb out of it.
+    pub depth_lift: f64,
+}
+
+/// The horizon a probe found, twice over.
+///
+/// Two, because a lift makes the question ambiguous: the terrain that occludes
+/// in the drawing is not the terrain that occludes in the world. `drawn`
+/// decides what the render shows and `real` what the eye could actually see.
+/// They are the same wherever `depth_lift` is 0.
+#[derive(Clone, Copy)]
+struct Horizon {
+    drawn: f64,
+    real: f64,
+}
+
+/// Whether `alt` clears the horizon its two bracketing rays reported.
+///
+/// Three states per side, and conflating any two of them is a bug. NaN: no ray
+/// answered, so the peak is outside the rendered arc. NEG_INFINITY: a ray
+/// answered but found no ground at all before the peak -- nodata or outside
+/// coverage, not open sky. Finite: a real horizon.
+///
+/// Only two finite horizons may be interpolated. Lerping a real one against a
+/// no-coverage ray would average a blocking ridge with a hole and let a hidden
+/// peak through, so where one side has no coverage the side that does decides
+/// -- and where neither does, no ground was found to block anything.
+fn clears(alt: f64, h0: f64, h1: f64, t: f64) -> bool {
+    match (h0.is_finite(), h1.is_finite()) {
+        (true, true) => alt >= h0 + (h1 - h0) * t,
+        (true, false) => alt >= h0,
+        (false, true) => alt >= h1,
+        (false, false) => !(h0.is_nan() && h1.is_nan()),
+    }
 }
 
 /// One pyramid level, with a block cache over its GTI index.
@@ -499,7 +558,7 @@ fn march_ray(
     finest: u32,
     col: &mut Column,
     probe_d: &[f64],
-    probe_h: &mut Vec<f64>,
+    probe_h: &mut Vec<Horizon>,
     profile: Option<(&mut Profile, usize)>,
 ) -> usize {
     let (mut profile, profile_col) = match profile {
@@ -512,10 +571,23 @@ fn march_ray(
     // NEG_INFINITY carries "this ray found no ground at all before here" all
     // the way to the caller, which must not confuse it with a low horizon:
     // it means no coverage, not open sky.
-    probe_h.resize(probe_d.len(), f64::NEG_INFINITY);
+    probe_h.resize(
+        probe_d.len(),
+        Horizon {
+            drawn: f64::NEG_INFINITY,
+            real: f64::NEG_INFINITY,
+        },
+    );
     let mut probe_i = 0usize;
     let mut samples = 0usize;
     let mut max_alpha = f64::NEG_INFINITY;
+    // The horizon geometry alone would give. Tracked always rather than only
+    // when the lift reveals: it costs one comparison per sample, and the
+    // branch it would save sits in the hottest loop in the program.
+    let mut max_real = f64::NEG_INFINITY;
+    // Degrees of lift per metre of distance. Hoisted because `max_range` is
+    // fixed for the render and the division is not.
+    let lift_per_m = p.depth_lift / p.max_range;
     // Row 0 is the top of the frame, so a larger angle means a smaller row
     // index. `filled_from` is the topmost row already written; a new maximum
     // fills the band [row_new, filled_from) and moves the boundary up.
@@ -533,7 +605,10 @@ fn march_ray(
         // a geometric statement, where the old distance comparison needed a
         // fudge factor -- which was wrong three times over.
         while probe_i < probe_d.len() && probe_d[probe_i] <= d + step {
-            probe_h[probe_i] = max_alpha;
+            probe_h[probe_i] = Horizon {
+                drawn: max_alpha,
+                real: max_real,
+            };
             probe_i += 1;
         }
 
@@ -550,13 +625,28 @@ fn march_ray(
             }
             let drop = curvature_drop(d);
             let alpha = ((h - eye - drop) / d).atan().to_degrees();
+            if alpha > max_real {
+                max_real = alpha;
+            }
+            // Occlusion is decided on the lifted angle, which is what makes
+            // hidden ground appear: the far surface is compared against the
+            // near ridge after both have been raised, and being farther it is
+            // raised more. Deciding it on `alpha` instead -- lifting only
+            // where a sample lands -- opens a gap at every crest that the
+            // band fill can only paper over, and the far ranges come out as
+            // slabs.
+            //
+            // Accepted samples march monotonically up the frame, which is
+            // what the band fill below relies on: the test makes `alpha +
+            // lift` rise, and rows follow it.
+            let drawn = alpha + lift_per_m * d;
 
-            if alpha > max_alpha {
-                max_alpha = alpha;
+            if drawn > max_alpha {
+                max_alpha = drawn;
                 // The band's top edge lands at a fractional row; keeping that
                 // fraction as coverage is what antialiases the horizon, and it
                 // costs nothing since alpha is already a float.
-                let f = ((p.alt_max - alpha) / alt_step).max(0.0);
+                let f = ((p.alt_max - drawn) / alt_step).max(0.0);
                 if f < filled_from as f64 {
                     let full_start = f.ceil() as usize;
                     // Rows between two *consecutive* samples show terrain
@@ -600,7 +690,10 @@ fn march_ray(
     // Past the last sample, or out the early exit once the column filled:
     // whatever the horizon had reached stands for everything beyond.
     for h in &mut probe_h[probe_i..] {
-        *h = max_alpha;
+        *h = Horizon {
+            drawn: max_alpha,
+            real: max_real,
+        };
     }
     samples
 }
@@ -1036,7 +1129,12 @@ pub fn render(
 
             let off = (pk.azimuth - p.az_start).rem_euclid(360.0);
             pk.x = off / p.step_deg;
-            pk.y = (p.alt_max - pk.altitude) / p.step_deg;
+            // Lifted by the same rule the marcher lifts its samples by, or the
+            // labels float free of the summits they name. `altitude` itself
+            // stays the true elevation angle -- it is a fact about the
+            // landscape, where `y` is a position in a picture.
+            pk.y = (p.alt_max - (pk.altitude + p.depth_lift * pk.distance / p.max_range))
+                / p.step_deg;
             // Sub-column, not output column, and bounded against the ray count
             // rather than az_span: out_w rounds, so the image can cover
             // slightly more or less than the requested fov, and only the rays
@@ -1106,7 +1204,7 @@ pub fn render(
         sky: usize,
         /// Peak index, which bracketing ray this was, and that ray's horizon
         /// angle at the peak's distance.
-        answers: Vec<(usize, u8, f64)>,
+        answers: Vec<(usize, u8, Horizon)>,
         profile: Profile,
     }
     let parts: Vec<ChunkOut> = (0..out_w)
@@ -1118,9 +1216,9 @@ pub fn render(
             let mut pyr = Pyramid::open(root, doc)?;
             let mut pixels = vec![[0u8; 3]; cols * out_h];
             let mut depth = vec![0u16; cols * out_h];
-            let mut peak_results: Vec<(usize, u8, f64)> = Vec::new();
+            let mut peak_results: Vec<(usize, u8, Horizon)> = Vec::new();
             let mut probe_d: Vec<f64> = Vec::new();
-            let mut probe_h: Vec<f64> = Vec::new();
+            let mut probe_h: Vec<Horizon> = Vec::new();
             // Only dominance reads it, so a plain image render neither
             // allocates it nor pays a bin lookup per marched sample.
             let mut profile = Profile::new(if want_peaks { cols } else { 0 });
@@ -1225,7 +1323,11 @@ pub fn render(
     let mut sky = 0usize;
     let mut cells = 0usize;
     // Horizon angle from each bracketing ray, per peak.
-    let mut horizon = vec![[f64::NAN; 2]; peaks.len()];
+    let nowhere = Horizon {
+        drawn: f64::NAN,
+        real: f64::NAN,
+    };
+    let mut horizon = vec![[nowhere; 2]; peaks.len()];
     let mut profile = Profile::new(if want_peaks { out_w } else { 0 });
     for part in parts {
         let ChunkOut {
@@ -1268,22 +1370,15 @@ pub fn render(
     for (i, pk) in peaks.iter_mut().enumerate() {
         let [h0, h1] = horizon[i];
         let t = blend[i];
-        // Three states, and conflating any two of them is a bug. NaN: no ray
-        // answered, so the peak is outside the rendered arc. NEG_INFINITY: a
-        // ray answered but found no ground at all before the peak -- nodata or
-        // outside coverage, not open sky. Finite: a real horizon.
-        //
-        // Only two finite horizons may be interpolated. Lerping a real one
-        // against a no-coverage ray would average a blocking ridge with a
-        // hole and let a hidden peak through, so where one side has no
-        // coverage the side that does decides -- and where neither does, no
-        // ground was found to block anything.
-        pk.visible = match (h0.is_finite(), h1.is_finite()) {
-            (true, true) => pk.altitude >= h0 + (h1 - h0) * t,
-            (true, false) => pk.altitude >= h0,
-            (false, true) => pk.altitude >= h1,
-            (false, false) => !(h0.is_nan() && h1.is_nan()),
-        };
+        // Against the same angle the marcher occluded by, so a peak is kept
+        // exactly when the render drew its summit.
+        let lifted = pk.altitude + p.depth_lift * pk.distance / p.max_range;
+        pk.visible = clears(lifted, h0.drawn, h1.drawn, t);
+        // Asked of the true geometry, so it answers the question a reader of
+        // the picture would ask: is that summit actually in sight from here,
+        // or has the drawing lifted it out from behind something? Always false
+        // without a lift, since the two horizons are then the same.
+        pk.revealed = pk.visible && !clears(pk.altitude, h0.real, h1.real, t);
     }
 
     // Dominance reads across columns, so it waits until they are merged.
@@ -1413,16 +1508,26 @@ pub fn parse_colour(s: &str) -> Result<(f64, f64, f64)> {
 /// column height for every edge in the frame.
 pub const MAX_RIDGE_WIDTH: f64 = 20.0;
 
+/// Most the far horizon may be lifted by, degrees.
+///
+/// Well past useful -- a few degrees already reads as a strong effect against
+/// a thirty-degree frame -- and it is a bound rather than a taste: the band
+/// fill assumes drawn angles rise with distance, which holds for any lift that
+/// does not fall, and the frame has to stay somewhere near ninety degrees for
+/// the row arithmetic to mean anything.
+pub const MAX_DEPTH_LIFT: f64 = 45.0;
+
 /// Reject styling the renderer cannot draw, before it reaches the hot loop.
 ///
 /// Shared so the CLI cannot do what the server refuses: `--ridge-width 1e9`
 /// used to make the ink pass span the whole column for every edge, which reads
 /// as a hang and paints a solid slab, while the same value over HTTP was a
 /// clean 400.
-pub fn validate_style(ridge_strength: f64, ridge_width: f64) -> Result<()> {
+pub fn validate_style(ridge_strength: f64, ridge_width: f64, depth_lift: f64) -> Result<()> {
     for (name, v) in [
         ("ridge_strength", ridge_strength),
         ("ridge_width", ridge_width),
+        ("depth_lift", depth_lift),
     ] {
         anyhow::ensure!(v.is_finite(), "{name} must be a finite number");
     }
@@ -1433,6 +1538,15 @@ pub fn validate_style(ridge_strength: f64, ridge_width: f64) -> Result<()> {
     anyhow::ensure!(
         (0.0..=MAX_RIDGE_WIDTH).contains(&ridge_width),
         "ridge_width must lie within 0..{MAX_RIDGE_WIDTH}"
+    );
+    // Negative is refused rather than clamped because it is not merely
+    // useless: a lift that shrinks with distance can place a farther sample
+    // *below* the nearer one it stands over, and the band fill -- which walks
+    // the frame upwards and never revisits a row -- would drop it, leaving
+    // sky where terrain is.
+    anyhow::ensure!(
+        (0.0..=MAX_DEPTH_LIFT).contains(&depth_lift),
+        "depth_lift must lie within 0..{MAX_DEPTH_LIFT}"
     );
     Ok(())
 }
@@ -1835,5 +1949,86 @@ mod tests {
             prev = z;
             d *= 1.2;
         }
+    }
+
+    // ---- depth lift -------------------------------------------------------
+
+    /// The band fill walks the frame upwards and never revisits a row, so a
+    /// sample accepted after another must also *draw* above it. Occlusion
+    /// guarantees the true angle rises; this asserts the lift cannot undo
+    /// that, which is the whole reason a falling lift is refused.
+    #[test]
+    fn lift_preserves_the_order_the_band_fill_needs() {
+        let max_range = 300_000.0;
+        for lift in [0.0, 0.5, 3.0, MAX_DEPTH_LIFT] {
+            let per_m = lift / max_range;
+            // A ray that keeps just barely clearing its own horizon: the
+            // hardest case, since a lift only has to survive ties.
+            let mut prev = f64::NEG_INFINITY;
+            let mut d = 10.0;
+            let mut alpha = -5.0;
+            while d < max_range {
+                let drawn = alpha + per_m * d;
+                assert!(
+                    drawn > prev,
+                    "lift {lift} put d = {d} at {drawn}, below {prev}"
+                );
+                prev = drawn;
+                alpha += 1e-9;
+                d *= 1.05;
+            }
+        }
+    }
+
+    /// Zero must be the true projection, bit for bit -- the default has to
+    /// leave every existing render untouched.
+    #[test]
+    fn zero_lift_moves_nothing() {
+        let per_m = 0.0 / 300_000.0;
+        for d in [10.0, 5_000.0, 120_000.0, 300_000.0] {
+            assert_eq!(3.25 + per_m * d, 3.25, "zero lift moved d = {d}");
+        }
+    }
+
+    /// The horizon rises by exactly `depth_lift` and the eye by nothing, which
+    /// is what the caller is told when deciding how much `alt_max` to add.
+    #[test]
+    fn lift_spans_zero_to_the_full_amount() {
+        let (lift, max_range): (f64, f64) = (4.0, 250_000.0);
+        let per_m = lift / max_range;
+        assert!((per_m * max_range - lift).abs() < 1e-12);
+        assert!(per_m * 0.0 == 0.0);
+        // Linear, so the halfway distance gets exactly half.
+        assert!((per_m * (max_range / 2.0) - lift / 2.0).abs() < 1e-12);
+    }
+
+    /// Three states per side, and the reason `clears` exists is that the
+    /// visible and revealed answers must not spell them out twice.
+    #[test]
+    fn a_missing_ray_is_not_a_low_horizon() {
+        let n = f64::NEG_INFINITY;
+        // No coverage either side: nothing was found to block anything.
+        assert!(clears(-9.0, n, n, 0.5));
+        // Out of frame entirely: no ray answered, so nothing is visible.
+        assert!(!clears(90.0, f64::NAN, f64::NAN, 0.5));
+        // One side has coverage; it decides alone rather than being averaged
+        // against a hole.
+        assert!(!clears(1.0, 5.0, n, 0.5));
+        assert!(clears(6.0, 5.0, n, 0.5));
+        // Two real horizons interpolate.
+        assert!(clears(3.1, 2.0, 4.0, 0.5));
+        assert!(!clears(2.9, 2.0, 4.0, 0.5));
+    }
+
+    /// A falling lift would leave sky where terrain is; it has to be refused
+    /// rather than clamped, and both front-ends share the rule.
+    #[test]
+    fn a_lift_that_falls_with_distance_is_refused() {
+        assert!(validate_style(1.0, 1.0, 0.0).is_ok());
+        assert!(validate_style(1.0, 1.0, MAX_DEPTH_LIFT).is_ok());
+        assert!(validate_style(1.0, 1.0, -0.1).is_err());
+        assert!(validate_style(1.0, 1.0, MAX_DEPTH_LIFT + 0.1).is_err());
+        assert!(validate_style(1.0, 1.0, f64::NAN).is_err());
+        assert!(validate_style(1.0, 1.0, f64::INFINITY).is_err());
     }
 }

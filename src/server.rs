@@ -123,6 +123,15 @@ pub struct Request {
     /// whether a gradient artefact is dithering or something else.
     #[serde(default = "d_dither")]
     dither_strength: f64,
+    /// Degrees of extra elevation given to terrain at `range`, tapering to
+    /// nothing at the viewpoint. Spreads out distance that the true projection
+    /// compresses into the horizon. 0, the default, is the true projection.
+    ///
+    /// Terrain rises clear of what hides it, so ground the eye cannot see
+    /// comes into view and the picture stops being a photograph. Peaks that
+    /// only appear this way come back with `revealed: true`.
+    #[serde(default)]
+    depth_lift: f64,
 }
 
 #[derive(Deserialize, Clone, Copy, Default, PartialEq)]
@@ -401,7 +410,7 @@ async fn panorama_route(
             return bad(format!("{name} must be a finite number"));
         }
     }
-    if let Err(e) = panorama::validate_style(req.ridge_strength, req.ridge_width) {
+    if let Err(e) = panorama::validate_style(req.ridge_strength, req.ridge_width, req.depth_lift) {
         return bad(e.to_string());
     }
     if !(-90.0..=90.0).contains(&req.alt_min) || !(-90.0..=90.0).contains(&req.alt_max) {
@@ -463,6 +472,7 @@ async fn panorama_route(
         ridge_colour,
         ground_colour,
         dither_strength: req.dither_strength.clamp(0.0, 8.0),
+        depth_lift: req.depth_lift,
     };
 
     let cancel = Cancel::default();
