@@ -118,7 +118,8 @@ pub struct Request {
     #[serde(default = "d_min_dom")]
     min_dominance: f64,
     /// Keep at most this many peaks, most label-worthy first -- dominance
-    /// discounted by distance, see `peak_rank_power`. 0 is no cap.
+    /// discounted by distance, or by `peak_rank` if one is given. 0 is no cap,
+    /// and no cap is the simplest correct answer -- see the docs.
     #[serde(default)]
     max_peaks: usize,
     /// Multiplier on the ridge silhouettes; 0 removes them.
@@ -158,24 +159,17 @@ pub struct Request {
     /// the default.
     #[serde(default = "d_true")]
     revealed_peaks: bool,
-    /// Exponent on distance when `max_peaks` decides which summits to keep.
-    /// 0 ranks on dominance alone, which is what this did before.
-    #[serde(default = "d_rank_power")]
-    peak_rank_power: f64,
-    /// Degrees per column of the grid `dominance` is measured on, independent
-    /// of `step` and `supersample_x`. Held to the ray spacing if finer; the
-    /// value used comes back as `meta.peak_profile_step`.
-    #[serde(default = "d_profile_step")]
-    peak_profile_step: f64,
     /// Formula deciding which summits `max_peaks` keeps, as a MapLibre-shaped
-    /// JSON prefix expression. Overrides `peak_rank_power`. See `rank`.
+    /// JSON prefix expression. See `rank`.
+    ///
+    /// This is the only ranking knob. `peak_rank_power` used to sit beside it
+    /// and was strictly subsumed -- the expression reproduces it exactly, and
+    /// a test pins that -- so two parameters were doing one job.
     #[serde(default)]
     peak_rank: Option<serde_json::Value>,
 }
 
 fn d_true() -> bool { true }
-fn d_rank_power() -> f64 { peaks::DEFAULT_RANK_POWER }
-fn d_profile_step() -> f64 { panorama::DEFAULT_PROFILE_STEP }
 fn d_gamma() -> f64 { 1.0 }
 
 #[derive(Deserialize, Clone, Copy, Default, PartialEq)]
@@ -477,7 +471,6 @@ async fn panorama_route(
         ("range", req.range),
         ("min_dominance", req.min_dominance),
         ("dither_strength", req.dither_strength),
-        ("peak_rank_power", req.peak_rank_power),
     ] {
         if !v.is_finite() {
             return bad(format!("{name} must be a finite number"));
@@ -487,17 +480,9 @@ async fn panorama_route(
         req.ridge_strength,
         req.ridge_width,
         req.depth_lift,
-        req.peak_profile_step,
+        panorama::DEFAULT_PROFILE_STEP,
     ) {
         return bad(e.to_string());
-    }
-    if !(0.0..=peaks::MAX_RANK_POWER).contains(&req.peak_rank_power) {
-        // Negative would invert the weighting -- distance would *raise* a
-        // score -- and quietly return the most remote summits in the data.
-        return bad(format!(
-            "peak_rank_power must lie within 0..{}",
-            peaks::MAX_RANK_POWER
-        ));
     }
     if !(-90.0..=90.0).contains(&req.alt_min) || !(-90.0..=90.0).contains(&req.alt_max) {
         return bad("alt_min and alt_max must lie within -90..90");
@@ -559,7 +544,11 @@ async fn panorama_route(
         ground_colour,
         dither_strength: req.dither_strength.clamp(0.0, 8.0),
         depth_lift: req.depth_lift,
-        peak_profile_step: req.peak_profile_step,
+        // Not a request field. It is the resolution `dominance` is measured
+        // at, which exists so two renders of one viewpoint agree -- and the
+        // default already achieves that, so exposing it only invited a client
+        // to break it.
+        peak_profile_step: panorama::DEFAULT_PROFILE_STEP,
     };
 
     let cancel = Cancel::default();
@@ -592,7 +581,7 @@ async fn panorama_route(
     let min_dom = req.min_dominance;
     let max_peaks = req.max_peaks;
     let keep_revealed = req.revealed_peaks;
-    let rank_power = req.peak_rank_power;
+    let rank_power = peaks::DEFAULT_RANK_POWER;
     // Compiled here, before a render slot is taken, so a bad formula costs the
     // caller a 400 rather than costing everyone twenty seconds of queue.
     let rank = match &req.peak_rank {

@@ -53,9 +53,7 @@ All fields except `lon` and `lat` are optional.
 | `ground_color` | string | `#3a4a34` | near-terrain colour, before haze |
 | `depth_lift` | number | `0` | degrees of extra elevation at `range`, tapering to nothing at the eye (0–45); see [Depth lift](#depth-lift) |
 | `revealed_peaks` | bool | `true` | let summits only `depth_lift` brought into view take label slots |
-| `peak_rank_power` | number | `0.5` | exponent on distance in the `max_peaks` cut (0–4); `0` ranks on raw dominance |
-| `peak_profile_step` | number | `0.2` | degrees per column of the grid `dominance` is measured on (0.02–2), independent of `step` and `supersample_x`; held to the ray spacing if finer |
-| `peak_rank` | expression | — | formula deciding which summits `max_peaks` keeps; see [Ranking formula](#ranking-formula). Overrides `peak_rank_power` |
+| `peak_rank` | expression | — | formula deciding which summits `max_peaks` keeps; see [Ranking formula](#ranking-formula). Not needed unless you cap |
 
 Image dimensions follow from the angles:
 
@@ -381,9 +379,9 @@ That is why `meta` can be `JSON.parse`d directly.
 ```
 
 `depth` is `null` unless requested. `eye_elevation` is metres above sea level,
-already including `eye`. `peak_profile_step` is the grid `dominance` was
-measured on — the requested value, or the ray spacing where that was coarser.
-Two requests return the same peaks only if they agree here.
+already including `eye`. `peak_profile_step` reports the grid `dominance` was
+measured on; it is fixed, and is here only so a client rendering a view twice
+can assert the two agree rather than assume it.
 
 ### Peaks
 
@@ -401,12 +399,11 @@ kilometres away, while the near one fills more of the frame and is what a
 viewer is looking at. The cut therefore orders by
 
 ```
-rank = dominance / distance ** peak_rank_power     where dominance >= 0
-rank = dominance * distance ** peak_rank_power     where dominance <  0
+rank = dominance / distance ** 0.5     where dominance >= 0
+rank = dominance * distance ** 0.5     where dominance <  0
 ```
 
-with `peak_rank_power` defaulting to `0.5`. **`peak_rank_power: 0` gives the
-old ordering exactly** — raw dominance, both branches collapsing to it.
+unless `peak_rank` says otherwise.
 
 The two branches are not a quirk. Dominance is signed, and dividing a negative
 by a larger number *raises* it, so a single expression that penalises a distant
@@ -418,8 +415,15 @@ it inside a `max_peaks: 2000` cut.
 
 #### Ranking formula
 
-`peak_rank_power` is a single knob, and with `prominence` alongside `dominance`
-there is no single number that says how the two should be weighed. So the
+**You probably do not need this.** The whole apparatus exists because
+`max_peaks` truncates, and truncation is the only reason the server's opinion
+about ranking matters at all. Peaks cost about **58 bytes each on the wire**
+after rounding and gzip, so an uncapped 2631-peak view is ~153 KB — two map
+tiles. **Send `max_peaks: 0`, rank client-side, and none of this applies.**
+
+If you do cap, the cut has to use *your* criterion or it discards exactly what
+you would have kept, and no re-ranking afterwards recovers it. One number
+cannot express how `dominance` and `prominence` should be weighed. So the
 formula can come in the request:
 
 ```jsonc
@@ -513,11 +517,8 @@ not happen at any cap, because the weighting already pushes deeply negative
 scores down, which is the same direction the threshold cuts in.
 
 `dominance` itself is untouched in the payload, so a client is free to re-rank
-however it likes — the ordering only decides *which* peaks survive to be sent.
-If your client uses its own exponent, send the same one here so the cut and the
-re-rank agree. Raising the exponent favours the near field steadily: on that
-same view the top moves 2471 → 2249 → 1966 → 1647 → 1419 for
-`peak_rank_power` 0 → 0.25 → 0.5 → 0.75 → 1.
+however it likes — the ordering only decides *which* peaks survive to be sent,
+and with `max_peaks: 0` it decides nothing at all.
 
 ```json
 {
@@ -624,9 +625,9 @@ still see churn in the tail.
 
 #### Progressive rendering
 
-Both passes must agree about `peak_profile_step`, which they do by default. If
-you set it, set it identically — and `meta.peak_profile_step` reports the value
-actually used, so a client can assert rather than assume.
+Both passes measure `dominance` on the same fixed grid, so they agree about it
+whatever quality you ask for. `meta.peak_profile_step` reports that grid, so a
+client can assert rather than assume.
 
 Asking for peaks on **one** pass only is still the strongest guarantee, and it
 takes the peak work off the expensive render:
@@ -1085,8 +1086,7 @@ Most out-of-range numbers are clamped rather than rejected — `range`, `fov`,
 `step`, the supersampling factors, `eye_search_radius`, `dither_strength`. The
 exceptions are the ones where silently rewriting the request would hide a real
 mistake, and they answer `400` naming the field: `alt_min` or `alt_max` outside
-−90–90, `depth_lift` outside 0–45, `peak_rank_power` outside 0–4,
-`peak_profile_step` outside 0.02–2, `ridge_width` outside 0–20, a negative
+−90–90, `depth_lift` outside 0–45, `ridge_width` outside 0–20, a negative
 `ridge_strength`, a malformed colour,
 and a non-finite value in any numeric field — though the JSON parser refuses
 `NaN` and `Infinity` before the check ever sees them, so that one is belt and
