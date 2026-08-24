@@ -59,7 +59,7 @@ OUT="$WORK/out-eu"
 ISO="$WORK/iso-eu"
 
 step_tile() {
-	mkdir -p "$HGT"
+	mkdir -p "$HGT" "$HGT/.staging"
 	local lat lon f n=0 skipped=0
 	for ((lat = S; lat < N; lat++)); do
 		for ((lon = W; lon < E; lon++)); do
@@ -81,23 +81,41 @@ step_tile() {
 			# shifts samples by up to half a pixel either way, and a shifted
 			# true elevation beats a smoothed summit when what matters is the
 			# height of cols and tops.
-			# Written under a temporary name and moved into place, so an
-			# interrupted run leaves no half-tile behind to be trusted later.
-			# SRTMHGT derives its geotransform from the filename, so the temp
-			# name has to keep it -- hence a suffix rather than a prefix.
-			gdal_translate -q -projwin "$lon" $((lat + 1)) $((lon + 1)) "$lat" \
-				-outsize 3601 3601 -r near -ot Int16 -a_nodata -32768 \
-				-of SRTMHGT "$SRC" "$f.part" 2>/dev/null || {
+			# gdalwarp rather than gdal_translate, and the -srcnodata pair is
+			# the whole reason. GEDTM30 marks absent data with the float
+			# maximum, 3.4e38; `gdal_translate -ot Int16` saturates that to
+			# 32767, so every ocean pixel became a 32 km peak. It fails
+			# quietly and completely: the fake plateau outranks every real
+			# mountain, so it becomes the root of the divide tree and every
+			# prominence in Europe is measured against it. The merge crashed
+			# before it ever produced a number, which was luck.
+			#
+			# `-dstnodata 0` is asked for and not obeyed: the SRTMHGT driver
+			# writes -32768, the SRTM void, whatever it is told. Left that way
+			# after checking what reads it -- hgt_loader maps -32768 onto
+			# Tile::NODATA_ELEVATION, so the sea is missing data rather than a
+			# 32 km-deep hole, and an island becomes its own landmass whose
+			# high point takes prominence equal to its elevation. That is the
+			# right answer: Etna's prominence really is its full 3357 m. The
+			# flag stays because it costs nothing and states the intent.
+			#
+			# Staged through a directory rather than a filename suffix:
+			# SRTMHGT derives its geotransform from the name and warns, or
+			# outright refuses, when the extension is not .hgt.
+			gdalwarp -q -te "$lon" "$lat" $((lon + 1)) $((lat + 1)) \
+				-ts 3601 3601 -r near -ot Int16 \
+				-srcnodata 3.4028234663852886e+38 -dstnodata 0 \
+				-of SRTMHGT "$SRC" "$HGT/.staging/$(basename "$f")" 2>/dev/null || {
 				echo "warning: no data for $f, skipping" >&2
-				rm -f "$f.part"
+				rm -f "$HGT/.staging/$(basename "$f")"
 				continue
 			}
-			if [ "$(stat -c%s "$f.part")" != "$TILE_BYTES" ]; then
-				echo "warning: $f came out $(stat -c%s "$f.part") bytes, discarding" >&2
-				rm -f "$f.part"
+			if [ "$(stat -c%s "$HGT/.staging/$(basename "$f")")" != "$TILE_BYTES" ]; then
+				echo "warning: $f came out the wrong size, discarding" >&2
+				rm -f "$HGT/.staging/$(basename "$f")"
 				continue
 			fi
-			mv "$f.part" "$f"
+			mv "$HGT/.staging/$(basename "$f")" "$f"
 			n=$((n + 1))
 		done
 	done

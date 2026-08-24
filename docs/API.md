@@ -658,7 +658,7 @@ Mercator, centred on the viewpoint, transparent where nothing is visible.
 | field | type | default | meaning |
 |---|---|---|---|
 | `lon`, `lat` | number | — | viewpoint |
-| `radius` | number | `30000` | how far to look, ground metres (max 200 000) |
+| `radius` | number | `30000` | how far to look, ground metres (max 300 000) |
 | `scale` | number | `20` | ground metres per pixel |
 | `eye` | number | `1.7` | eye height above ground |
 | `eye_search_radius` | number | `10` | as for panoramas |
@@ -672,7 +672,39 @@ Mercator, centred on the viewpoint, transparent where nothing is visible.
 `radius` and `scale` together fix the image size — `2 × radius / scale` on a
 side — and are **validated together**, because neither looks unreasonable
 alone: a 100 km radius is fine, 5 m per pixel is fine, and asking for both is a
-40000 × 40000 raster. The pair must come to no more than 24 M pixels.
+40000 × 40000 raster. The pair must come to no more than **96 M pixels**, which
+for a square image means **9797 px a side**.
+
+That is a total, not a side length, so it trades against `radius`:
+
+| `radius` | finest `scale` | image |
+|---|---|---|
+| 10 km | 2.05 m | 9756² |
+| 30 km (default) | **6.13 m** | 9788² |
+| 50 km | 10.2 m | 9804² |
+| 100 km | 20.4 m | 9804² |
+| 300 km (max) | 61.3 m | 9788² |
+
+**Set `scale` from the data, not from the cap.** The finest pyramid level is
+6.27 m of ground in the LiDAR countries and 30 m everywhere else, and the
+marcher steps by cell size — so anything finer is more pixels carrying no more
+information, at quadratic cost. Around 6–10 m is the useful floor over LiDAR,
+30 m for anything wide or outside the surveyed countries.
+
+Measured at these settings, warm:
+
+| request | wall | payload |
+|---|---|---|
+| 30 km @ 12.25 m | 9 s | 2.9 MB |
+| 30 km @ 6.1 m | 16 s | **9.1 MB** |
+| 100 km @ 20.5 m | 36 s | 6.4 MB |
+| 300 km @ 61.3 m | 19 s | 1.9 MB |
+
+**The payload is the real cost of a fine scale, not the compute.** A 30 km
+viewshed at 6.1 m is 9 MB — three times the 300 km one, because near terrain
+at full resolution is all edges and edges do not compress. Peak memory is about
+0.6 GB for a full-size raster, and renders are serialised, so that is one
+request's worth rather than everyone's.
 
 The response is the same multipart shape as a panorama: `meta` plus `image`.
 `meta.bounds` is `[west, south, east, north]` in degrees, which is what a

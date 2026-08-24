@@ -37,7 +37,16 @@ const MAX_SUPERSAMPLE: u32 = 9;
 const MIN_STEP: f64 = 0.02;
 /// Beyond this a viewshed is mostly answering questions about the curvature of
 /// the earth, and the cost grows with the square of it.
-const MAX_VIEWSHED_RADIUS: f64 = 200_000.0;
+const MAX_VIEWSHED_RADIUS: f64 = 300_000.0;
+/// Separate from `MAX_PIXELS`, which the panorama also uses. Four times it, so
+/// a viewshed of any given radius may be drawn at twice the resolution.
+///
+/// A square, so the linear factor is what a caller feels: at the cap the image
+/// is 9797 px a side. That costs about half a gigabyte to hold -- one byte per
+/// pixel of alpha while the rays run, four per pixel once it becomes RGBA --
+/// and renders are serialised, so the ceiling is one request's memory, not the
+/// sum of everyone's.
+const MAX_VIEWSHED_PIXELS: usize = 96_000_000;
 /// A warm tint that reads over both map and imagery; opacity carries the
 /// detail, so the colour is deliberately flat.
 const DEFAULT_VIEWSHED_COLOUR: (f64, f64, f64) = (255.0, 214.0, 102.0);
@@ -731,9 +740,11 @@ async fn viewshed_route(
     // reasonable, 5 m per pixel is reasonable, and asking for both is a
     // 40000 x 40000 raster.
     let px = viewshed::extent(req.radius, req.scale);
-    if px.checked_mul(px).is_none_or(|n| n > MAX_PIXELS) {
+    if px.checked_mul(px).is_none_or(|n| n > MAX_VIEWSHED_PIXELS) {
         return bad(format!(
-            "{px}x{px} exceeds the {MAX_PIXELS} pixel limit; raise scale or reduce radius"
+            "{px}x{px} is {} pixels, over the {MAX_VIEWSHED_PIXELS} limit; \
+             raise scale or reduce radius",
+            px.saturating_mul(px)
         ));
     }
 
