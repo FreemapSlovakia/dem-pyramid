@@ -42,7 +42,7 @@ All fields except `lon` and `lat` are optional.
 | `depth` | bool | `false` | include the distance buffer |
 | `depth_step` | int | `4` | depth quantisation; see [Depth](#depth) |
 | `peaks` | bool | `true` | include peak labels |
-| `min_dominance` | number | `30` | **deprecated** — use `peak_filter`; drop peaks standing less than this above their surroundings, metres |
+| `min_dominance` | number | `30`, or none if `peak_filter` is given | **deprecated** — use `peak_filter`; drop peaks standing less than this above their surroundings, metres |
 | `max_peaks` | int | `0` | keep at most this many, in `peak_rank` order; 0 is no cap |
 | `format` | string | `avif` | image encoding: `avif` or `png` |
 | `quality` | int | `95` | AVIF quality, 1–100; ignored for PNG |
@@ -411,10 +411,19 @@ reach stage 1 at all; that part is structural and not configurable.
 > | `"min_dominance": 30` | `"peak_filter": [">=", ["get","dominance"], 30]` |
 > | `"revealed_peaks": false` | `"peak_filter": ["==", ["get","revealed"], 0]` |
 >
-> Note that `min_dominance` **defaults to 30**, so it is filtering even when
-> you never mentioned it — at one 360° viewpoint that is 946 peaks returned
-> out of 2626 visible. To disable it while it still exists, send
-> `"min_dominance": -100000`.
+> Note that `min_dominance` **defaults to 30**, so it filters even when you
+> never mentioned it — at one 360° viewpoint that is 946 peaks returned out of
+> 2626 visible.
+>
+> **That default steps aside as soon as you send a `peak_filter`.** It has to:
+> the threshold is applied first, so a filter could otherwise only narrow what
+> survived it, and a filter asking for "a real mountain however it reads from
+> here" would never see the low-dominance peaks it exists to catch. Measured on
+> one 90° view: 89 peaks with no filter, **542** with `"peak_filter": 1`.
+>
+> An **explicit** `min_dominance` is still honoured beside a filter, and the
+> two intersect — sending `"min_dominance": 30` with that same filter returns
+> 89 again. So send it only if you mean it.
 
 #### What `max_peaks` keeps
 
