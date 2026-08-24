@@ -397,6 +397,20 @@ async fn panorama_route(
     // the product then wraps in release, so an absurd alt range sails past the
     // pixel limit and reaches the allocator -- one request aborting the
     // process on a service that is otherwise carefully bounded.
+    // Every numeric field, not only the ones feeding the pixel count.
+    //
+    // A guard rather than a live fix: serde_json refuses the `NaN` and
+    // `Infinity` literals and rejects out-of-range exponents, so today nothing
+    // gets a non-finite past the parser. It is cheap insurance on a property
+    // the geometry quietly depends on and the clamps do not provide -- a
+    // `f64::clamp` returns NaN for a NaN input, so an unchecked field would
+    // carry it straight into the marcher and answer 200 with an empty
+    // picture. The CLI, which parses with `f64::from_str` and accepts "NaN",
+    // does exactly that: `--range NaN` renders 100% sky and exits 0.
+    //
+    // Cheaper here than a debate later about whether some future entry point
+    // -- a different body format, a query string, an internal caller -- has
+    // the same parser guarantees.
     for (name, v) in [
         ("lon", req.lon),
         ("lat", req.lat),
@@ -405,6 +419,11 @@ async fn panorama_route(
         ("step", req.step),
         ("alt_min", req.alt_min),
         ("alt_max", req.alt_max),
+        ("eye", req.eye),
+        ("eye_search_radius", req.eye_search_radius),
+        ("range", req.range),
+        ("min_dominance", req.min_dominance),
+        ("dither_strength", req.dither_strength),
     ] {
         if !v.is_finite() {
             return bad(format!("{name} must be a finite number"));

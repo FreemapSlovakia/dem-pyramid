@@ -675,7 +675,14 @@ so it can be panned continuously or tiled as a cylinder.
 | `500` | render failed — most often the viewpoint has no elevation data |
 | `503` | shutting down |
 
-Out-of-range numeric parameters are clamped rather than rejected.
+Most out-of-range numbers are clamped rather than rejected — `range`, `fov`,
+`step`, the supersampling factors, `eye_search_radius`, `dither_strength`. The
+exceptions are the ones where silently rewriting the request would hide a real
+mistake, and they answer `400` naming the field: `depth_lift` outside 0–45,
+`ridge_width` outside 0–20, a negative `ridge_strength`, a malformed colour,
+and a non-finite value in any numeric field — though the JSON parser refuses
+`NaN` and `Infinity` before the check ever sees them, so that one is belt and
+braces rather than something you can trigger.
 
 ## Caveats worth surfacing to users
 

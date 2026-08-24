@@ -134,6 +134,26 @@ pub struct Params {
     pub depth_lift: f64,
 }
 
+impl Params {
+    /// Degrees of lift per metre of distance.
+    ///
+    /// Split out from `lift_at` so the marcher can hoist the division: it asks
+    /// this once per ray and multiplies per sample, over a hundred million of
+    /// them in a full render.
+    fn lift_per_m(&self) -> f64 {
+        self.depth_lift / self.max_range
+    }
+
+    /// Degrees terrain `d` metres away is raised by.
+    ///
+    /// The one definition of the rule. It decides where samples are drawn,
+    /// where peak labels sit, and which peaks count as visible, and those
+    /// three have to agree exactly or labels drift off their summits.
+    fn lift_at(&self, d: f64) -> f64 {
+        self.lift_per_m() * d
+    }
+}
+
 /// The horizon a probe found, twice over.
 ///
 /// Two, because a lift makes the question ambiguous: the terrain that occludes
@@ -585,9 +605,7 @@ fn march_ray(
     // when the lift reveals: it costs one comparison per sample, and the
     // branch it would save sits in the hottest loop in the program.
     let mut max_real = f64::NEG_INFINITY;
-    // Degrees of lift per metre of distance. Hoisted because `max_range` is
-    // fixed for the render and the division is not.
-    let lift_per_m = p.depth_lift / p.max_range;
+    let lift_per_m = p.lift_per_m();
     // Row 0 is the top of the frame, so a larger angle means a smaller row
     // index. `filled_from` is the topmost row already written; a new maximum
     // fills the band [row_new, filled_from) and moves the boundary up.
@@ -1133,8 +1151,7 @@ pub fn render(
             // labels float free of the summits they name. `altitude` itself
             // stays the true elevation angle -- it is a fact about the
             // landscape, where `y` is a position in a picture.
-            pk.y = (p.alt_max - (pk.altitude + p.depth_lift * pk.distance / p.max_range))
-                / p.step_deg;
+            pk.y = (p.alt_max - (pk.altitude + p.lift_at(pk.distance))) / p.step_deg;
             // Sub-column, not output column, and bounded against the ray count
             // rather than az_span: out_w rounds, so the image can cover
             // slightly more or less than the requested fov, and only the rays
@@ -1372,7 +1389,7 @@ pub fn render(
         let t = blend[i];
         // Against the same angle the marcher occluded by, so a peak is kept
         // exactly when the render drew its summit.
-        let lifted = pk.altitude + p.depth_lift * pk.distance / p.max_range;
+        let lifted = pk.altitude + p.lift_at(pk.distance);
         pk.visible = clears(lifted, h0.drawn, h1.drawn, t);
         // Asked of the true geometry, so it answers the question a reader of
         // the picture would ask: is that summit actually in sight from here,
