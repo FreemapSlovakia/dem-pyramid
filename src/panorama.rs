@@ -1528,10 +1528,11 @@ pub const MAX_RIDGE_WIDTH: f64 = 20.0;
 /// Most the far horizon may be lifted by, degrees.
 ///
 /// Well past useful -- a few degrees already reads as a strong effect against
-/// a thirty-degree frame -- and it is a bound rather than a taste: the band
-/// fill assumes drawn angles rise with distance, which holds for any lift that
-/// does not fall, and the frame has to stay somewhere near ninety degrees for
-/// the row arithmetic to mean anything.
+/// a thirty-degree frame -- and a bound at all because the frame has to stay
+/// somewhere near ninety degrees for the row arithmetic to mean anything.
+///
+/// The *lower* bound is the load-bearing one; see `validate_style` for what a
+/// falling lift breaks, which is `revealed` rather than the band fill.
 pub const MAX_DEPTH_LIFT: f64 = 45.0;
 
 /// Reject styling the renderer cannot draw, before it reaches the hot loop.
@@ -1979,6 +1980,39 @@ mod tests {
 
     // ---- depth lift -------------------------------------------------------
 
+    /// A `Params` the lift tests can ask questions of.
+    ///
+    /// They go through `Params::lift_at` rather than recomputing the formula,
+    /// or they assert arithmetic instead of code: an earlier version of these
+    /// divided `lift / max_range` locally, which stays green through a sign
+    /// flip, a taper, or a clamp in the real lift -- the very changes that
+    /// would invert `revealed`.
+    fn lift_params(depth_lift: f64, max_range: f64) -> Params {
+        Params {
+            lon: 20.0,
+            lat: 49.0,
+            eye_height: 1.7,
+            az_start: 0.0,
+            az_span: 60.0,
+            alt_min: -10.0,
+            alt_max: 10.0,
+            step_deg: 0.05,
+            max_range,
+            edge_ratio: 1.35,
+            edge_hidden_ref: 20_000.0,
+            eye_level: false,
+            eye_search_radius: 10.0,
+            supersample_x: 1,
+            supersample_y: 1,
+            ridge_strength: 1.0,
+            ridge_width: 1.0,
+            ridge_colour: DEFAULT_RIDGE,
+            ground_colour: DEFAULT_GROUND,
+            dither_strength: DEFAULT_DITHER,
+            depth_lift,
+        }
+    }
+
     /// `revealed` means "drawn in sight, but not truly in sight", and that is
     /// only well-founded if truly visible always implies drawn visible.
     ///
@@ -1993,14 +2027,14 @@ mod tests {
     fn nothing_nearer_is_lifted_more_than_the_peak() {
         let max_range = 300_000.0;
         for lift in [0.0, 0.5, 3.0, MAX_DEPTH_LIFT] {
-            let per_m = lift / max_range;
+            let p = lift_params(lift, max_range);
             // Every (occluder, peak) ordering the marcher can produce.
             let mut d_pk = 20.0;
             while d_pk < max_range {
                 let mut d_s = 10.0;
                 while d_s < d_pk {
                     assert!(
-                        per_m * d_s <= per_m * d_pk,
+                        p.lift_at(d_s) <= p.lift_at(d_pk),
                         "lift {lift}: an occluder at {d_s} outgained a peak at {d_pk}"
                     );
                     d_s *= 1.3;
@@ -2014,9 +2048,9 @@ mod tests {
     /// leave every existing render untouched.
     #[test]
     fn zero_lift_moves_nothing() {
-        let per_m = 0.0 / 300_000.0;
+        let p = lift_params(0.0, 300_000.0);
         for d in [10.0, 5_000.0, 120_000.0, 300_000.0] {
-            assert_eq!(3.25 + per_m * d, 3.25, "zero lift moved d = {d}");
+            assert_eq!(p.lift_at(d), 0.0, "zero lift moved d = {d}");
         }
     }
 
@@ -2025,11 +2059,11 @@ mod tests {
     #[test]
     fn lift_spans_zero_to_the_full_amount() {
         let (lift, max_range): (f64, f64) = (4.0, 250_000.0);
-        let per_m = lift / max_range;
-        assert!((per_m * max_range - lift).abs() < 1e-12);
-        assert!(per_m * 0.0 == 0.0);
+        let p = lift_params(lift, max_range);
+        assert!((p.lift_at(max_range) - lift).abs() < 1e-12);
+        assert_eq!(p.lift_at(0.0), 0.0);
         // Linear, so the halfway distance gets exactly half.
-        assert!((per_m * (max_range / 2.0) - lift / 2.0).abs() < 1e-12);
+        assert!((p.lift_at(max_range / 2.0) - lift / 2.0).abs() < 1e-12);
     }
 
     /// Three states per side, and the reason `clears` exists is that the
@@ -2050,8 +2084,8 @@ mod tests {
         assert!(!clears(2.9, 2.0, 4.0, 0.5));
     }
 
-    /// A falling lift would leave sky where terrain is; it has to be refused
-    /// rather than clamped, and both front-ends share the rule.
+    /// A falling lift would report summits the eye can see as hidden, so it
+    /// is refused rather than clamped, and both front-ends share the rule.
     #[test]
     fn a_lift_that_falls_with_distance_is_refused() {
         assert!(validate_style(1.0, 1.0, 0.0).is_ok());

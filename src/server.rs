@@ -97,7 +97,8 @@ pub struct Request {
     peaks: bool,
     #[serde(default = "d_min_dom")]
     min_dominance: f64,
-    /// Keep at most this many peaks, the most dominant first. 0 is no cap.
+    /// Keep at most this many peaks, most label-worthy first -- dominance
+    /// discounted by distance, see `peak_rank_power`. 0 is no cap.
     #[serde(default)]
     max_peaks: usize,
     /// Multiplier on the ridge silhouettes; 0 removes them.

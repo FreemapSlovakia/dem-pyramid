@@ -43,7 +43,7 @@ All fields except `lon` and `lat` are optional.
 | `depth_step` | int | `4` | depth quantisation; see [Depth](#depth) |
 | `peaks` | bool | `true` | include peak labels |
 | `min_dominance` | number | `30` | drop peaks standing less than this above their surroundings, metres; may be negative |
-| `max_peaks` | int | `0` | keep at most this many, most dominant first; 0 is no cap |
+| `max_peaks` | int | `0` | keep at most this many, most label-worthy first — *not* most dominant, see [What `max_peaks` keeps](#what-max_peaks-keeps); 0 is no cap |
 | `format` | string | `avif` | image encoding: `avif` or `png` |
 | `quality` | int | `95` | AVIF quality, 1–100; ignored for PNG |
 | `dither_strength` | number | `1.5` | 8-bit dither amplitude, levels; 0 disables |
@@ -110,10 +110,13 @@ payload matters more than the resolution, say so and the numbers can be
 rounded to something defensible (0.1 m, 6 decimal places of latitude) for
 roughly a quarter off.
 
-What *does* cost is `range`, through the candidate count, and `min_dominance`,
-through how many survive to be measured.
+**`min_dominance` is not a load control either.** It is applied in the same
+place as `max_peaks`, after every visible candidate has already had its
+dominance measured, so raising it returns no time — only fewer bytes. The one
+parameter that genuinely reduces the peak work is `range`, because it decides
+how many candidates exist at all; `peaks: false` removes it entirely.
 
-Three things multiply those figures, and they compound:
+Three things multiply the **wall-clock** figures above, and they compound:
 
 - **A cold viewpoint is about twice a warm one** — 9.6 s against 4.9 s for the
   same request — because the pyramid blocks come off disk the first time.
@@ -407,6 +410,14 @@ ridge country is most visible tops. Measured on the 2631-peak Ötztal view that
 prompted this: a near subordinate top sat 2471st under raw dominance, **2627th**
 under naive division, and **1966th** under the rule above, which is what brings
 it inside a `max_peaks: 2000` cut.
+
+`min_dominance` still filters on **raw** metres, deliberately: it is a
+statement about the landscape — "nothing flatter than this is a summit" — and
+would stop meaning anything in metres if distance entered it. Only the cut is
+ranked. The two can in principle disagree, a near top failing the threshold
+while ranking above distant ones that pass; measured on the view above it does
+not happen at any cap, because the weighting already pushes deeply negative
+scores down, which is the same direction the threshold cuts in.
 
 `dominance` itself is untouched in the payload, so a client is free to re-rank
 however it likes — the ordering only decides *which* peaks survive to be sent.
@@ -761,7 +772,8 @@ Most out-of-range numbers are clamped rather than rejected — `range`, `fov`,
 `step`, the supersampling factors, `eye_search_radius`, `dither_strength`. The
 exceptions are the ones where silently rewriting the request would hide a real
 mistake, and they answer `400` naming the field: `alt_min` or `alt_max` outside
-−90–90, `depth_lift` outside 0–45, `ridge_width` outside 0–20, a negative
+−90–90, `depth_lift` outside 0–45, `peak_rank_power` outside 0–4,
+`ridge_width` outside 0–20, a negative
 `ridge_strength`, a malformed colour,
 and a non-finite value in any numeric field — though the JSON parser refuses
 `NaN` and `Infinity` before the check ever sees them, so that one is belt and

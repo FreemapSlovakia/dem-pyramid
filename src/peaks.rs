@@ -144,12 +144,6 @@ fn split_csv(line: &str) -> Vec<String> {
     out
 }
 
-/// Which summits earn a label, most dominant first.
-///
-/// In frame, not hidden, and standing far enough above what is around it.
-/// Visibility was decided during the render, from the columns it marched
-/// anyway; `column` is `Some` exactly when a ray answered the peak.
-///
 /// Distance exponent the label cut uses unless asked otherwise.
 ///
 /// Gentle: it keeps the great distant massifs, which people do want named,
@@ -210,6 +204,15 @@ pub fn label_rank(dominance: f64, distance: f64, power: f64) -> f64 {
     }
 }
 
+/// Which summits earn a label, most label-worthy first.
+///
+/// In frame, not hidden, and standing far enough above what is around it.
+/// Visibility was decided during the render, from the columns it marched
+/// anyway; `column` is `Some` exactly when a ray answered the peak.
+///
+/// Ordered by [`label_rank`], not by dominance: see there for why metres are
+/// not a rank, and for the sign trap in fixing that.
+///
 /// One policy, in one place. Both front-ends want the same answer, and while
 /// they each spelled it out the two copies drifted -- a cast here, a clause
 /// there -- and every change to the rule, including the dominance rename, was
@@ -234,9 +237,14 @@ pub fn select(peaks: &mut Vec<Peak>, s: &Selection) {
     // statement about the landscape -- "nothing flatter than this is a summit"
     // -- and would stop meaning anything in metres if distance entered it.
     // Only the cut, which is about label density in a picture, is ranked.
+    // `total_cmp`, not `partial_cmp().unwrap()`. Nothing reachable produces a
+    // NaN rank today -- both front-ends check `rank_power`, and dominance is
+    // guarded finite where it is computed -- but `label_rank` and `Selection`
+    // are public with public fields, so that guarantee lives entirely in
+    // validators in other files. This costs the same and cannot panic.
     peaks.sort_by(|a, b| {
         let rank = |k: &Peak| label_rank(k.dominance, k.distance, s.rank_power);
-        rank(b).partial_cmp(&rank(a)).unwrap()
+        rank(b).total_cmp(&rank(a))
     });
     // After the sort, so a cap keeps the summits worth labelling rather than
     // an arbitrary slice. Zero is no cap.

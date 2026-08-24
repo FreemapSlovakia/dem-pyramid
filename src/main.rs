@@ -205,7 +205,8 @@ enum Command {
         /// 0 ranks on dominance alone.
         #[arg(long, default_value_t = peaks::DEFAULT_RANK_POWER)]
         peak_rank_power: f64,
-        /// Keep at most this many peaks, most dominant first. 0 is no cap.
+        /// Keep at most this many peaks, most label-worthy first -- dominance
+        /// discounted by distance, see --peak-rank-power. 0 is no cap.
         #[arg(long, default_value_t = 0)]
         max_peaks: usize,
         /// Rays per output pixel horizontally, averaged down.
@@ -410,6 +411,13 @@ fn main() -> Result<()> {
                 ("min-dominance", min_dominance),
                 ("dither-strength", dither_strength),
                 ("peak-rank-power", peak_rank_power),
+                // `edge-hidden-ref` divides the hidden extent and the result
+                // goes through `clamp`, which passes a NaN straight out, so a
+                // non-finite here inks no edge in the frame and the render
+                // still exits 0. `edge-ratio` survives its own `max(1.001)`,
+                // and is listed anyway rather than left as a puzzle.
+                ("edge-ratio", edge_ratio),
+                ("edge-hidden-ref", edge_hidden_ref),
             ] {
                 anyhow::ensure!(v.is_finite(), "--{name} must be a finite number");
             }
