@@ -154,9 +154,24 @@ fn split_csv(line: &str) -> Vec<String> {
 /// they each spelled it out the two copies drifted -- a cast here, a clause
 /// there -- and every change to the rule, including the dominance rename, was
 /// two edits with nothing to catch the one you forgot.
-pub fn select(peaks: &mut Vec<Peak>, min_dominance: f64, max_peaks: usize, height: usize) {
+///
+/// `keep_revealed` decides whether summits that only `depth_lift` brought into
+/// view may take label slots. It has to be settled here rather than left to
+/// the caller, because `max_peaks` truncates: filter afterwards and a request
+/// for twenty labels returns however many of its twenty happened to be real,
+/// with the near summits it dropped unrecoverable. Dominance is in metres, so
+/// distant ranges outrank near hills -- and revealed peaks are distant by
+/// construction, being the ones that were behind something.
+pub fn select(
+    peaks: &mut Vec<Peak>,
+    min_dominance: f64,
+    max_peaks: usize,
+    height: usize,
+    keep_revealed: bool,
+) {
     peaks.retain(|k| {
         k.visible
+            && (keep_revealed || !k.revealed)
             && k.column.is_some()
             && k.dominance >= min_dominance
             && k.y >= 0.0
@@ -205,7 +220,7 @@ mod tests {
             peak(5, 100.0, true, Some(0), -1.0),   // above the frame
             peak(6, 100.0, true, Some(0), 601.0),  // below the frame
         ];
-        select(&mut peaks, 30.0, 0, 600);
+        select(&mut peaks, 30.0, 0, 600, true);
         assert_eq!(peaks.iter().map(|p| p.osm_id).collect::<Vec<_>>(), [1]);
     }
 
@@ -220,7 +235,7 @@ mod tests {
             peak(3, -5.0, true, Some(0), 10.0),
             peak(4, 20.0, true, Some(0), 10.0),
         ];
-        select(&mut peaks, -100.0, 0, 600);
+        select(&mut peaks, -100.0, 0, 600, true);
         assert_eq!(
             peaks.iter().map(|p| p.osm_id).collect::<Vec<_>>(),
             [2, 4, 3, 1]
@@ -236,14 +251,46 @@ mod tests {
             peak(2, 900.0, true, Some(0), 10.0),
             peak(3, 500.0, true, Some(0), 10.0),
         ];
-        select(&mut peaks, -1000.0, 2, 600);
+        select(&mut peaks, -1000.0, 2, 600, true);
         assert_eq!(peaks.iter().map(|p| p.osm_id).collect::<Vec<_>>(), [2, 3]);
     }
 
     #[test]
     fn zero_means_no_cap() {
         let mut peaks = (0..5).map(|i| peak(i, 100.0, true, Some(0), 10.0)).collect();
-        select(&mut peaks, 0.0, 0, 600);
+        select(&mut peaks, 0.0, 0, 600, true);
         assert_eq!(peaks.len(), 5);
+    }
+
+    /// The reason `keep_revealed` is decided inside `select` rather than left
+    /// to the caller: dominance is in metres, so the distant summits a lift
+    /// brings out outrank near ones, and the cap runs after the sort. Filter
+    /// afterwards and a request for two labels returns one.
+    #[test]
+    fn revealed_summits_do_not_take_slots_from_visible_ones() {
+        let revealed = |id, dom| {
+            let mut k = peak(id, dom, true, Some(0), 10.0);
+            k.revealed = true;
+            k
+        };
+        let candidates = || {
+            vec![
+                revealed(1, 900.0),
+                revealed(2, 800.0),
+                peak(3, 400.0, true, Some(0), 10.0),
+                peak(4, 300.0, true, Some(0), 10.0),
+            ]
+        };
+
+        // Kept: the lift was asked for, so what it brought out gets labelled.
+        let mut all = candidates();
+        select(&mut all, 0.0, 2, 600, true);
+        assert_eq!(all.iter().map(|p| p.osm_id).collect::<Vec<_>>(), [1, 2]);
+
+        // Refused: the cap now spends both slots on summits actually in sight,
+        // rather than returning two labels of which none are.
+        let mut real = candidates();
+        select(&mut real, 0.0, 2, 600, false);
+        assert_eq!(real.iter().map(|p| p.osm_id).collect::<Vec<_>>(), [3, 4]);
     }
 }

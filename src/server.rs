@@ -132,7 +132,14 @@ pub struct Request {
     /// only appear this way come back with `revealed: true`.
     #[serde(default)]
     depth_lift: f64,
+    /// Whether summits only `depth_lift` brought into view may take label
+    /// slots. Nothing is revealed without a lift, so this changes nothing at
+    /// the default.
+    #[serde(default = "d_true")]
+    revealed_peaks: bool,
 }
+
+fn d_true() -> bool { true }
 
 #[derive(Deserialize, Clone, Copy, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -523,6 +530,7 @@ async fn panorama_route(
     let quality = req.quality.clamp(1, 100);
     let min_dom = req.min_dominance;
     let max_peaks = req.max_peaks;
+    let keep_revealed = req.revealed_peaks;
 
     let render_cancel = cancel.clone();
     let built = tokio::task::spawn_blocking(move || -> Result<Vec<Part>> {
@@ -548,7 +556,7 @@ async fn panorama_route(
             job.set_phase(Phase::Encoding);
         }
 
-        peaks::select(&mut found, min_dom, max_peaks, stats.height);
+        peaks::select(&mut found, min_dom, max_peaks, stats.height, keep_revealed);
 
         let meta = serde_json::json!({
             "width": stats.width,
@@ -643,6 +651,7 @@ async fn viewshed_route(
         ("radius", req.radius),
         ("scale", req.scale),
         ("eye", req.eye),
+        ("eye_search_radius", req.eye_search_radius),
         ("target_height", req.target_height),
     ] {
         if !v.is_finite() {

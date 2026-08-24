@@ -1556,11 +1556,20 @@ pub fn validate_style(ridge_strength: f64, ridge_width: f64, depth_lift: f64) ->
         (0.0..=MAX_RIDGE_WIDTH).contains(&ridge_width),
         "ridge_width must lie within 0..{MAX_RIDGE_WIDTH}"
     );
-    // Negative is refused rather than clamped because it is not merely
-    // useless: a lift that shrinks with distance can place a farther sample
-    // *below* the nearer one it stands over, and the band fill -- which walks
-    // the frame upwards and never revisits a row -- would drop it, leaving
-    // sky where terrain is.
+    // Negative is refused rather than clamped because it would break
+    // `revealed`, which rests on a lift that never shrinks with distance.
+    //
+    // Every sample a probe folds into a peak's horizon is nearer than the
+    // peak. With a rising lift the peak is therefore raised at least as much
+    // as anything blocking it, so a summit genuinely in sight is always drawn
+    // in sight too, and `revealed` can mean "drawn but not truly visible". A
+    // falling lift inverts that -- the occluder gains the larger lift -- and a
+    // peak the eye really can see comes back `visible: false` with nothing in
+    // the response to say why.
+    //
+    // Not, as this once claimed, to protect the band fill. That invariant is
+    // structural: occlusion is decided on the drawn angle, so accepted samples
+    // rise up the frame by construction whatever the lift does.
     anyhow::ensure!(
         (0.0..=MAX_DEPTH_LIFT).contains(&depth_lift),
         "depth_lift must lie within 0..{MAX_DEPTH_LIFT}"
@@ -1970,29 +1979,33 @@ mod tests {
 
     // ---- depth lift -------------------------------------------------------
 
-    /// The band fill walks the frame upwards and never revisits a row, so a
-    /// sample accepted after another must also *draw* above it. Occlusion
-    /// guarantees the true angle rises; this asserts the lift cannot undo
-    /// that, which is the whole reason a falling lift is refused.
+    /// `revealed` means "drawn in sight, but not truly in sight", and that is
+    /// only well-founded if truly visible always implies drawn visible.
+    ///
+    /// Everything a probe folds into a peak's horizon is nearer than the peak,
+    /// so what this needs is that nothing nearer ever gains more lift than the
+    /// peak does. A rising lift gives that; a falling one inverts it and marks
+    /// summits the eye really can see as hidden, which is why negatives are
+    /// refused. Not, as an earlier version of this test claimed, to protect
+    /// the band fill -- occlusion is decided on the drawn angle, so accepted
+    /// samples rise up the frame whatever the lift does.
     #[test]
-    fn lift_preserves_the_order_the_band_fill_needs() {
+    fn nothing_nearer_is_lifted_more_than_the_peak() {
         let max_range = 300_000.0;
         for lift in [0.0, 0.5, 3.0, MAX_DEPTH_LIFT] {
             let per_m = lift / max_range;
-            // A ray that keeps just barely clearing its own horizon: the
-            // hardest case, since a lift only has to survive ties.
-            let mut prev = f64::NEG_INFINITY;
-            let mut d = 10.0;
-            let mut alpha = -5.0;
-            while d < max_range {
-                let drawn = alpha + per_m * d;
-                assert!(
-                    drawn > prev,
-                    "lift {lift} put d = {d} at {drawn}, below {prev}"
-                );
-                prev = drawn;
-                alpha += 1e-9;
-                d *= 1.05;
+            // Every (occluder, peak) ordering the marcher can produce.
+            let mut d_pk = 20.0;
+            while d_pk < max_range {
+                let mut d_s = 10.0;
+                while d_s < d_pk {
+                    assert!(
+                        per_m * d_s <= per_m * d_pk,
+                        "lift {lift}: an occluder at {d_s} outgained a peak at {d_pk}"
+                    );
+                    d_s *= 1.3;
+                }
+                d_pk *= 1.3;
             }
         }
     }

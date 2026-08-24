@@ -197,6 +197,10 @@ enum Command {
         /// Negative for tops their own ridge stands over.
         #[arg(long, default_value_t = 30.0)]
         min_dominance: f64,
+        /// Drop summits only --depth-lift brought into view, so labels name
+        /// nothing the eye cannot see. Nothing is revealed without a lift.
+        #[arg(long, default_value_t = false)]
+        no_revealed_peaks: bool,
         /// Keep at most this many peaks, most dominant first. 0 is no cap.
         #[arg(long, default_value_t = 0)]
         max_peaks: usize,
@@ -373,11 +377,37 @@ fn main() -> Result<()> {
             peaks: peaks_path,
             peaks_out,
             min_dominance,
+            no_revealed_peaks,
             max_peaks,
             supersample_x,
             supersample_y,
         } => {
             panorama::validate_style(ridge_strength, ridge_width, depth_lift)?;
+            // The server's parser refuses a non-finite before any check sees
+            // it; clap's does not, so this is the side where `--range NaN`
+            // reaches the geometry and renders an empty frame with exit 0.
+            // `range` also has to be positive rather than merely finite: the
+            // lift divides by it, so `--range 0` computes 0/0 and hands the
+            // marcher a NaN. Both self-cancel today -- a march loop that never
+            // runs cannot draw a NaN -- which is exactly the kind of accident
+            // worth not depending on.
+            for (name, v) in [
+                ("lon", lon),
+                ("lat", lat),
+                ("az", az),
+                ("fov", fov),
+                ("step", step),
+                ("alt-min", alt_min),
+                ("alt-max", alt_max),
+                ("eye", eye),
+                ("eye-search-radius", eye_search_radius),
+                ("range", range),
+                ("min-dominance", min_dominance),
+                ("dither-strength", dither_strength),
+            ] {
+                anyhow::ensure!(v.is_finite(), "--{name} must be a finite number");
+            }
+            anyhow::ensure!(range > 0.0, "--range must be positive");
             let p = panorama::Params {
                 lon,
                 lat,
@@ -479,7 +509,13 @@ fn main() -> Result<()> {
             }
 
             if peaks_path.is_some() {
-                peaks::select(&mut cands, min_dominance, max_peaks, stats.height);
+                peaks::select(
+                    &mut cands,
+                    min_dominance,
+                    max_peaks,
+                    stats.height,
+                    !no_revealed_peaks,
+                );
 
                 let dst = peaks_out.unwrap_or_else(|| out.with_extension("json"));
                 serde_json::to_writer_pretty(

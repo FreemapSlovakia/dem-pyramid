@@ -52,6 +52,7 @@ All fields except `lon` and `lat` are optional.
 | `ridge_color` | string | `#000000` | silhouette colour, `#rrggbb` or `#rgb` |
 | `ground_color` | string | `#3a4a34` | near-terrain colour, before haze |
 | `depth_lift` | number | `0` | degrees of extra elevation at `range`, tapering to nothing at the eye (0–45); see [Depth lift](#depth-lift) |
+| `revealed_peaks` | bool | `true` | let summits only `depth_lift` brought into view take label slots |
 
 Image dimensions follow from the angles:
 
@@ -237,6 +238,16 @@ without it the lift tears the picture apart (see below). But the result is no
 longer a photograph, and anything built on "the user can see this from here"
 has to account for it. Peaks brought into view this way come back with
 `revealed: true` — see [Peaks](#peaks).
+
+**`max_peaks` needs `revealed_peaks: false` to stay honest.** Dominance is in
+metres, so distant ranges outrank near hills — and revealed summits are distant
+by construction, being the ones that were behind something. Under a lift they
+sort to the top and a `max_peaks: 20` request can come back with twenty labels
+naming nothing you can see, the near summits truncated away. Sending
+`revealed_peaks: false` drops them *before* the cap, so the twenty slots go to
+summits genuinely in sight. Filtering on `revealed` client-side cannot recover
+this: truncation has already happened, and you are left with fewer labels than
+you asked for.
 
 Three things to expect:
 
@@ -664,6 +675,15 @@ that serialises requests per client.
 - **Image** — origin top-left. `x = ((azimuth - az_start) mod 360) / step`,
   `y = (alt_max - altitude) / step`.
 
+> **`y` needs a term for `depth_lift`.** With a lift the row is
+> `y = (alt_max - (altitude + depth_lift * distance / range)) / step`, because
+> terrain is raised in proportion to its distance. The formula above is the
+> `depth_lift: 0` case. Using it under a lift puts a label 60 px off for a
+> summit at `range` with `depth_lift: 3` and `step: 0.05` — and inverting a
+> hovered row back to an altitude needs the distance from the depth buffer
+> before the term can be removed. Peaks already come back with `y` computed
+> correctly; this matters for overlays a client positions itself.
+
 For a 360° render the image wraps: column `width - 1` is adjacent to column 0,
 so it can be panned continuously or tiled as a cylinder.
 
@@ -678,8 +698,9 @@ so it can be panned continuously or tiled as a cylinder.
 Most out-of-range numbers are clamped rather than rejected — `range`, `fov`,
 `step`, the supersampling factors, `eye_search_radius`, `dither_strength`. The
 exceptions are the ones where silently rewriting the request would hide a real
-mistake, and they answer `400` naming the field: `depth_lift` outside 0–45,
-`ridge_width` outside 0–20, a negative `ridge_strength`, a malformed colour,
+mistake, and they answer `400` naming the field: `alt_min` or `alt_max` outside
+−90–90, `depth_lift` outside 0–45, `ridge_width` outside 0–20, a negative
+`ridge_strength`, a malformed colour,
 and a non-finite value in any numeric field — though the JSON parser refuses
 `NaN` and `Infinity` before the check ever sees them, so that one is belt and
 braces rather than something you can trigger.
