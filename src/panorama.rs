@@ -163,18 +163,35 @@ struct ProfileGrid {
     /// reads as "no ground at this depth" and silently shortens the sweep.
     az_step: f64,
     cols: usize,
+    /// How many rays exist. Every column must be spoken for by one of them.
+    sub_w: usize,
 }
 
 impl ProfileGrid {
-    fn new(p: &Params, az_step: f64) -> Self {
-        let step = p.peak_profile_step.max(az_step);
-        // Floored, not rounded, so the grid never claims bearings no ray
-        // covers -- the last column's centre then always has a ray near it.
-        let cols = ((p.az_span / step).floor() as usize).max(1);
+    /// `sub_w` is the ray count, and it is what the grid must be built from.
+    ///
+    /// Not `az_span`: the image is `round(az_span / step_deg)` columns wide, so
+    /// the rays cover a whole number of output columns and generally not the
+    /// requested arc. Sizing the grid from the arc lets it claim bearings no
+    /// ray reaches, and a column no ray fills reads as "no ground at this
+    /// depth" -- so the sweep stops early and dominance comes back 0. At
+    /// `fov: 0.1, step: 0.05` that was every peak in the frame, and 0 fails
+    /// the default `min_dominance`, so the answer was a panorama with no
+    /// labels at all and nothing to say why.
+    fn new(p: &Params, az_step: f64, sub_w: usize) -> Self {
+        // Exactly the arc the rays span, which is the only arc there is data
+        // for.
+        let covered = sub_w as f64 * az_step;
+        // Never finer than the rays that fill it, and never coarser than the
+        // frame -- a single column wider than the picture has its centre
+        // outside it, which is the same failure by a different route.
+        let step = p.peak_profile_step.max(az_step).min(covered);
+        let cols = ((covered / step).floor() as usize).max(1);
         Self {
             step,
             az_step,
             cols,
+            sub_w,
         }
     }
 
@@ -193,8 +210,15 @@ impl ProfileGrid {
     fn spoken_for_by(&self, sub: usize) -> Option<usize> {
         let col = self.col_of((sub as f64 + 0.5) * self.az_step);
         let centre = (col as f64 + 0.5) * self.step;
-        let ideal = (centre / self.az_step - 0.5).round();
-        (ideal >= 0.0 && ideal as usize == sub).then_some(col)
+        // Clamped into the rays that exist. Sizing `cols` from `sub_w` should
+        // already keep every centre inside them; this is what makes "every
+        // column has exactly one ray" true by construction rather than by
+        // an argument about rounding, and the edge column falls back to the
+        // nearest real bearing instead of to no bearing at all.
+        let ideal = (centre / self.az_step - 0.5)
+            .round()
+            .clamp(0.0, (self.sub_w - 1) as f64);
+        (ideal as usize == sub).then_some(col)
     }
 }
 
@@ -1187,7 +1211,7 @@ pub fn render(
     let sub_h = out_h * ssy as usize;
     let az_step = p.step_deg / f64::from(ssx);
     let alt_step = p.step_deg / f64::from(ssy);
-    let grid = ProfileGrid::new(p, az_step);
+    let grid = ProfileGrid::new(p, az_step, out_w * ssx as usize);
 
     // Eye elevation, and the peak geometry that depends on it, before any
     // marching. Peaks are then answered from the columns the render produces
@@ -2239,12 +2263,12 @@ mod tests {
         for (step_deg, ssx) in tiers {
             p.step_deg = step_deg;
             let az_step = step_deg / f64::from(ssx);
-            let grid = ProfileGrid::new(&p, az_step);
+            let subs = (p.az_span / step_deg).round() as usize * ssx as usize;
+            let grid = ProfileGrid::new(&p, az_step, subs);
             assert_eq!(grid.cols, 1800, "{step_deg}/{ssx} disagreed on width");
 
             // Exactly one ray speaks for each column, and the bearing it
             // speaks from is within half a ray of the column centre.
-            let subs = (360.0 / az_step).round() as usize;
             let mut spoken = vec![None; grid.cols];
             for sub in 0..subs {
                 if let Some(c) = grid.spoken_for_by(sub) {
@@ -2291,11 +2315,59 @@ mod tests {
         p.peak_profile_step = 0.02;
 
         // Asked for 0.02 with rays 0.2 apart: the request cannot be honoured.
-        let grid = ProfileGrid::new(&p, 0.2);
+        let grid = ProfileGrid::new(&p, 0.2, 1800);
         assert_eq!(grid.step, 0.2);
         // Asked for 0.02 with rays finer than that: honoured.
-        let grid = ProfileGrid::new(&p, 0.01);
+        let grid = ProfileGrid::new(&p, 0.01, 36_000);
         assert_eq!(grid.step, 0.02);
+    }
+
+    /// Every profile column must be spoken for by exactly one ray, for every
+    /// shape of request the server will accept -- not merely for the round
+    /// ones.
+    ///
+    /// A column nobody fills reads as "no ground at this depth", which stops
+    /// the dominance sweep early and returns 0. Zero then fails the default
+    /// `min_dominance`, so the visible symptom is a panorama with no labels
+    /// and nothing in the response to explain it. This held for 360-degree
+    /// renders and failed for narrow ones, because the grid was sized from
+    /// the requested arc while the rays cover `round(fov / step)` output
+    /// columns -- generally a slightly different arc, and at `fov: 0.1,
+    /// step: 0.05` a column whose centre needed ray 18 of 18.
+    #[test]
+    fn every_column_is_spoken_for_at_every_shape() {
+        let mut p = lift_params(0.0, 300_000.0);
+        for fov in [0.1, 0.3, 0.5, 1.0, 2.0, 7.0, 33.0, 60.0, 123.4, 360.0] {
+            for step_deg in [0.02, 0.05, 0.0625, 0.1, 0.15, 0.2] {
+                for ssx in [1u32, 3, 9] {
+                    for profile_step in [0.02, 0.05, 0.2, 1.0, MAX_PROFILE_STEP] {
+                        p.az_span = fov;
+                        p.step_deg = step_deg;
+                        p.peak_profile_step = profile_step;
+                        let out_w = (fov / step_deg).round().max(1.0) as usize;
+                        let az_step = step_deg / f64::from(ssx);
+                        let subs = out_w * ssx as usize;
+                        let grid = ProfileGrid::new(&p, az_step, subs);
+
+                        let mut claims = vec![0usize; grid.cols];
+                        for sub in 0..subs {
+                            if let Some(c) = grid.spoken_for_by(sub) {
+                                claims[c] += 1;
+                            }
+                        }
+                        let what = format!(
+                            "fov {fov} step {step_deg} ssx {ssx} profile {profile_step} \
+                             ({} cols, {subs} rays)",
+                            grid.cols
+                        );
+                        assert!(grid.cols >= 1, "{what}: no columns");
+                        for (c, &n) in claims.iter().enumerate() {
+                            assert_eq!(n, 1, "{what}: column {c} claimed {n} times");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// A falling lift would report summits the eye can see as hidden, so it

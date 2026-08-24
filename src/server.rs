@@ -42,10 +42,21 @@ const MAX_VIEWSHED_RADIUS: f64 = 300_000.0;
 /// a viewshed of any given radius may be drawn at twice the resolution.
 ///
 /// A square, so the linear factor is what a caller feels: at the cap the image
-/// is 9797 px a side. That costs about half a gigabyte to hold -- one byte per
-/// pixel of alpha while the rays run, four per pixel once it becomes RGBA --
-/// and renders are serialised, so the ceiling is one request's memory, not the
-/// sum of everyone's.
+/// is 9797 px a side.
+///
+/// Measured, because reasoning about it undercounted by eightfold. The
+/// renderer's own buffers are the small part -- one byte per pixel of alpha
+/// while the rays run, four once it is RGBA, so about 480 MB. Encoding is the
+/// rest: `avif::write_fast_png` builds the whole PNG in memory while the RGBA
+/// image is still live, writes it to a `/tmp` that `PrivateTmp=yes` puts on a
+/// tmpfs -- so that file is RAM as well -- and `avifenc` then decodes it and
+/// converts 96 megapixels to 10-bit 4:4:4. A full-size request measured
+/// **3.3 GB resident plus 0.8 GB of tmpfs**, against 45 GB free on fm6.
+///
+/// Affordable, and renders are serialised so it is one request's worth rather
+/// than everyone's -- but unguarded it would abort the process rather than
+/// fail the request, taking the queue with it. `terrain.service` carries a
+/// `MemoryMax` for that reason; raise this cap and raise that with it.
 const MAX_VIEWSHED_PIXELS: usize = 96_000_000;
 /// A warm tint that reads over both map and imagery; opacity carries the
 /// detail, so the colour is deliberately flat.

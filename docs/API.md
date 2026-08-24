@@ -681,8 +681,8 @@ That is a total, not a side length, so it trades against `radius`:
 |---|---|---|
 | 10 km | 2.05 m | 9756² |
 | 30 km (default) | **6.13 m** | 9788² |
-| 50 km | 10.2 m | 9804² |
-| 100 km | 20.4 m | 9804² |
+| 50 km | 10.21 m | 9794² |
+| 100 km | 20.42 m | 9794² |
 | 300 km (max) | 61.3 m | 9788² |
 
 **Set `scale` from the data, not from the cap.** The finest pyramid level is

@@ -33,6 +33,22 @@ Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=6
 
+# The largest legal viewshed measured 3.3 GB resident plus 0.8 GB of tmpfs --
+# and `PrivateTmp` puts that tmpfs in RAM, so it is ~4 GB for one request. Most
+# of it is the AVIF encoder rather than the renderer: the PNG is built whole in
+# memory while the RGBA image is still live, and 96 megapixels then become
+# 10-bit 4:4:4.
+#
+# Affordable on 62 GB, and renders are serialised. The cap is here because
+# nothing else bounds it: a Rust allocation failure aborts rather than failing
+# the request, so without this a pathological render competes with the tile
+# servers and mariadb for the whole box. Better that this service dies alone
+# and restarts than that it takes the site with it.
+#
+# High before Max, so the kernel reclaims and throttles before it kills.
+MemoryHigh=8G
+MemoryMax=12G
+
 Restart=on-failure
 RestartSec=5
 

@@ -59,6 +59,12 @@ OUT="$WORK/out-eu"
 ISO="$WORK/iso-eu"
 
 step_tile() {
+	# Emptied, not merely created. A run killed between the gdalwarp and the
+	# mv leaves a staged tile behind, and SRTMHGT has no update support -- so
+	# the next run's gdalwarp fails trying to reopen it and the tile is
+	# reported as "no data", which is a wrong diagnosis for a self-inflicted
+	# wound. It self-heals a run later, silently, having wasted a pass.
+	rm -rf "$HGT/.staging"
 	mkdir -p "$HGT" "$HGT/.staging"
 	local lat lon f n=0 skipped=0
 	for ((lat = S; lat < N; lat++)); do

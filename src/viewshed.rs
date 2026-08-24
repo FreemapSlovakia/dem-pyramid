@@ -76,7 +76,13 @@ impl Params {
         // 1 is the marcher's "visible but grazing" floor and 255 is face-on;
         // the curve works in that span rather than in 0..255, so a floor of 0
         // still cannot make visible ground vanish.
-        let v = f64::from(a - 1) / 254.0;
+        //
+        // Saturating, though 0 cannot reach here today -- the only caller
+        // guards on `a > 0` a hundred lines away, and release builds have
+        // overflow checks off, so a future second caller would wrap to 255 and
+        // paint fully opaque exactly where nothing is visible. That is the one
+        // thing the alpha channel must never say.
+        let v = f64::from(a.saturating_sub(1)) / 254.0;
         let v = if self.gamma == 1.0 {
             v
         } else {
