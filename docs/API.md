@@ -443,7 +443,7 @@ formula can come in the request:
 
 // trust prominence less the further it had to be matched
 "peak_rank": ["*", ["coalesce", ["get","prominence"], 0],
-                   ["max", 0, ["-", 1, ["/", ["coalesce", ["get","prom_dist"], 999], 100]]]]
+                   ["max", 0, ["-", 1, ["/", ["coalesce", ["get","prom_dist_m"], 999], 100]]]]
 ```
 
 The shape is MapLibre's — JSON prefix arrays — **but this is not MapLibre
@@ -456,9 +456,10 @@ take any number of arguments; `-` takes one (negate) or two (subtract).
 Everything is floating point, so `["/", 1, 2]` is 0.5.
 
 **Properties.** `dominance` `distance` `altitude` `ele` `x` `y` `revealed`
-`prominence` `prom_dist`. `revealed` is 0 or 1, so weight it arithmetically.
+`prominence` `prom_dist_m`. Spelled exactly as the payload spells them.
+`revealed` is 0 or 1, so weight it arithmetically.
 
-**Nulls are real.** `prominence` and `prom_dist` are null for two thirds of
+**Nulls are real.** `prominence` and `prom_dist_m` are null for two thirds of
 peaks, and null propagates through every operator — `["*", 0, ["get",
 "prominence"]]` is null, not 0. Only `coalesce` stops it. A formula that
 forgets ranks those peaks **last**, which is loud; treating a missing
@@ -474,7 +475,7 @@ is taken, naming the JSON path:
 
 ```
 peak_rank: unknown property `prominance`; expected one of dominance, distance,
-altitude, ele, x, y, revealed, prominence, prom_dist at $[1]
+altitude, ele, x, y, revealed, prominence, prom_dist_m at $[1]
 ```
 
 A misspelled property is the mistake most worth catching this way — MapLibre
@@ -510,7 +511,9 @@ same view the top moves 2471 → 2249 → 1966 → 1647 → 1419 for
   "x": 326.4, "y": 181.8,
   "visible": true,
   "revealed": false,
-  "dominance": 412.8
+  "dominance": 412.8,
+  "prominence": 1518.0,
+  "prom_dist_m": 22.4
 }
 ```
 
@@ -524,7 +527,9 @@ same view the top moves 2471 → 2249 → 1966 → 1647 → 1419 for
 | `altitude` | degrees above horizontal from the eye, including curvature and refraction — the true angle, unaffected by `depth_lift` |
 | `x`, `y` | position in the image, **output pixels**, origin top-left — `y` *does* follow `depth_lift`, so place labels by this, not by `altitude` |
 | `revealed` | `true` where `depth_lift` is what brought the summit into view: it is drawn and labelled, but the eye could not see it from here. Always `false` without a lift |
-| `dominance` | **metres** the summit stands above the terrain around it, **signed** |
+| `dominance` | **metres** the summit stands above the terrain around it, **signed**, measured from this viewpoint |
+| `prominence` | **metres** of true topographic prominence, precomputed and viewpoint-independent, or **`null` where no DEM summit could be matched** — which means "unknown", never "prominence 0". Null for about two thirds of peaks; see [Prominence](#prominence) |
+| `prom_dist_m` | **metres** between the OSM node and the DEM summit the prominence came from, or `null` alongside it. The match's own error bar — see the table under [Prominence](#prominence) for what each distance is worth |
 
 This is what makes a summit worth a label: one standing clear of its
 neighbours reads as a peak, one on a long level ridge does not, however tall
@@ -627,10 +632,11 @@ better-measured set, since coarse rays miss ground beside a summit and bias its
 from the render, is both — and asking twice guarantees the disagreement is
 visible.
 
-Making this exact needs dominance to stop being a render-time measurement: true
-topographic prominence is a property of the summit, computable once from the
-DEM at ingest and stored with the peak. That would be perfectly stable, free
-per request, and is the intended direction.
+**That is what `prominence` is for**, and it now ships: computed once from the
+DEM across the continent and stored with the peak, so it is identical from
+every viewpoint and costs nothing per request. It does not replace `dominance`
+— the two answer different questions, and a summit seen end-on along its own
+ridge genuinely is unremarkable from there. See [Prominence](#prominence).
 
 Metres, not degrees, because degrees are not comparable across distance: a 2 km
 hill subtends more than the whole High Tatra range and would outrank every

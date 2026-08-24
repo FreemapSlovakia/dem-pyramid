@@ -63,7 +63,10 @@ impl Var {
             "y" => Var::Y,
             "revealed" => Var::Revealed,
             "prominence" => Var::Prominence,
-            "prom_dist" => Var::PromDist,
+            // Spelled exactly as the payload spells it. Two names for one
+            // field is how a client ends up learning the schema by dumping
+            // keys from a response.
+            "prom_dist_m" => Var::PromDist,
             _ => return None,
         })
     }
@@ -71,7 +74,7 @@ impl Var {
     /// For the error message, so a typo is answered with the alternatives
     /// rather than with a shrug.
     pub const NAMES: &'static str = "dominance, distance, altitude, ele, x, y, \
-                                     revealed, prominence, prom_dist";
+                                     revealed, prominence, prom_dist_m";
 }
 
 /// What one peak looks like to a formula.
