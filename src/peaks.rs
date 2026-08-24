@@ -150,6 +150,66 @@ fn split_csv(line: &str) -> Vec<String> {
 /// Visibility was decided during the render, from the columns it marched
 /// anyway; `column` is `Some` exactly when a ray answered the peak.
 ///
+/// Distance exponent the label cut uses unless asked otherwise.
+///
+/// Gentle: it keeps the great distant massifs, which people do want named,
+/// while letting near subordinate tops through. The client re-ranks whatever
+/// it receives, so this only has to make the *cut* land in a sensible place.
+pub const DEFAULT_RANK_POWER: f64 = 0.5;
+
+/// Largest exponent accepted. Well past useful -- at 1 the score is already
+/// dominance per metre of distance -- and a bound at all because the value is
+/// an exponent applied to distances up to 400 km.
+pub const MAX_RANK_POWER: f64 = 4.0;
+
+/// How the label cut is made.
+///
+/// A struct rather than five positional arguments, two of which are `f64` and
+/// one a bare `bool`: transposing any pair compiles and changes which summits
+/// come back.
+pub struct Selection {
+    /// Drop summits scoring below this, metres, signed.
+    pub min_dominance: f64,
+    /// Keep at most this many, highest [`label_rank`] first. 0 is no cap.
+    pub max_peaks: usize,
+    /// Frame height in output pixels; peaks outside it are not in the picture.
+    pub height: usize,
+    /// Whether summits only `depth_lift` brought into view may take slots.
+    pub keep_revealed: bool,
+    /// Exponent on distance in [`label_rank`]. 0 ranks on dominance alone.
+    pub rank_power: f64,
+}
+
+/// How label-worthy a summit is: dominance, discounted by distance.
+///
+/// Dominance is in metres and metres are not a rank. A 400 m top sixty
+/// kilometres out scores far above a 90 m one two kilometres away, while the
+/// near one fills more of the frame and is what a viewer is actually looking
+/// at. Dividing by a power of distance restores that; 0.5 is gentle enough to
+/// keep the great distant massifs, which people do want named.
+///
+/// **The sign is a trap, and getting it backwards is worse than not weighting
+/// at all.** Dominance is signed -- in ridge country most visible tops score
+/// below zero -- and dividing a negative by a larger number *raises* it, so
+/// the same expression that penalises a distant peak rewards a distant one as
+/// soon as its dominance goes negative. Distance has to push the score down
+/// on both sides of zero, which means dividing where it is positive and
+/// multiplying where it is negative. Measured on a 2631-peak Ötztal view,
+/// dividing throughout moved a near subordinate top from 2471st to 2627th --
+/// the opposite of the intent -- where the rule below moves it to 1966th.
+///
+/// Continuous through zero: both branches give 0 at 0.
+pub fn label_rank(dominance: f64, distance: f64, power: f64) -> f64 {
+    // Guards a viewpoint sitting on the summit itself, where the scale would
+    // otherwise be zero and divide a positive dominance to infinity.
+    let scale = distance.max(1.0).powf(power);
+    if dominance >= 0.0 {
+        dominance / scale
+    } else {
+        dominance * scale
+    }
+}
+
 /// One policy, in one place. Both front-ends want the same answer, and while
 /// they each spelled it out the two copies drifted -- a cast here, a clause
 /// there -- and every change to the rule, including the dominance rename, was
@@ -159,29 +219,29 @@ fn split_csv(line: &str) -> Vec<String> {
 /// view may take label slots. It has to be settled here rather than left to
 /// the caller, because `max_peaks` truncates: filter afterwards and a request
 /// for twenty labels returns however many of its twenty happened to be real,
-/// with the near summits it dropped unrecoverable. Dominance is in metres, so
-/// distant ranges outrank near hills -- and revealed peaks are distant by
-/// construction, being the ones that were behind something.
-pub fn select(
-    peaks: &mut Vec<Peak>,
-    min_dominance: f64,
-    max_peaks: usize,
-    height: usize,
-    keep_revealed: bool,
-) {
+/// with the near summits it dropped unrecoverable. Revealed peaks are distant
+/// by construction, being the ones that were behind something.
+pub fn select(peaks: &mut Vec<Peak>, s: &Selection) {
     peaks.retain(|k| {
         k.visible
-            && (keep_revealed || !k.revealed)
+            && (s.keep_revealed || !k.revealed)
             && k.column.is_some()
-            && k.dominance >= min_dominance
+            && k.dominance >= s.min_dominance
             && k.y >= 0.0
-            && k.y <= height as f64
+            && k.y <= s.height as f64
     });
-    peaks.sort_by(|a, b| b.dominance.partial_cmp(&a.dominance).unwrap());
-    // After the sort, so a cap keeps the summits that dominate the view rather
-    // than an arbitrary slice. Zero is no cap.
-    if max_peaks > 0 {
-        peaks.truncate(max_peaks);
+    // `min_dominance` still filters on raw dominance, deliberately: it is a
+    // statement about the landscape -- "nothing flatter than this is a summit"
+    // -- and would stop meaning anything in metres if distance entered it.
+    // Only the cut, which is about label density in a picture, is ranked.
+    peaks.sort_by(|a, b| {
+        let rank = |k: &Peak| label_rank(k.dominance, k.distance, s.rank_power);
+        rank(b).partial_cmp(&rank(a)).unwrap()
+    });
+    // After the sort, so a cap keeps the summits worth labelling rather than
+    // an arbitrary slice. Zero is no cap.
+    if s.max_peaks > 0 {
+        peaks.truncate(s.max_peaks);
     }
 }
 
@@ -210,6 +270,18 @@ mod tests {
         }
     }
 
+    /// The frame and the revealed policy are fixed for most of these; only
+    /// the threshold and the cap vary.
+    fn sel(min_dominance: f64, max_peaks: usize) -> Selection {
+        Selection {
+            min_dominance,
+            max_peaks,
+            height: 600,
+            keep_revealed: true,
+            rank_power: DEFAULT_RANK_POWER,
+        }
+    }
+
     #[test]
     fn select_keeps_only_summits_worth_a_label() {
         let mut peaks = vec![
@@ -220,7 +292,7 @@ mod tests {
             peak(5, 100.0, true, Some(0), -1.0),   // above the frame
             peak(6, 100.0, true, Some(0), 601.0),  // below the frame
         ];
-        select(&mut peaks, 30.0, 0, 600, true);
+        select(&mut peaks, &sel(30.0, 0));
         assert_eq!(peaks.iter().map(|p| p.osm_id).collect::<Vec<_>>(), [1]);
     }
 
@@ -235,7 +307,7 @@ mod tests {
             peak(3, -5.0, true, Some(0), 10.0),
             peak(4, 20.0, true, Some(0), 10.0),
         ];
-        select(&mut peaks, -100.0, 0, 600, true);
+        select(&mut peaks, &sel(-100.0, 0));
         assert_eq!(
             peaks.iter().map(|p| p.osm_id).collect::<Vec<_>>(),
             [2, 4, 3, 1]
@@ -251,14 +323,14 @@ mod tests {
             peak(2, 900.0, true, Some(0), 10.0),
             peak(3, 500.0, true, Some(0), 10.0),
         ];
-        select(&mut peaks, -1000.0, 2, 600, true);
+        select(&mut peaks, &sel(-1000.0, 2));
         assert_eq!(peaks.iter().map(|p| p.osm_id).collect::<Vec<_>>(), [2, 3]);
     }
 
     #[test]
     fn zero_means_no_cap() {
         let mut peaks = (0..5).map(|i| peak(i, 100.0, true, Some(0), 10.0)).collect();
-        select(&mut peaks, 0.0, 0, 600, true);
+        select(&mut peaks, &sel(0.0, 0));
         assert_eq!(peaks.len(), 5);
     }
 
@@ -284,13 +356,57 @@ mod tests {
 
         // Kept: the lift was asked for, so what it brought out gets labelled.
         let mut all = candidates();
-        select(&mut all, 0.0, 2, 600, true);
+        select(&mut all, &sel(0.0, 2));
         assert_eq!(all.iter().map(|p| p.osm_id).collect::<Vec<_>>(), [1, 2]);
 
         // Refused: the cap now spends both slots on summits actually in sight,
         // rather than returning two labels of which none are.
         let mut real = candidates();
-        select(&mut real, 0.0, 2, 600, false);
+        select(
+            &mut real,
+            &Selection {
+                keep_revealed: false,
+                ..sel(0.0, 2)
+            },
+        );
         assert_eq!(real.iter().map(|p| p.osm_id).collect::<Vec<_>>(), [3, 4]);
+    }
+
+    /// The sign rule, pinned with the numbers that exposed it.
+    ///
+    /// Both of these are real summits from a 2631-peak Ötztal view: a near
+    /// subordinate top the client wants labelled, and the peak that sat on
+    /// the `max_peaks: 2000` boundary. Dividing throughout -- the obvious
+    /// reading of "discount by distance" -- ranks the near one *below* the
+    /// boundary, which is how the bug reached production in the first place.
+    #[test]
+    fn distance_pushes_a_score_down_on_both_sides_of_zero() {
+        let (near, far) = ((-259.9, 2117.7), (-60.4, 45_000.0));
+
+        // The rule: a distant negative is worse than a near one of the same
+        // depth, and worse than a shallower near one that is far enough out.
+        assert!(label_rank(near.0, near.1, 0.5) > label_rank(far.0, far.1, 0.5));
+        // Naive division inverts exactly that, which is the trap.
+        assert!(near.0 / near.1.sqrt() < far.0 / far.1.sqrt());
+
+        // Positives are discounted too, or a distant massif outranks
+        // everything near it.
+        assert!(label_rank(100.0, 2_000.0, 0.5) > label_rank(400.0, 60_000.0, 0.5));
+
+        // Monotone in distance on both sides, for any exponent.
+        for power in [0.25, 0.5, 1.0, MAX_RANK_POWER] {
+            for dominance in [-500.0, -1.0, 0.0, 1.0, 500.0] {
+                let (near, far) = (
+                    label_rank(dominance, 1_000.0, power),
+                    label_rank(dominance, 100_000.0, power),
+                );
+                assert!(near >= far, "{dominance} at power {power}: {near} < {far}");
+            }
+        }
+
+        // Zero exponent is the old behaviour exactly, both signs.
+        for dominance in [-500.0, 0.0, 500.0] {
+            assert_eq!(label_rank(dominance, 12_345.0, 0.0), dominance);
+        }
     }
 }

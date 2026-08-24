@@ -137,9 +137,14 @@ pub struct Request {
     /// the default.
     #[serde(default = "d_true")]
     revealed_peaks: bool,
+    /// Exponent on distance when `max_peaks` decides which summits to keep.
+    /// 0 ranks on dominance alone, which is what this did before.
+    #[serde(default = "d_rank_power")]
+    peak_rank_power: f64,
 }
 
 fn d_true() -> bool { true }
+fn d_rank_power() -> f64 { peaks::DEFAULT_RANK_POWER }
 
 #[derive(Deserialize, Clone, Copy, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -431,6 +436,7 @@ async fn panorama_route(
         ("range", req.range),
         ("min_dominance", req.min_dominance),
         ("dither_strength", req.dither_strength),
+        ("peak_rank_power", req.peak_rank_power),
     ] {
         if !v.is_finite() {
             return bad(format!("{name} must be a finite number"));
@@ -438,6 +444,14 @@ async fn panorama_route(
     }
     if let Err(e) = panorama::validate_style(req.ridge_strength, req.ridge_width, req.depth_lift) {
         return bad(e.to_string());
+    }
+    if !(0.0..=peaks::MAX_RANK_POWER).contains(&req.peak_rank_power) {
+        // Negative would invert the weighting -- distance would *raise* a
+        // score -- and quietly return the most remote summits in the data.
+        return bad(format!(
+            "peak_rank_power must lie within 0..{}",
+            peaks::MAX_RANK_POWER
+        ));
     }
     if !(-90.0..=90.0).contains(&req.alt_min) || !(-90.0..=90.0).contains(&req.alt_max) {
         return bad("alt_min and alt_max must lie within -90..90");
@@ -531,6 +545,7 @@ async fn panorama_route(
     let min_dom = req.min_dominance;
     let max_peaks = req.max_peaks;
     let keep_revealed = req.revealed_peaks;
+    let rank_power = req.peak_rank_power;
 
     let render_cancel = cancel.clone();
     let built = tokio::task::spawn_blocking(move || -> Result<Vec<Part>> {
@@ -556,7 +571,16 @@ async fn panorama_route(
             job.set_phase(Phase::Encoding);
         }
 
-        peaks::select(&mut found, min_dom, max_peaks, stats.height, keep_revealed);
+        peaks::select(
+            &mut found,
+            &peaks::Selection {
+                min_dominance: min_dom,
+                max_peaks,
+                height: stats.height,
+                keep_revealed,
+                rank_power,
+            },
+        );
 
         let meta = serde_json::json!({
             "width": stats.width,

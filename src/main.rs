@@ -201,6 +201,10 @@ enum Command {
         /// nothing the eye cannot see. Nothing is revealed without a lift.
         #[arg(long, default_value_t = false)]
         no_revealed_peaks: bool,
+        /// Exponent on distance when --max-peaks decides what to keep.
+        /// 0 ranks on dominance alone.
+        #[arg(long, default_value_t = peaks::DEFAULT_RANK_POWER)]
+        peak_rank_power: f64,
         /// Keep at most this many peaks, most dominant first. 0 is no cap.
         #[arg(long, default_value_t = 0)]
         max_peaks: usize,
@@ -378,6 +382,7 @@ fn main() -> Result<()> {
             peaks_out,
             min_dominance,
             no_revealed_peaks,
+            peak_rank_power,
             max_peaks,
             supersample_x,
             supersample_y,
@@ -404,10 +409,16 @@ fn main() -> Result<()> {
                 ("range", range),
                 ("min-dominance", min_dominance),
                 ("dither-strength", dither_strength),
+                ("peak-rank-power", peak_rank_power),
             ] {
                 anyhow::ensure!(v.is_finite(), "--{name} must be a finite number");
             }
             anyhow::ensure!(range > 0.0, "--range must be positive");
+            anyhow::ensure!(
+                (0.0..=peaks::MAX_RANK_POWER).contains(&peak_rank_power),
+                "--peak-rank-power must lie within 0..{}",
+                peaks::MAX_RANK_POWER
+            );
             let p = panorama::Params {
                 lon,
                 lat,
@@ -511,10 +522,13 @@ fn main() -> Result<()> {
             if peaks_path.is_some() {
                 peaks::select(
                     &mut cands,
-                    min_dominance,
-                    max_peaks,
-                    stats.height,
-                    !no_revealed_peaks,
+                    &peaks::Selection {
+                        min_dominance,
+                        max_peaks,
+                        height: stats.height,
+                        keep_revealed: !no_revealed_peaks,
+                        rank_power: peak_rank_power,
+                    },
                 );
 
                 let dst = peaks_out.unwrap_or_else(|| out.with_extension("json"));

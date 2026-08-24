@@ -53,6 +53,7 @@ All fields except `lon` and `lat` are optional.
 | `ground_color` | string | `#3a4a34` | near-terrain colour, before haze |
 | `depth_lift` | number | `0` | degrees of extra elevation at `range`, tapering to nothing at the eye (0–45); see [Depth lift](#depth-lift) |
 | `revealed_peaks` | bool | `true` | let summits only `depth_lift` brought into view take label slots |
+| `peak_rank_power` | number | `0.5` | exponent on distance in the `max_peaks` cut (0–4); `0` ranks on raw dominance |
 
 Image dimensions follow from the angles:
 
@@ -81,6 +82,36 @@ Measured on a 12-core machine, 360°, peaks and depth included:
 
 A 60–120° viewport is proportionally cheaper. Peaks add roughly a second;
 depth costs almost nothing.
+
+#### What peaks cost, and what `max_peaks` does not
+
+The peak pass scales with **candidates within `range`**, not with how many you
+ask to keep. Everything expensive — reading each summit's elevation, answering
+the two rays that bracket its bearing, and the dominance sweep — runs over the
+whole candidate set, before `max_peaks` is looked at. On a 360° Ötztal view
+with 52 728 candidates in range, peaks took the render from **11.4 s to 13.5 s**
+(best of three, on a busy host): about 2 s, and that 2 s is the same whether
+you keep 50 peaks or all 2631.
+
+**`max_peaks` is a truncation before serialization and nothing else.** Raising
+it costs the server no measurable time — only bytes:
+
+| peaks returned | payload |
+|---|---|
+| 50 | 415 KB |
+| 2000 | 1085 KB |
+| 2631 (uncapped) | 1302 KB |
+
+That is **~344 B per peak**, linear and consistent to 0.2% across the range
+(`bytes ≈ 397 500 + 344·n` on that view). So a cap is a client-side bandwidth
+decision, not a server-load one. The bytes go on full `f64` precision —
+`"distance": 116483.52984247255`, `"ele": 3198.131752006181` — so if the
+payload matters more than the resolution, say so and the numbers can be
+rounded to something defensible (0.1 m, 6 decimal places of latitude) for
+roughly a quarter off.
+
+What *does* cost is `range`, through the candidate count, and `min_dominance`,
+through how many survive to be measured.
 
 Three things multiply those figures, and they compound:
 
@@ -349,10 +380,40 @@ already including `eye`.
 ### Peaks
 
 Only peaks that are **visible and pass `min_dominance`** are returned, sorted
-by `dominance` descending and then cut to `max_peaks`. Because the cut comes
-after the sort, a small `max_peaks` keeps the summits that dominate the view
-rather than an arbitrary slice — it is the cheapest way to control label
-density, and it costs the server nothing.
+by label rank and then cut to `max_peaks`. Because the cut comes after the
+sort, a small `max_peaks` keeps the summits worth labelling rather than an
+arbitrary slice — it is the cheapest way to control label density, and it
+costs the server nothing.
+
+#### What `max_peaks` keeps
+
+Not the highest `dominance`. Dominance is in metres and **metres are not a
+rank**: a 400 m top sixty kilometres out scores far above a 90 m one two
+kilometres away, while the near one fills more of the frame and is what a
+viewer is looking at. The cut therefore orders by
+
+```
+rank = dominance / distance ** peak_rank_power     where dominance >= 0
+rank = dominance * distance ** peak_rank_power     where dominance <  0
+```
+
+with `peak_rank_power` defaulting to `0.5`. **`peak_rank_power: 0` gives the
+old ordering exactly** — raw dominance, both branches collapsing to it.
+
+The two branches are not a quirk. Dominance is signed, and dividing a negative
+by a larger number *raises* it, so a single expression that penalises a distant
+peak starts rewarding one the moment its dominance goes negative — which in
+ridge country is most visible tops. Measured on the 2631-peak Ötztal view that
+prompted this: a near subordinate top sat 2471st under raw dominance, **2627th**
+under naive division, and **1966th** under the rule above, which is what brings
+it inside a `max_peaks: 2000` cut.
+
+`dominance` itself is untouched in the payload, so a client is free to re-rank
+however it likes — the ordering only decides *which* peaks survive to be sent.
+If your client uses its own exponent, send the same one here so the cut and the
+re-rank agree. Raising the exponent favours the near field steadily: on that
+same view the top moves 2471 → 2249 → 1966 → 1647 → 1419 for
+`peak_rank_power` 0 → 0.25 → 0.5 → 0.75 → 1.
 
 ```json
 {
@@ -438,9 +499,10 @@ per request, and is the intended direction.
 
 Metres, not degrees, because degrees are not comparable across distance: a 2 km
 hill subtends more than the whole High Tatra range and would outrank every
-summit in it. Beware that the reverse also holds — ranking purely by metres
-puts a big distant massif above a nearby hill that fills far more of the frame.
-For label placement, weigh `dominance` against `distance`.
+summit in it. The reverse also holds — ranking purely by metres puts a big
+distant massif above a nearby hill that fills far more of the frame — which is
+why the `max_peaks` cut weighs distance in, and why you should too when placing
+labels. `dominance` is reported raw so you can.
 
 `x` and `y` are fractional — place labels at sub-pixel positions.
 
