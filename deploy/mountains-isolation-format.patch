@@ -1,0 +1,83 @@
+Give `isolation` the -f flag that `prominence` in the same repo already has.
+
+Upstream hardcodes `FileFormat::Value::HGT` -- SRTM 3-arcsecond, 1201x1201 --
+with a TODO beside it asking for exactly this. Our tiles are 1-arcsecond,
+3601x3601, cut from GEDTM30, so the unpatched binary reads every one with the
+wrong stride. It does not fail: it reports wrong elevations at wrong places,
+which is the kind of answer that gets believed.
+
+The `case 'f'` block is copied from prominence.cpp so the two agree on what a
+format name means. Worth sending upstream; until then this file is the fork.
+
+  git -C mountains apply .../deploy/mountains-isolation-format.patch
+diff --git a/code/isolation.cpp b/code/isolation.cpp
+index 5b00d83..925c470 100644
+--- a/code/isolation.cpp
++++ b/code/isolation.cpp
+@@ -52,6 +52,7 @@ static void usage() {
+   printf("  Options:\n");
+   printf("  -i directory     Directory with terrain data\n");
+   printf("  -m min_isolation Minimum isolation threshold for output, default = 1km\n");
++  printf("  -f format        \"SRTM\", \"SRTM30\", \"GLO30\", ...; default SRTM\n");
+   printf("  -o directory     Directory for output data\n");
+   printf("  -t num_threads   Number of threads, default = 1\n");
+   exit(1);
+@@ -60,6 +61,7 @@ static void usage() {
+ int main(int argc, char **argv) {
+   string terrain_directory(".");
+   string output_directory(".");
++  std::unique_ptr<FileFormat> fileFormat(new FileFormat(FileFormat::Value::HGT));
+ 
+   float minIsolation = 1;
+   int numThreads = 1;
+@@ -72,8 +74,19 @@ int main(int argc, char **argv) {
+     {"v", required_argument, nullptr, 0},
+     {nullptr, 0, 0, 0},
+   };
+-  while ((ch = getopt_long(argc, argv, "i:m:o:t:", long_options, nullptr)) != -1) {
++  while ((ch = getopt_long(argc, argv, "f:i:m:o:t:", long_options, nullptr)) != -1) {
+     switch (ch) {
++    case 'f': {
++      auto format = FileFormat::fromName(optarg);
++      if (format == nullptr) {
++        LOG(ERROR) << "Unknown file format " << optarg;
++        usage();
++      }
++
++      fileFormat.reset(format);
++      break;
++    }
++
+     case 'i':
+       terrain_directory = optarg;
+       break;
+@@ -109,9 +122,7 @@ int main(int argc, char **argv) {
+     }
+   }
+ 
+-  // TODO: Maybe support other file formats in the future?
+-  FileFormat fileFormat(FileFormat::Value::HGT);
+-  BasicTileLoadingPolicy policy(terrain_directory, fileFormat);
++  BasicTileLoadingPolicy policy(terrain_directory, *fileFormat);
+   const int CACHE_SIZE = 50;
+   auto cache = std::make_unique<TileCache>(&policy, CACHE_SIZE);
+ 
+@@ -123,12 +134,15 @@ int main(int argc, char **argv) {
+   for (auto lat = (float) floor(bounds[0]); lat < ceil(bounds[1]); lat += 1) {
+      for (auto lng = (float) floor(bounds[2]); lng < ceil(bounds[3]); lng += 1) {
+        std::shared_ptr<CoordinateSystem> coordinateSystem(
+-         fileFormat.coordinateSystemForOrigin(lat, lng));
+-       
++         fileFormat->coordinateSystemForOrigin(lat, lng));
++
+       IsolationTask *task = new IsolationTask(
+         cache.get(), output_directory, bounds, minIsolation);
++      // By value, because the lambda outlives this scope on the thread pool
++      // and the unique_ptr stays here.
++      FileFormat format = *fileFormat;
+       results.push_back(threadPool->enqueue([=] {
+-            return task->run(lat, lng, *coordinateSystem, fileFormat);
++            return task->run(lat, lng, *coordinateSystem, format);
+           }));
+     }
+   }
