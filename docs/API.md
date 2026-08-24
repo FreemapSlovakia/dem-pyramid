@@ -742,8 +742,17 @@ window" for Elbrus, whose chain runs into Asia.
 
 #### Coverage, and why it is what it is
 
-**167 053 of 488 232 peaks carry a prominence** — nearer 45% at a mountainous
-viewpoint, since the unmatched skew to minor tops. Of the 321 179 without one:
+**180 271 of 488 232 peaks carry a prominence** — nearer half at a mountainous
+viewpoint, since the unmatched skew to minor tops.
+
+Matches are made two ways. Within **150 m**, position alone is enough. Between
+150 m and **400 m**, a summit is accepted only if its elevation also agrees
+with the OSM tag within 50 m — position *and* height agreeing at 400 m is a
+stronger claim than position alone at half that. The second rule accounts for
+13 218 of the total, and they are disproportionately peaks that had nothing:
+Κέρκης on Samos, Mali i Dejës, Ameringkogel.
+
+Of the peaks still without one:
 
 | | count | share |
 |---|---|---|
