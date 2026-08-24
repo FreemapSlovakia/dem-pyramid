@@ -55,6 +55,7 @@ All fields except `lon` and `lat` are optional.
 | `revealed_peaks` | bool | `true` | let summits only `depth_lift` brought into view take label slots |
 | `peak_rank_power` | number | `0.5` | exponent on distance in the `max_peaks` cut (0–4); `0` ranks on raw dominance |
 | `peak_profile_step` | number | `0.2` | degrees per column of the grid `dominance` is measured on (0.02–2), independent of `step` and `supersample_x`; held to the ray spacing if finer |
+| `peak_rank` | expression | — | formula deciding which summits `max_peaks` keeps; see [Ranking formula](#ranking-formula). Overrides `peak_rank_power` |
 
 Image dimensions follow from the angles:
 
@@ -414,6 +415,71 @@ ridge country is most visible tops. Measured on the 2631-peak Ötztal view that
 prompted this: a near subordinate top sat 2471st under raw dominance, **2627th**
 under naive division, and **1966th** under the rule above, which is what brings
 it inside a `max_peaks: 2000` cut.
+
+#### Ranking formula
+
+`peak_rank_power` is a single knob, and with `prominence` alongside `dominance`
+there is no single number that says how the two should be weighed. So the
+formula can come in the request:
+
+```jsonc
+// today's default, written out — sending this changes nothing
+"peak_rank": ["/", ["get", "dominance"],
+                   ["^", ["max", ["get", "distance"], 1],
+                         ["*", 0.5, ["sign", ["get", "dominance"]]]]]
+
+// prominence alone
+"peak_rank": ["coalesce", ["get", "prominence"], 0]
+
+// both: standing-out from here, plus being a mountain at all
+"peak_rank": ["+",
+  ["/", ["get","dominance"],
+        ["^", ["max", ["get","distance"], 1],
+              ["*", 0.5, ["sign", ["get","dominance"]]]]],
+  ["*", 0.3, ["coalesce", ["get","prominence"], 0]]]
+
+// demote summits only depth_lift revealed
+"peak_rank": ["-", ["get", "dominance"], ["*", 500, ["get", "revealed"]]]
+
+// trust prominence less the further it had to be matched
+"peak_rank": ["*", ["coalesce", ["get","prominence"], 0],
+                   ["max", 0, ["-", 1, ["/", ["coalesce", ["get","prom_dist"], 999], 100]]]]
+```
+
+The shape is MapLibre's — JSON prefix arrays — **but this is not MapLibre
+expressions and does not implement them.** The syntax is borrowed because
+clients already read and write it; the operators are ours.
+
+**Operators.** `get` `coalesce` · `+` `-` `*` `/` `^` `min` `max` · `abs`
+`sign` `sqrt` `ln` `log2` `log10` `exp`. `+` `*` `min` `max` and `coalesce`
+take any number of arguments; `-` takes one (negate) or two (subtract).
+Everything is floating point, so `["/", 1, 2]` is 0.5.
+
+**Properties.** `dominance` `distance` `altitude` `ele` `x` `y` `revealed`
+`prominence` `prom_dist`. `revealed` is 0 or 1, so weight it arithmetically.
+
+**Nulls are real.** `prominence` and `prom_dist` are null for two thirds of
+peaks, and null propagates through every operator — `["*", 0, ["get",
+"prominence"]]` is null, not 0. Only `coalesce` stops it. A formula that
+forgets ranks those peaks **last**, which is loud; treating a missing
+prominence as 0 would rank real mountains as flat, which is not.
+
+**Anything unusable ranks last.** Null, `NaN` and infinity — from `ln(0)`,
+`0/0`, a negative base to a fractional power — all sort worst. A peak the
+formula could not score is never promoted by that failure.
+
+**Mistakes are `400`s, not surprises.** Unknown operator, unknown property,
+wrong arity and unbalanced expressions are all rejected before a render slot
+is taken, naming the JSON path:
+
+```
+peak_rank: unknown property `prominance`; expected one of dominance, distance,
+altitude, ele, x, y, revealed, prominence, prom_dist at $[1]
+```
+
+A misspelled property is the mistake most worth catching this way — MapLibre
+itself would return null for it and rank every peak identically, with nothing
+to say why.
 
 `min_dominance` still filters on **raw** metres, deliberately: it is a
 statement about the landscape — "nothing flatter than this is a summit" — and

@@ -18,6 +18,7 @@ mod panorama;
 mod peaks;
 mod progress;
 mod queue;
+mod rank;
 mod server;
 mod viewshed;
 
@@ -543,6 +544,7 @@ fn main() -> Result<()> {
                         height: stats.height,
                         keep_revealed: !no_revealed_peaks,
                         rank_power: peak_rank_power,
+                        rank: None,
                     },
                 );
 

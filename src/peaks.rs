@@ -265,6 +265,13 @@ pub struct Selection {
     pub keep_revealed: bool,
     /// Exponent on distance in [`label_rank`]. 0 ranks on dominance alone.
     pub rank_power: f64,
+    /// A caller-supplied formula, which overrides `rank_power` entirely.
+    ///
+    /// Here rather than in the client because `max_peaks` truncates: a cut
+    /// made on our criterion throws away exactly what a client ranking on its
+    /// own criterion would have kept, and no amount of re-ranking afterwards
+    /// gets it back.
+    pub rank: Option<crate::rank::Program>,
 }
 
 /// How label-worthy a summit is: dominance, discounted by distance.
@@ -336,7 +343,20 @@ pub fn select(peaks: &mut Vec<Peak>, s: &Selection) {
     // are public with public fields, so that guarantee lives entirely in
     // validators in other files. This costs the same and cannot panic.
     peaks.sort_by(|a, b| {
-        let rank = |k: &Peak| label_rank(k.dominance, k.distance, s.rank_power);
+        let rank = |k: &Peak| match &s.rank {
+            Some(p) => p.rank(&crate::rank::Vars {
+                dominance: k.dominance,
+                distance: k.distance,
+                altitude: k.altitude,
+                ele: k.ele,
+                x: k.x,
+                y: k.y,
+                revealed: k.revealed,
+                prominence: k.prominence,
+                prom_dist: k.prom_dist_m,
+            }),
+            None => label_rank(k.dominance, k.distance, s.rank_power),
+        };
         rank(b).total_cmp(&rank(a))
     });
     // After the sort, so a cap keeps the summits worth labelling rather than
@@ -382,6 +402,7 @@ mod tests {
             height: 600,
             keep_revealed: true,
             rank_power: DEFAULT_RANK_POWER,
+            rank: None,
         }
     }
 

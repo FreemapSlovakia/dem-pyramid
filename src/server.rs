@@ -167,6 +167,10 @@ pub struct Request {
     /// value used comes back as `meta.peak_profile_step`.
     #[serde(default = "d_profile_step")]
     peak_profile_step: f64,
+    /// Formula deciding which summits `max_peaks` keeps, as a MapLibre-shaped
+    /// JSON prefix expression. Overrides `peak_rank_power`. See `rank`.
+    #[serde(default)]
+    peak_rank: Option<serde_json::Value>,
 }
 
 fn d_true() -> bool { true }
@@ -589,6 +593,15 @@ async fn panorama_route(
     let max_peaks = req.max_peaks;
     let keep_revealed = req.revealed_peaks;
     let rank_power = req.peak_rank_power;
+    // Compiled here, before a render slot is taken, so a bad formula costs the
+    // caller a 400 rather than costing everyone twenty seconds of queue.
+    let rank = match &req.peak_rank {
+        Some(j) => match crate::rank::Program::compile(j) {
+            Ok(p) => Some(p),
+            Err(e) => return bad(format!("peak_rank: {e}")),
+        },
+        None => None,
+    };
 
     let render_cancel = cancel.clone();
     let built = tokio::task::spawn_blocking(move || -> Result<Vec<Part>> {
@@ -622,6 +635,7 @@ async fn panorama_route(
                 height: stats.height,
                 keep_revealed,
                 rank_power,
+                rank,
             },
         );
 
