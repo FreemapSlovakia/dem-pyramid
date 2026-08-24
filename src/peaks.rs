@@ -285,17 +285,50 @@ fn split_csv(line: &str) -> Vec<String> {
     out
 }
 
-/// Distance exponent the label cut uses unless asked otherwise.
+/// What the label cut orders by when the caller gives no formula.
 ///
-/// Gentle: it keeps the great distant massifs, which people do want named,
-/// while letting near subordinate tops through. The client re-ranks whatever
-/// it receives, so this only has to make the *cut* land in a sensible place.
-pub const DEFAULT_RANK_POWER: f64 = 0.5;
-
-/// Largest exponent accepted. Well past useful -- at 1 the score is already
-/// dominance per metre of distance -- and a bound at all because the value is
-/// an exponent applied to distances up to 400 km.
-pub const MAX_RANK_POWER: f64 = 4.0;
+/// It is the documented default expression, and it is the *only*
+/// implementation of it. There used to be a second -- a Rust `label_rank`
+/// with an exponent parameter -- and a test kept the two in step. The
+/// documentation's promise that "sending this formula changes nothing" was
+/// then true because a test said so; now it is true because there is nothing
+/// else for it to differ from.
+///
+/// The shape it encodes, and why it is not simply `dominance`:
+///
+/// Dominance is in metres and metres are not a rank. A 400 m top sixty
+/// kilometres out scores far above a 90 m one two kilometres away, while the
+/// near one fills more of the frame and is what a viewer is actually looking
+/// at. Dividing by the square root of distance restores that, gently enough
+/// to keep the great distant massifs people do want named.
+///
+/// **The sign is a trap, and getting it backwards is worse than not weighting
+/// at all.** Dominance is signed -- in ridge country most visible tops score
+/// below zero -- and dividing a negative by a larger number *raises* it, so
+/// the same expression that penalises a distant peak rewards a distant one as
+/// soon as its dominance goes negative. Distance has to push the score down
+/// on both sides of zero, which is what folding `sign` into the exponent
+/// does: positive dominance divides by `distance^0.5`, negative multiplies,
+/// because dividing by `distance^-0.5` is multiplying. Measured on a
+/// 2631-peak Ötztal view, dividing throughout moved a near subordinate top
+/// from 2471st to 2627th -- the opposite of the intent -- where this rule
+/// moves it to 1966th.
+///
+/// `max(distance, 1)` guards a viewpoint standing on the summit it is
+/// ranking, where `distance^0.5` would be zero and the division infinite.
+/// Continuous through zero: `sign` is 0 there, `distance^0` is 1, 0/1 is 0.
+fn default_rank() -> &'static crate::rank::Program {
+    static P: std::sync::OnceLock<crate::rank::Program> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        crate::rank::Program::compile(&serde_json::json!([
+            "/",
+            ["get", "dominance"],
+            ["^", ["max", ["get", "distance"], 1],
+                  ["*", 0.5, ["sign", ["get", "dominance"]]]]
+        ]))
+        .expect("the built-in ranking formula must compile")
+    })
+}
 
 /// How the label cut is made.
 ///
@@ -305,15 +338,13 @@ pub const MAX_RANK_POWER: f64 = 4.0;
 pub struct Selection {
     /// Drop summits scoring below this, metres, signed.
     pub min_dominance: f64,
-    /// Keep at most this many, highest [`label_rank`] first. 0 is no cap.
+    /// Keep at most this many, highest-ranked first. 0 is no cap.
     pub max_peaks: usize,
     /// Frame height in output pixels; peaks outside it are not in the picture.
     pub height: usize,
     /// Whether summits only `depth_lift` brought into view may take slots.
     pub keep_revealed: bool,
-    /// Exponent on distance in [`label_rank`]. 0 ranks on dominance alone.
-    pub rank_power: f64,
-    /// A caller-supplied formula, which overrides `rank_power` entirely.
+    /// A caller-supplied formula, used instead of [`default_rank`].
     ///
     /// Here rather than in the client because `max_peaks` truncates: a cut
     /// made on our criterion throws away exactly what a client ranking on its
@@ -346,35 +377,6 @@ fn vars(k: &Peak) -> crate::rank::Vars {
     }
 }
 
-/// How label-worthy a summit is: dominance, discounted by distance.
-///
-/// Dominance is in metres and metres are not a rank. A 400 m top sixty
-/// kilometres out scores far above a 90 m one two kilometres away, while the
-/// near one fills more of the frame and is what a viewer is actually looking
-/// at. Dividing by a power of distance restores that; 0.5 is gentle enough to
-/// keep the great distant massifs, which people do want named.
-///
-/// **The sign is a trap, and getting it backwards is worse than not weighting
-/// at all.** Dominance is signed -- in ridge country most visible tops score
-/// below zero -- and dividing a negative by a larger number *raises* it, so
-/// the same expression that penalises a distant peak rewards a distant one as
-/// soon as its dominance goes negative. Distance has to push the score down
-/// on both sides of zero, which means dividing where it is positive and
-/// multiplying where it is negative. Measured on a 2631-peak Ötztal view,
-/// dividing throughout moved a near subordinate top from 2471st to 2627th --
-/// the opposite of the intent -- where the rule below moves it to 1966th.
-///
-/// Continuous through zero: both branches give 0 at 0.
-pub fn label_rank(dominance: f64, distance: f64, power: f64) -> f64 {
-    // Guards a viewpoint sitting on the summit itself, where the scale would
-    // otherwise be zero and divide a positive dominance to infinity.
-    let scale = distance.max(1.0).powf(power);
-    if dominance >= 0.0 {
-        dominance / scale
-    } else {
-        dominance * scale
-    }
-}
 
 /// Which summits earn a label, most label-worthy first.
 ///
@@ -424,11 +426,9 @@ pub fn select(peaks: &mut Vec<Peak>, s: &Selection) {
     // comparator -- which is both cheaper and the only way the value can be
     // returned to the caller. An ordering nobody can see is one nobody can
     // debug.
+    let program = s.rank.as_ref().unwrap_or_else(|| default_rank());
     for k in peaks.iter_mut() {
-        k.rank = Some(match &s.rank {
-            Some(p) => p.rank(&vars(k)),
-            None => label_rank(k.dominance, k.distance, s.rank_power),
-        });
+        k.rank = Some(program.rank(&vars(k)));
     }
     // `total_cmp`, so a formula producing NaN sorts somewhere definite rather
     // than wherever the comparison happens to leave it.
@@ -480,7 +480,6 @@ mod tests {
             max_peaks,
             height: 600,
             keep_revealed: true,
-            rank_power: DEFAULT_RANK_POWER,
             rank: None,
             filter: None,
         }
@@ -641,7 +640,7 @@ mod tests {
         select(&mut peaks, &sel(0.0, 0));
         assert_eq!(peaks[0].osm_id, 2);
         for p in &peaks {
-            let want = label_rank(p.dominance, p.distance, DEFAULT_RANK_POWER);
+            let want = default_rank().rank(&vars(p));
             assert!((p.rank.expect("rank is returned") - want).abs() < 1e-9);
         }
     }
@@ -653,34 +652,36 @@ mod tests {
     /// the `max_peaks: 2000` boundary. Dividing throughout -- the obvious
     /// reading of "discount by distance" -- ranks the near one *below* the
     /// boundary, which is how the bug reached production in the first place.
+    ///
+    /// It now tests the compiled default rather than a second Rust
+    /// implementation of it, because there is no longer a second one.
     #[test]
     fn distance_pushes_a_score_down_on_both_sides_of_zero() {
-        let (near, far) = ((-259.9, 2117.7), (-60.4, 45_000.0));
+        let score = |dominance: f64, distance: f64| {
+            let mut k = peak(1, dominance, true, Some(0), 10.0);
+            k.distance = distance;
+            default_rank().rank(&vars(&k))
+        };
+        let (near, far) = ((-259.9f64, 2117.7f64), (-60.4f64, 45_000.0f64));
 
-        // The rule: a distant negative is worse than a near one of the same
-        // depth, and worse than a shallower near one that is far enough out.
-        assert!(label_rank(near.0, near.1, 0.5) > label_rank(far.0, far.1, 0.5));
+        // A distant negative is worse than a near one, even a deeper one.
+        assert!(score(near.0, near.1) > score(far.0, far.1));
         // Naive division inverts exactly that, which is the trap.
         assert!(near.0 / near.1.sqrt() < far.0 / far.1.sqrt());
 
         // Positives are discounted too, or a distant massif outranks
         // everything near it.
-        assert!(label_rank(100.0, 2_000.0, 0.5) > label_rank(400.0, 60_000.0, 0.5));
+        assert!(score(100.0, 2_000.0) > score(400.0, 60_000.0));
 
-        // Monotone in distance on both sides, for any exponent.
-        for power in [0.25, 0.5, 1.0, MAX_RANK_POWER] {
-            for dominance in [-500.0, -1.0, 0.0, 1.0, 500.0] {
-                let (near, far) = (
-                    label_rank(dominance, 1_000.0, power),
-                    label_rank(dominance, 100_000.0, power),
-                );
-                assert!(near >= far, "{dominance} at power {power}: {near} < {far}");
-            }
+        // Monotone in distance on both sides of zero.
+        for dominance in [-500.0, -1.0, 0.0, 1.0, 500.0] {
+            let (n, f) = (score(dominance, 1_000.0), score(dominance, 100_000.0));
+            assert!(n >= f, "{dominance}: near {n} ranked below far {f}");
         }
 
-        // Zero exponent is the old behaviour exactly, both signs.
-        for dominance in [-500.0, 0.0, 500.0] {
-            assert_eq!(label_rank(dominance, 12_345.0, 0.0), dominance);
-        }
+        // Continuous through zero, and the one-metre guard holds where a
+        // viewpoint stands on the summit it is ranking.
+        assert_eq!(score(0.0, 12_345.0), 0.0);
+        assert!(score(100.0, 0.0).is_finite());
     }
 }

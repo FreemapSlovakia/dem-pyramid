@@ -586,10 +586,13 @@ mod tests {
         Program::compile(j).expect("should compile").eval(v)
     }
 
-    /// The formula the server uses today, and the Rust it has to agree with.
-    /// If these ever drift, every ranking drifts with them.
+    /// The sign folded into the exponent is the whole trick, so it is checked
+    /// against arithmetic written out longhand rather than against another
+    /// copy of itself. There used to be a second implementation in Rust and a
+    /// test that the two agreed; deleting it is what made the documented
+    /// default formula the only one there is.
     #[test]
-    fn the_default_formula_reproduces_label_rank() {
+    fn the_default_formula_weights_distance_on_both_sides_of_zero() {
         let f = json!([
             "/",
             ["get", "dominance"],
@@ -598,20 +601,26 @@ mod tests {
         ]);
         let p = Program::compile(&f).unwrap();
 
-        // Both sides of zero, and zero itself, with the real numbers from the
-        // report that prompted the distance weighting.
+        // Real numbers from the report that prompted the distance weighting.
         for (dominance, distance) in [
-            (360.9, 31_273.6),   // Gerlach, dominant and far
-            (-259.9, 2_117.7),   // Wazekopf, subordinate and near
-            (0.0, 5_000.0),      // exactly on the boundary
-            (100.0, 0.0),        // standing on the summit being ranked
-            (-50.0, 0.5),        // inside the one-metre guard
+            (360.9f64, 31_273.6f64), // Gerlach, dominant and far
+            (-259.9, 2_117.7),       // Wazekopf, subordinate and near
+            (0.0, 5_000.0),          // exactly on the boundary
+            (100.0, 0.0),            // standing on the summit being ranked
+            (-50.0, 0.5),            // inside the one-metre guard
         ] {
-            let ours = p.eval(&peak(dominance, distance)).unwrap();
-            let theirs = crate::peaks::label_rank(dominance, distance, 0.5);
+            let scale = distance.max(1.0).sqrt();
+            let want = if dominance > 0.0 {
+                dominance / scale
+            } else if dominance < 0.0 {
+                dominance * scale
+            } else {
+                0.0
+            };
+            let got = p.eval(&peak(dominance, distance)).unwrap();
             assert!(
-                (ours - theirs).abs() < 1e-9 * theirs.abs().max(1.0),
-                "dominance {dominance} at {distance} m: expression {ours}, label_rank {theirs}"
+                (got - want).abs() < 1e-9 * want.abs().max(1.0),
+                "dominance {dominance} at {distance} m: got {got}, want {want}"
             );
         }
     }
@@ -816,7 +825,7 @@ mod tests {
         // 34 nested ops are 34 ops, nowhere near 256, so only the depth guard
         // ever fired and MAX_OPS had no test at all.
         let wide: Vec<Json> = std::iter::once(json!("+"))
-            .chain(std::iter::repeat(json!(1)).take(MAX_OPS * 4))
+            .chain(std::iter::repeat_n(json!(1), MAX_OPS * 4))
             .collect();
         assert!(Program::compile(&Json::Array(wide)).is_err(), "op limit");
 
@@ -855,8 +864,15 @@ mod tests {
         ] {
             let mut v = peak(dominance, distance);
             v.prominence = prom;
-            let want = crate::peaks::label_rank(dominance, distance, 0.5)
-                + 0.3 * prom.unwrap_or(0.0);
+            let scale = distance.max(1.0f64).sqrt();
+            let base = if dominance > 0.0 {
+                dominance / scale
+            } else if dominance < 0.0 {
+                dominance * scale
+            } else {
+                0.0
+            };
+            let want = base + 0.3 * prom.unwrap_or(0.0);
             let got = p.eval(&v).expect("coalesce makes this total");
             assert!(
                 (got - want).abs() < 1e-9 * want.abs().max(1.0),

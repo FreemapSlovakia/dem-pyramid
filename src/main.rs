@@ -204,8 +204,13 @@ enum Command {
         no_revealed_peaks: bool,
         /// Exponent on distance when --max-peaks decides what to keep.
         /// 0 ranks on dominance alone.
-        #[arg(long, default_value_t = peaks::DEFAULT_RANK_POWER)]
-        peak_rank_power: f64,
+        /// Formula deciding which summits --max-peaks keeps, as a JSON prefix
+        /// expression. See docs/API.md; omit for the built-in ranking.
+        #[arg(long)]
+        peak_rank: Option<String>,
+        /// Which peaks are returned at all, same expression language.
+        #[arg(long)]
+        peak_filter: Option<String>,
         /// Degrees per column of the grid dominance is measured on, so the
         /// score does not change with --step or --supersample-x. Held to the
         /// ray spacing if finer.
@@ -389,7 +394,8 @@ fn main() -> Result<()> {
             peaks_out,
             min_dominance,
             no_revealed_peaks,
-            peak_rank_power,
+            peak_rank,
+            peak_filter,
             peak_profile_step,
             max_peaks,
             supersample_x,
@@ -417,7 +423,6 @@ fn main() -> Result<()> {
                 ("range", range),
                 ("min-dominance", min_dominance),
                 ("dither-strength", dither_strength),
-                ("peak-rank-power", peak_rank_power),
                 // `edge-hidden-ref` divides the hidden extent and the result
                 // goes through `clamp`, which passes a NaN straight out, so a
                 // non-finite here inks no edge in the frame and the render
@@ -429,11 +434,18 @@ fn main() -> Result<()> {
                 anyhow::ensure!(v.is_finite(), "--{name} must be a finite number");
             }
             anyhow::ensure!(range > 0.0, "--range must be positive");
-            anyhow::ensure!(
-                (0.0..=peaks::MAX_RANK_POWER).contains(&peak_rank_power),
-                "--peak-rank-power must lie within 0..{}",
-                peaks::MAX_RANK_POWER
-            );
+            // Compiled before the render, like the server does, so a typo
+            // costs a message rather than twenty seconds of marching.
+            let compile = |flag: &str, src: &Option<String>| -> Result<Option<rank::Program>> {
+                let Some(src) = src else { return Ok(None) };
+                let json = serde_json::from_str(src)
+                    .with_context(|| format!("--{flag} is not valid JSON"))?;
+                rank::Program::compile(&json)
+                    .map(Some)
+                    .map_err(|e| anyhow::anyhow!("--{flag}: {e}"))
+            };
+            let peak_rank = compile("peak-rank", &peak_rank)?;
+            let peak_filter = compile("peak-filter", &peak_filter)?;
             let p = panorama::Params {
                 lon,
                 lat,
@@ -543,9 +555,8 @@ fn main() -> Result<()> {
                         max_peaks,
                         height: stats.height,
                         keep_revealed: !no_revealed_peaks,
-                        rank_power: peak_rank_power,
-                        rank: None,
-                        filter: None,
+                        rank: peak_rank,
+                        filter: peak_filter,
                     },
                 );
 

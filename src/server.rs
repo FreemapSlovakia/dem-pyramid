@@ -594,7 +594,6 @@ async fn panorama_route(
     let quality = req.quality.clamp(1, 100);
     let max_peaks = req.max_peaks;
     let keep_revealed = req.revealed_peaks;
-    let rank_power = peaks::DEFAULT_RANK_POWER;
     // Compiled here, before a render slot is taken, so a bad formula costs the
     // caller a 400 rather than costing everyone twenty seconds of queue.
     let rank = match &req.peak_rank {
@@ -654,7 +653,6 @@ async fn panorama_route(
                 max_peaks,
                 height: stats.height,
                 keep_revealed,
-                rank_power,
                 rank,
                 filter,
             },
