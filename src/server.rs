@@ -81,12 +81,6 @@ pub struct Request {
     /// served at priority 0, with nothing to show why.
     #[serde(default)]
     priority: Option<i32>,
-    /// Accepted only to warn about it. Renamed to `min_dominance` when the
-    /// measure became signed; ignored here it would silently fall back to the
-    /// 30 m default, which drops every negative-dominance peak -- the whole
-    /// near field, and the reason the rename happened.
-    #[serde(default)]
-    min_prominence: Option<f64>,
     #[serde(default = "d_az")]
     az: f64,
     #[serde(default = "d_fov")]
@@ -115,15 +109,6 @@ pub struct Request {
     depth_step: u16,
     #[serde(default = "d_peaks")]
     peaks: bool,
-    /// Optional so that "not sent" is distinguishable from "sent as 30".
-    ///
-    /// It has to be, because the default is 30 and it is ANDed *before*
-    /// `peak_filter`. A filter saying "a real mountain however it reads from
-    /// here" -- low dominance, high prominence -- would never see those peaks:
-    /// the default threshold drops them first, and the filter can then only
-    /// narrow what is left. The feature's own motivating example did not work.
-    #[serde(default)]
-    min_dominance: Option<f64>,
     /// Keep at most this many peaks, most label-worthy first -- dominance
     /// discounted by distance, or by `peak_rank` if one is given. 0 is no cap,
     /// and no cap is the simplest correct answer -- see the docs.
@@ -161,32 +146,22 @@ pub struct Request {
     /// only appear this way come back with `revealed: true`.
     #[serde(default)]
     depth_lift: f64,
-    /// Whether summits only `depth_lift` brought into view may take label
-    /// slots. Nothing is revealed without a lift, so this changes nothing at
-    /// the default.
-    #[serde(default = "d_true")]
-    revealed_peaks: bool,
     /// Formula deciding which summits `max_peaks` keeps, as a MapLibre-shaped
     /// JSON prefix expression. See `rank`.
     ///
-    /// The only ranking knob. `peak_rank_power` used to sit beside it and was
-    /// strictly subsumed, so two parameters were doing one job; omitting this
-    /// now runs the same expression the docs present as the default, because
-    /// that expression *is* the default -- see `peaks::default_rank`.
+    /// The only ranking knob. Omitting it runs the same expression the docs
+    /// present as the default, because that expression *is* the default --
+    /// see `peaks::default_rank`.
     #[serde(default)]
     peak_rank: Option<serde_json::Value>,
     /// Which peaks come back at all, as the same kind of expression.
     ///
-    /// Supersedes `min_dominance` and `revealed_peaks`, which can each see one
-    /// field. An **explicit** `min_dominance` still applies alongside this and
-    /// the two intersect; its default of 30 steps aside, or the threshold
-    /// would drop the low-dominance mountains a filter exists to catch before
-    /// the filter ever ran.
+    /// The only filter there is. Omitted, every visible peak in the frame
+    /// comes back -- the service measures, and the caller decides.
     #[serde(default)]
     peak_filter: Option<serde_json::Value>,
 }
 
-fn d_true() -> bool { true }
 fn d_gamma() -> f64 { 1.0 }
 
 #[derive(Deserialize, Clone, Copy, Default, PartialEq)]
@@ -248,7 +223,6 @@ fn d_range() -> f64 { 300_000.0 }
 fn d_ss() -> u32 { 9 }
 fn d_depth_step() -> u16 { 4 }
 fn d_peaks() -> bool { true }
-fn d_min_dom() -> f64 { 30.0 }
 fn d_ridge_strength() -> f64 { 1.0 }
 fn d_ridge_width() -> f64 { 1.0 }
 fn d_quality() -> u8 { avif::QUALITY }
@@ -445,18 +419,6 @@ async fn panorama_route(
              set the X-Priority header instead"
         );
     }
-    // Rejected rather than warned about. A warning goes to our stderr, where
-    // the caller cannot see it, and they would get a 200 carrying peaks
-    // filtered at the 30 m default -- the whole negative range gone, with
-    // nothing in the response to say why. That silent failure is the thing the
-    // rename existed to prevent, so it has to be visible from the client side.
-    if let Some(v) = req.min_prominence {
-        return bad(format!(
-            "`min_prominence` was removed; use `min_dominance` (metres, signed, \
-             may be negative). You sent {v}"
-        ));
-    }
-
     // Validate before arithmetic. `as usize` saturates rather than failing and
     // the product then wraps in release, so an absurd alt range sails past the
     // pixel limit and reaches the allocator -- one request aborting the
@@ -486,7 +448,6 @@ async fn panorama_route(
         ("eye", req.eye),
         ("eye_search_radius", req.eye_search_radius),
         ("range", req.range),
-        ("min_dominance", req.min_dominance.unwrap_or_default()),
         ("dither_strength", req.dither_strength),
     ] {
         if !v.is_finite() {
@@ -596,7 +557,6 @@ async fn panorama_route(
     let format = req.format;
     let quality = req.quality.clamp(1, 100);
     let max_peaks = req.max_peaks;
-    let keep_revealed = req.revealed_peaks;
     // Compiled here, before a render slot is taken, so a bad formula costs the
     // caller a 400 rather than costing everyone twenty seconds of queue.
     let rank = match &req.peak_rank {
@@ -612,17 +572,6 @@ async fn panorama_route(
             Err(e) => return bad(format!("peak_filter: {e}")),
         },
         None => None,
-    };
-    // The legacy default applies only when no filter was given. Keeping it
-    // alongside one would let a threshold nobody asked for veto the filter --
-    // and a filter can only ever narrow what reaches it, so the peaks a caller
-    // most wants back would be exactly the ones already gone. An explicit
-    // `min_dominance` is still honoured beside a filter; only the default
-    // steps aside.
-    let min_dom = match (req.min_dominance, &filter) {
-        (Some(v), _) => v,
-        (None, Some(_)) => f64::NEG_INFINITY,
-        (None, None) => d_min_dom(),
     };
 
     let render_cancel = cancel.clone();
@@ -652,10 +601,8 @@ async fn panorama_route(
         peaks::select(
             &mut found,
             &peaks::Selection {
-                min_dominance: min_dom,
                 max_peaks,
                 height: stats.height,
-                keep_revealed,
                 rank,
                 filter,
             },

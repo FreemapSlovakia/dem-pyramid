@@ -42,7 +42,6 @@ All fields except `lon` and `lat` are optional.
 | `depth` | bool | `false` | include the distance buffer |
 | `depth_step` | int | `4` | depth quantisation; see [Depth](#depth) |
 | `peaks` | bool | `true` | include peak labels |
-| `min_dominance` | number | `30`, or none if `peak_filter` is given | **deprecated** — use `peak_filter`; drop peaks standing less than this above their surroundings, metres |
 | `max_peaks` | int | `0` | keep at most this many, in `peak_rank` order; 0 is no cap |
 | `format` | string | `avif` | image encoding: `avif` or `png` |
 | `quality` | int | `95` | AVIF quality, 1–100; ignored for PNG |
@@ -52,7 +51,6 @@ All fields except `lon` and `lat` are optional.
 | `ridge_color` | string | `#000000` | silhouette colour, `#rrggbb` or `#rgb` |
 | `ground_color` | string | `#3a4a34` | near-terrain colour, before haze |
 | `depth_lift` | number | `0` | degrees of extra elevation at `range`, tapering to nothing at the eye (0–45); see [Depth lift](#depth-lift) |
-| `revealed_peaks` | bool | `true` | **deprecated** — use `peak_filter`; let summits only `depth_lift` brought into view take label slots |
 | `peak_filter` | expression | — | which peaks come back at all; see [Filtering and ranking](#filtering-and-ranking) |
 | `peak_rank` | expression | — | what `max_peaks` orders by, and the `rank` returned with each peak |
 
@@ -111,11 +109,11 @@ payload matters more than the resolution, say so and the numbers can be
 rounded to something defensible (0.1 m, 6 decimal places of latitude) for
 roughly a quarter off.
 
-**`min_dominance` is not a load control either.** It is applied in the same
+**`peak_filter` is not a load control either.** It is applied in the same
 place as `max_peaks`, after every visible candidate has already had its
-dominance measured, so raising it returns no time — only fewer bytes. The one
-parameter that genuinely reduces the peak work is `range`, because it decides
-how many candidates exist at all; `peaks: false` removes it entirely.
+dominance measured, so tightening it returns no time — only fewer bytes. The
+one parameter that genuinely reduces the peak work is `range`, because it
+decides how many candidates exist at all; `peaks: false` removes it entirely.
 
 Three things multiply the **wall-clock** figures above, and they compound:
 
@@ -274,15 +272,15 @@ longer a photograph, and anything built on "the user can see this from here"
 has to account for it. Peaks brought into view this way come back with
 `revealed: true` — see [Peaks](#peaks).
 
-**`max_peaks` needs `revealed_peaks: false` to stay honest.** Dominance is in
-metres, so distant ranges outrank near hills — and revealed summits are distant
-by construction, being the ones that were behind something. Under a lift they
+**`max_peaks` needs a `peak_filter` to stay honest.** Dominance is in metres,
+so distant ranges outrank near hills — and revealed summits are distant by
+construction, being the ones that were behind something. Under a lift they
 sort to the top and a `max_peaks: 20` request can come back with twenty labels
 naming nothing you can see, the near summits truncated away. Sending
-`revealed_peaks: false` drops them *before* the cap, so the twenty slots go to
-summits genuinely in sight. Filtering on `revealed` client-side cannot recover
-this: truncation has already happened, and you are left with fewer labels than
-you asked for.
+`"peak_filter": ["==", ["get", "revealed"], 0]` drops them *before* the cap, so
+the twenty slots go to summits genuinely in sight. Filtering on `revealed`
+client-side cannot recover this: truncation has already happened, and you are
+left with fewer labels than you asked for.
 
 Three things to expect:
 
@@ -396,34 +394,12 @@ Peaks pass through three stages, in this order:
 Only peaks that are genuinely visible, answered by a ray and inside the frame
 reach stage 1 at all; that part is structural and not configurable.
 
-> ### Deprecated: `min_dominance` and `revealed_peaks`
->
-> **Do not use these in new code, and remove them from existing code.** Both
-> will be deleted once nothing sends them.
->
-> Each can see exactly one property, and `peak_filter` says everything they
-> say and more. They still work, and they are applied *alongside* a
-> `peak_filter` rather than instead of it, so a request sending both gets the
-> intersection — which is rarely what anyone means. The direct translations:
->
-> | instead of | write |
-> |---|---|
-> | `"min_dominance": 30` | `"peak_filter": [">=", ["get","dominance"], 30]` |
-> | `"revealed_peaks": false` | `"peak_filter": ["==", ["get","revealed"], 0]` |
->
-> Note that `min_dominance` **defaults to 30**, so it filters even when you
-> never mentioned it — at one 360° viewpoint that is 946 peaks returned out of
-> 2626 visible.
->
-> **That default steps aside as soon as you send a `peak_filter`.** It has to:
-> the threshold is applied first, so a filter could otherwise only narrow what
-> survived it, and a filter asking for "a real mountain however it reads from
-> here" would never see the low-dominance peaks it exists to catch. Measured on
-> one 90° view: 89 peaks with no filter, **542** with `"peak_filter": 1`.
->
-> An **explicit** `min_dominance` is still honoured beside a filter, and the
-> two intersect — sending `"min_dominance": 30` with that same filter returns
-> 89 again. So send it only if you mean it.
+**Send no `peak_filter` and you get everything visible**, which is a lot: 2626
+peaks at one 360° viewpoint, 542 on one 90° view. That is deliberate — the
+server has no opinion about which tops are worth a label, and every property
+it used to decide with is in the payload, so the decision is yours. But it is
+a decision you have to make: `[">=", ["get", "dominance"], 30]` reproduces
+what the old fixed threshold did, and cuts that 2626 to 946.
 
 #### What `max_peaks` keeps
 
@@ -583,11 +559,10 @@ to say why.
 Filtering and ranking stay separate stages, and that is deliberate: what comes
 back is one question, what order it comes back in is another, and collapsing
 them means a peak can be dropped for being badly *placed* rather than for being
-uninteresting. Where the deprecated `min_dominance` is still in play it filters
-on raw metres and can in principle disagree with the ranking — a near top
-failing the threshold while ranking above distant ones that pass. Measured on
-the view above it does not happen at any cap, because the weighting already
-pushes deeply negative scores down, the same direction the threshold cuts in.
+uninteresting. The two can disagree, and nothing stops them: a filter on raw
+`dominance` metres can drop a near top that `peak_rank` would have put above
+distant ones that pass. If that matters, filter on the same expression you
+rank by.
 
 `dominance` itself is untouched in the payload, so a client is free to re-rank
 however it likes — the ordering only decides *which* peaks survive to be sent,

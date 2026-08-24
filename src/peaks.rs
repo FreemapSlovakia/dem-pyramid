@@ -302,11 +302,9 @@ fn split_csv(line: &str) -> Vec<String> {
 /// What the label cut orders by when the caller gives no formula.
 ///
 /// It is the documented default expression, and it is the *only*
-/// implementation of it. There used to be a second -- a Rust `label_rank`
-/// with an exponent parameter -- and a test kept the two in step. The
-/// documentation's promise that "sending this formula changes nothing" was
-/// then true because a test said so; now it is true because there is nothing
-/// else for it to differ from.
+/// implementation of it -- so the documentation's promise that "sending this
+/// formula changes nothing" is true because there is nothing else for it to
+/// differ from, not because a test keeps two copies in step.
 ///
 /// The shape it encodes, and why it is not simply `dominance`:
 ///
@@ -350,14 +348,10 @@ pub fn default_rank() -> &'static crate::rank::Program {
 /// one a bare `bool`: transposing any pair compiles and changes which summits
 /// come back.
 pub struct Selection {
-    /// Drop summits scoring below this, metres, signed.
-    pub min_dominance: f64,
     /// Keep at most this many, highest-ranked first. 0 is no cap.
     pub max_peaks: usize,
     /// Frame height in output pixels; peaks outside it are not in the picture.
     pub height: usize,
-    /// Whether summits only `depth_lift` brought into view may take slots.
-    pub keep_revealed: bool,
     /// A caller-supplied formula, used instead of [`default_rank`].
     ///
     /// Here rather than in the client because `max_peaks` truncates: a cut
@@ -367,12 +361,13 @@ pub struct Selection {
     pub rank: Option<crate::rank::Program>,
     /// Which peaks survive at all, as an expression over the same properties.
     ///
-    /// It supersedes `min_dominance` and `keep_revealed`, which can only ever
-    /// see one field each. Those still work and are applied alongside it --
-    /// existing clients depend on them -- but everything they express is
-    /// expressible here, and more: "a real mountain however it reads from
-    /// here, or anything standing out locally" needs two properties and a
-    /// disjunction, which no numeric threshold can say.
+    /// The only filter, and an expression rather than a threshold because a
+    /// threshold sees one property: no number can say "a real mountain
+    /// however it reads from here, or anything standing out locally", which
+    /// needs two properties and a disjunction.
+    ///
+    /// `None` keeps every peak the render found. The service measures; the
+    /// caller decides.
     pub filter: Option<crate::rank::Program>,
 }
 
@@ -407,36 +402,21 @@ fn vars(k: &Peak) -> crate::rank::Vars {
 /// there -- and every change to the rule, including the dominance rename, was
 /// two edits with nothing to catch the one you forgot.
 ///
-/// `keep_revealed` decides whether summits that only `depth_lift` brought into
-/// view may take label slots. It has to be settled here rather than left to
-/// the caller, because `max_peaks` truncates: filter afterwards and a request
-/// for twenty labels returns however many of its twenty happened to be real,
-/// with the near summits it dropped unrecoverable. Revealed peaks are distant
-/// by construction, being the ones that were behind something.
+/// Filtering happens here rather than in the client because `max_peaks`
+/// truncates: filter afterwards and a request for twenty labels returns
+/// however many of its twenty survived, with the ones it dropped
+/// unrecoverable.
 pub fn select(peaks: &mut Vec<Peak>, s: &Selection) {
     peaks.retain(|k| {
         // Structural first -- in frame, answered by a ray, actually seen --
-        // then the caller's opinion. `min_dominance` and `keep_revealed` are
-        // the older, single-field way of saying what `filter` says in
-        // general; all three apply, so a client sending both gets the
-        // intersection rather than a surprise.
+        // and then the caller's. Both run before the sort, so a cap spends
+        // its slots on peaks that survived the filter.
         k.visible
             && k.column.is_some()
             && k.y >= 0.0
             && k.y <= s.height as f64
-            && (s.keep_revealed || !k.revealed)
-            && k.dominance >= s.min_dominance
             && s.filter.as_ref().is_none_or(|f| f.keeps(&vars(k)))
     });
-    // `min_dominance` still filters on raw dominance, deliberately: it is a
-    // statement about the landscape -- "nothing flatter than this is a summit"
-    // -- and would stop meaning anything in metres if distance entered it.
-    // Only the cut, which is about label density in a picture, is ranked.
-    // `total_cmp`, not `partial_cmp().unwrap()`. A NaN cannot reach here --
-    // `Program::rank` folds every non-finite result to NEG_INFINITY, which is
-    // where the guarantee actually lives, not in any front-end validation of
-    // the sort a previous version of this comment credited. `total_cmp` costs
-    // the same and cannot panic whatever arrives.
     // Computed once per peak and kept, rather than recomputed inside the
     // comparator -- which is both cheaper and the only way the value can be
     // returned to the caller. An ordering nobody can see is one nobody can
@@ -445,8 +425,10 @@ pub fn select(peaks: &mut Vec<Peak>, s: &Selection) {
     for k in peaks.iter_mut() {
         k.rank = Some(program.rank(&vars(k)));
     }
-    // `total_cmp`, so a formula producing NaN sorts somewhere definite rather
-    // than wherever the comparison happens to leave it.
+    // `total_cmp`, not `partial_cmp().unwrap()`. A NaN cannot reach here --
+    // `Program::rank` folds every non-finite result to NEG_INFINITY, and that
+    // is where the guarantee lives, not in any validation of the formula.
+    // `total_cmp` costs the same and cannot panic whatever arrives.
     peaks.sort_by(|a, b| {
         b.rank
             .unwrap_or(f64::NEG_INFINITY)
@@ -462,6 +444,7 @@ pub fn select(peaks: &mut Vec<Peak>, s: &Selection) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn peak(osm_id: i64, dominance: f64, visible: bool, column: Option<usize>, y: f64) -> Peak {
         Peak {
@@ -487,16 +470,22 @@ mod tests {
         }
     }
 
-    /// The frame and the revealed policy are fixed for most of these; only
-    /// the threshold and the cap vary.
-    fn sel(min_dominance: f64, max_peaks: usize) -> Selection {
+    /// The frame is fixed for all of these; only the cap and the filter vary.
+    fn sel(max_peaks: usize) -> Selection {
         Selection {
-            min_dominance,
             max_peaks,
             height: 600,
-            keep_revealed: true,
             rank: None,
             filter: None,
+        }
+    }
+
+    /// A `Selection` filtering on a JSON expression, which is now the only
+    /// way to filter at all.
+    fn sel_filtered(max_peaks: usize, filter: serde_json::Value) -> Selection {
+        Selection {
+            filter: Some(crate::rank::Program::compile(&filter).expect("test filter compiles")),
+            ..sel(max_peaks)
         }
     }
 
@@ -506,11 +495,14 @@ mod tests {
             peak(1, 100.0, true, Some(0), 10.0),   // kept
             peak(2, 100.0, false, Some(0), 10.0),  // hidden
             peak(3, 100.0, true, None, 10.0),      // no ray answered it
-            peak(4, 10.0, true, Some(0), 10.0),    // below the threshold
+            peak(4, 10.0, true, Some(0), 10.0),    // filtered out
             peak(5, 100.0, true, Some(0), -1.0),   // above the frame
             peak(6, 100.0, true, Some(0), 601.0),  // below the frame
         ];
-        select(&mut peaks, &sel(30.0, 0));
+        select(
+            &mut peaks,
+            &sel_filtered(0, json!([">=", ["get", "dominance"], 30])),
+        );
         assert_eq!(peaks.iter().map(|p| p.osm_id).collect::<Vec<_>>(), [1]);
     }
 
@@ -525,7 +517,7 @@ mod tests {
             peak(3, -5.0, true, Some(0), 10.0),
             peak(4, 20.0, true, Some(0), 10.0),
         ];
-        select(&mut peaks, &sel(-100.0, 0));
+        select(&mut peaks, &sel(0));
         assert_eq!(
             peaks.iter().map(|p| p.osm_id).collect::<Vec<_>>(),
             [2, 4, 3, 1]
@@ -541,23 +533,23 @@ mod tests {
             peak(2, 900.0, true, Some(0), 10.0),
             peak(3, 500.0, true, Some(0), 10.0),
         ];
-        select(&mut peaks, &sel(-1000.0, 2));
+        select(&mut peaks, &sel(2));
         assert_eq!(peaks.iter().map(|p| p.osm_id).collect::<Vec<_>>(), [2, 3]);
     }
 
     #[test]
     fn zero_means_no_cap() {
         let mut peaks = (0..5).map(|i| peak(i, 100.0, true, Some(0), 10.0)).collect();
-        select(&mut peaks, &sel(0.0, 0));
+        select(&mut peaks, &sel(0));
         assert_eq!(peaks.len(), 5);
     }
 
-    /// The reason `keep_revealed` is decided inside `select` rather than left
-    /// to the caller: dominance is in metres, so the distant summits a lift
+    /// The reason the filter runs inside `select` rather than being left to
+    /// the caller: dominance is in metres, so the distant summits a lift
     /// brings out outrank near ones, and the cap runs after the sort. Filter
     /// afterwards and a request for two labels returns one.
     #[test]
-    fn revealed_summits_do_not_take_slots_from_visible_ones() {
+    fn the_filter_runs_before_the_cap() {
         let revealed = |id, dom| {
             let mut k = peak(id, dom, true, Some(0), 10.0);
             k.revealed = true;
@@ -572,31 +564,28 @@ mod tests {
             ]
         };
 
-        // Kept: the lift was asked for, so what it brought out gets labelled.
+        // Unfiltered: the lift was asked for, so what it brought out gets
+        // labelled, and it outranks the near summits.
         let mut all = candidates();
-        select(&mut all, &sel(0.0, 2));
+        select(&mut all, &sel(2));
         assert_eq!(all.iter().map(|p| p.osm_id).collect::<Vec<_>>(), [1, 2]);
 
-        // Refused: the cap now spends both slots on summits actually in sight,
-        // rather than returning two labels of which none are.
+        // Filtered: the cap now spends both slots on summits actually in
+        // sight, rather than returning two labels of which none are.
         let mut real = candidates();
         select(
             &mut real,
-            &Selection {
-                keep_revealed: false,
-                ..sel(0.0, 2)
-            },
+            &sel_filtered(2, json!(["==", ["get", "revealed"], 0])),
         );
         assert_eq!(real.iter().map(|p| p.osm_id).collect::<Vec<_>>(), [3, 4]);
     }
 
-    /// A filter sees every property, which is the point of it: no numeric
-    /// threshold can say "a real mountain however it reads from here, or
-    /// anything standing out locally", because that needs two properties and
-    /// a disjunction.
+    /// A filter sees every property, which is the point of it: no single
+    /// numeric threshold can say "a real mountain however it reads from here,
+    /// or anything standing out locally", because that needs two properties
+    /// and a disjunction.
     #[test]
-    fn a_filter_can_say_what_min_dominance_cannot() {
-        use serde_json::json;
+    fn a_filter_can_combine_properties() {
         let mut far_but_major = peak(1, 40.0, true, Some(0), 10.0);
         far_but_major.prominence = Some(2355.0);
         let mut near_and_local = peak(2, 200.0, true, Some(0), 10.0);
@@ -604,44 +593,19 @@ mod tests {
         let mut neither = peak(3, 5.0, true, Some(0), 10.0);
         neither.prominence = Some(20.0);
 
-        let f = crate::rank::Program::compile(&json!([
-            "case",
-            [">", ["coalesce", ["get", "prominence"], 0], 300], 1,
-            [">", ["get", "dominance"], 100]
-        ]))
-        .unwrap();
-
         let mut peaks = vec![far_but_major, near_and_local, neither];
         select(
             &mut peaks,
-            &Selection {
-                filter: Some(f),
-                // Wide open, so only the expression decides.
-                min_dominance: f64::NEG_INFINITY,
-                ..sel(0.0, 0)
-            },
+            &sel_filtered(
+                0,
+                json!([
+                    "case",
+                    [">", ["coalesce", ["get", "prominence"], 0], 300], 1,
+                    [">", ["get", "dominance"], 100]
+                ]),
+            ),
         );
         assert_eq!(peaks.iter().map(|p| p.osm_id).collect::<Vec<_>>(), [2, 1]);
-    }
-
-    /// The legacy thresholds and the expression both apply, so a client
-    /// sending both gets the intersection rather than a surprise.
-    #[test]
-    fn the_old_filters_still_bite_alongside_the_new_one() {
-        use serde_json::json;
-        let keep_everything = crate::rank::Program::compile(&json!(1)).unwrap();
-        let mut peaks = vec![
-            peak(1, 100.0, true, Some(0), 10.0),
-            peak(2, 5.0, true, Some(0), 10.0),
-        ];
-        select(
-            &mut peaks,
-            &Selection {
-                filter: Some(keep_everything),
-                ..sel(30.0, 0)
-            },
-        );
-        assert_eq!(peaks.iter().map(|p| p.osm_id).collect::<Vec<_>>(), [1]);
     }
 
     /// The ordering value is returned, so an ordering can be inspected rather
@@ -652,13 +616,11 @@ mod tests {
             peak(1, 100.0, true, Some(0), 10.0),
             peak(2, 900.0, true, Some(0), 10.0),
         ];
-        select(&mut peaks, &sel(0.0, 0));
+        select(&mut peaks, &sel(0));
         assert_eq!(peaks[0].osm_id, 2);
         // Against the arithmetic, not against `default_rank()` -- comparing
         // `select`'s output to the same call `select` made is
-        // `assert!((x - x).abs() < 1e-9)`, which no formula can fail. That is
-        // what this became when `label_rank`, the independent implementation
-        // it used to check against, was deleted.
+        // `assert!((x - x).abs() < 1e-9)`, which no formula can fail.
         for p in &peaks {
             let want = p.dominance / p.distance.max(1.0).sqrt();
             assert!(
@@ -677,9 +639,6 @@ mod tests {
     /// the `max_peaks: 2000` boundary. Dividing throughout -- the obvious
     /// reading of "discount by distance" -- ranks the near one *below* the
     /// boundary, which is how the bug reached production in the first place.
-    ///
-    /// It now tests the compiled default rather than a second Rust
-    /// implementation of it, because there is no longer a second one.
     #[test]
     fn distance_pushes_a_score_down_on_both_sides_of_zero() {
         let score = |dominance: f64, distance: f64| {

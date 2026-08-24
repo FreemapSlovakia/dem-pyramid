@@ -46,7 +46,7 @@ E=${E:-45}    # east
 S=${S:-34}    # south
 N=${N:-72}    # north
 
-MIN_PROM=${MIN_PROM:-30}     # metres, matching the API's min_dominance floor
+MIN_PROM=${MIN_PROM:-30}     # metres; below this a top is not worth a label
 MIN_ISO=${MIN_ISO:-1}        # km
 THREADS=${THREADS:-8}        # of 12; the box also serves tiles
 

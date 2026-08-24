@@ -175,9 +175,9 @@ impl ProfileGrid {
     /// requested arc. Sizing the grid from the arc lets it claim bearings no
     /// ray reaches, and a column no ray fills reads as "no ground at this
     /// depth" -- so the sweep stops early and dominance comes back 0. At
-    /// `fov: 0.1, step: 0.05` that was every peak in the frame, and 0 fails
-    /// the default `min_dominance`, so the answer was a panorama with no
-    /// labels at all and nothing to say why.
+    /// `fov: 0.1, step: 0.05` that was every peak in the frame, so every
+    /// dominance-based `peak_filter` fell through and the answer was a
+    /// panorama with no labels at all and nothing to say why.
     fn new(p: &Params, az_step: f64, sub_w: usize) -> Self {
         // Exactly the arc the rays span, which is the only arc there is data
         // for.
@@ -2327,9 +2327,9 @@ mod tests {
     /// ones.
     ///
     /// A column nobody fills reads as "no ground at this depth", which stops
-    /// the dominance sweep early and returns 0. Zero then fails the default
-    /// `min_dominance`, so the visible symptom is a panorama with no labels
-    /// and nothing in the response to explain it. This held for 360-degree
+    /// the dominance sweep early and returns 0. Zero then falls through any
+    /// dominance-based `peak_filter`, so the visible symptom is a panorama
+    /// with no labels and nothing to explain it. This held for 360-degree
     /// renders and failed for narrow ones, because the grid was sized from
     /// the requested arc while the rays cover `round(fov / step)` output
     /// columns -- generally a slightly different arc, and at `fov: 0.1,

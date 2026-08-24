@@ -603,9 +603,7 @@ mod tests {
 
     /// The sign folded into the exponent is the whole trick, so it is checked
     /// against arithmetic written out longhand rather than against another
-    /// copy of itself. There used to be a second implementation in Rust and a
-    /// test that the two agreed; deleting it is what made the documented
-    /// default formula the only one there is.
+    /// copy of itself.
     #[test]
     fn the_default_formula_weights_distance_on_both_sides_of_zero() {
         // The *shipped* default, not a copy of it typed here. A local `json!`
