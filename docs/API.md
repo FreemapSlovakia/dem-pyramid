@@ -651,6 +651,95 @@ Only `osm_id` is needed to identify a peak; everything else about it (names in
 every language, wikipedia, etc.) should come from OSM, since this service's
 copy carries only what its import kept.
 
+### Prominence
+
+`dominance` says whether a summit stands out **from where you are standing**.
+`prominence` says whether it is a mountain at all. They are different questions
+and neither answers the other: measured across two Slovak viewpoints, of 75
+summits visible from both, **20% flipped the sign of their dominance** and 40%
+of those earning a label from one viewpoint were dropped by the other.
+Prominence does not move, which is why it can name Gerlachovský štít from
+100 km away when dominance — measured within 3 km — can only report that it
+does not stand out from its neighbours at that range.
+
+It is precomputed: a continental divide-tree run over GEDTM30 at 1 arc-second,
+25°W–45°E and 34–72°N, matched onto the OSM nodes once and stored. Nothing is
+computed per request.
+
+#### How far to trust a value
+
+Every value is attached to its peak by a spatial match, and **`prom_dist_m` is
+that match's error bar**. A 30 m DEM places a summit up to ~75 m from where
+LiDAR and OSM agree it is, so the radius has to be generous or it misses
+exactly the sharp summits that matter. Measured over 153 274 matched peaks
+carrying an `ele` tag, comparing the matched DEM summit's elevation against
+OSM's:
+
+| `prom_dist_m` | peaks | mean elevation disagreement | share off by >50 m |
+|---|---|---|---|
+| 0–25 | 66 068 | 8.9 m | **0.9%** |
+| 25–50 | 49 035 | 9.9 m | 1.7% |
+| 50–75 | 19 679 | 11.2 m | 3.5% |
+| 75–100 | 9 454 | 12.2 m | 4.6% |
+| 100–150 | 9 034 | 12.8 m | **5.4%** |
+
+**A cutoff at 50 m is the sensible default** — it keeps 75% of matches with
+1.7% badly wrong. Past 100 m the bad-match rate triples.
+
+Two caveats that no cutoff removes. Even in the closest band **0.9% are off by
+more than 50 m**, and the worst case in *every* band exceeds 1600 m — those are
+matches onto an entirely different summit. And a close match is not a correct
+one: Lomnický štít comes back at 46 m of prominence from a summit 94 m away,
+which is wrong, while Gerlach at 2304 m from 20 m away is very nearly right.
+
+#### How accurate the values are
+
+Against published figures:
+
+| peak | ours | published | error |
+|---|---|---|---|
+| Mulhacén | 3279 | 3285 | −6 |
+| Aneto | 2777 | 2812 | −35 |
+| Gerlachovský štít | 2304 | 2355 | −51 |
+| Rysy | 269 | 331 | −62 |
+| Mont Blanc | 4779 | 4696 | +83 |
+| Chopok | 255 | 155 | +100 |
+| Ďumbier | 1170 | 1050 | +120 |
+| Kráľova hoľa | 755 | 486 | +269 |
+
+**Reliable for ranking above ~300 m, noise below ~150 m.** The errors are not
+summit smoothing but the col: a 30 m grid can miss a narrow ridge crest and
+route the divide through a lower saddle, which inflates the difference. That is
+worst exactly where terrain is sharpest. **Do not threshold on it** — a
+"prominence ≥ 100 m" cut would be arbitrary at this accuracy. Weigh it.
+
+Peaks whose prominence equals their elevation are **lower bounds**, not values:
+that is the convention for a landmass high point, and it is correct for an
+island (Etna really does have 3357 m) but merely means "the col is outside the
+window" for Elbrus, whose chain runs into Asia.
+
+#### Coverage, and why it is what it is
+
+**167 053 of 488 232 peaks carry a prominence** — nearer 45% at a mountainous
+viewpoint, since the unmatched skew to minor tops. Of the 321 179 without one:
+
+| | count | share |
+|---|---|---|
+| no DEM summit within 400 m at all | 281 252 | 88% |
+| nearest summit 150–400 m away | 36 848 | 11% |
+| a closer peak claimed the same summit | 3 079 | 1% |
+
+So neither the 150 m radius nor the one-summit-one-peak rule is the constraint.
+**The constraint is the 30 m prominence floor the run used**: summits below it
+do not exist in the output at all. Lowering it to 5 m yields ten times as many
+summits — 5 832 against 59 057 in a 2°×2° test box.
+
+`null` therefore means "no match", which is not the same as "not a mountain"
+and definitely not "prominence 0". Where two real summits sit inside the match
+radius only the nearest keeps a value: Rysy has three named tops within 130 m,
+all called "Rysy", and GEDTM30 resolves one of them, so two of the three come
+back `null` rather than all three sharing one answer.
+
 ## Depth
 
 A distance for every pixel, so the client can answer "how far is that ridge?"
@@ -983,11 +1072,13 @@ bigger than the difference between national datasets at a border.
 1 m data at 6.27 m resolution; elsewhere the fallback is 30 m GEDTM30. The
 transition is seamless but detail is not uniform.
 
-**Viewpoint elevation is the local maximum** within `eye_search_radius`, not
-the value at the exact point. The pyramid stores a 6.27 m average, and
-averaging costs a summit more the sharper it is, so the raw value reliably sits
-below where a person would stand — putting nearby rock above the eye. Set the
-radius to 0 to disable, and expect summit views to suffer.
+### Viewpoint elevation
+
+**It is the local maximum** within `eye_search_radius`, not the value at the
+exact point. The pyramid stores a 6.27 m average, and averaging costs a summit
+more the sharper it is, so the raw value reliably sits below where a person
+would stand — putting nearby rock above the eye. Set the radius to 0 to
+disable, and expect summit views to suffer.
 
 **Sub-pixel viewpoint accuracy matters on peaks.** A few metres off a summit
 can place terrain above the eye. When a user taps a named peak, resolve to the
