@@ -136,6 +136,28 @@ enum Op {
     Log2,
     Log10,
     Exp,
+    /// Comparisons yield 1 or 0 rather than a boolean, so the value type stays
+    /// `number | null` and nothing else has to learn about truth.
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    /// Pops a condition and jumps if it is not true. Null and NaN are not
+    /// true: an unknown is not a yes.
+    JumpIfFalsy(usize),
+    Jump(usize),
+}
+
+/// A condition is true only if it is a number that is neither zero nor NaN.
+///
+/// Null falls through to the next branch rather than making the whole `case`
+/// null, which is the point of having `case` at all: `["*", c, a]` cannot
+/// express a choice when `a` may be absent, because null times anything is
+/// null even where the branch was never wanted.
+fn truthy(v: Option<f64>) -> bool {
+    matches!(v, Some(x) if x != 0.0 && !x.is_nan())
 }
 
 /// Why an expression was refused, and where.
@@ -168,35 +190,60 @@ pub struct Program {
 impl Program {
     /// Compile a formula, or say exactly what is wrong with it.
     pub fn compile(json: &Json) -> Result<Self, Error> {
-        let mut ops = Vec::new();
-        walk(json, "$", 0, &mut ops)?;
-        if ops.len() > MAX_OPS {
-            return Err(err("$", format!("expression exceeds {MAX_OPS} operations")));
-        }
         // The stack discipline is settled here, once, so `eval` needs no
-        // checks at all. A compiled program that balanced during this walk
-        // balances for every peak, because the ops do not depend on the data.
-        let mut depth = 0usize;
-        let mut max = 0usize;
-        for op in &ops {
-            let (pops, pushes) = effect(*op);
-            if depth < pops {
-                return Err(err("$", "expression is not balanced"));
-            }
-            depth = depth - pops + pushes;
-            max = max.max(depth);
-        }
-        if depth != 1 {
+        // checks at all. It cannot be verified by scanning the ops linearly
+        // any more -- `case` compiles to jumps, and a linear scan would count
+        // every branch as if all of them ran. It is instead an invariant of
+        // the walk: every expression node leaves exactly one value behind,
+        // whichever path is taken through it.
+        let mut c = Compiler {
+            ops: Vec::new(),
+            depth: 0,
+            max: 0,
+        };
+        c.walk(json, "$", 0)?;
+        if c.depth != 1 {
             return Err(err("$", "expression must produce exactly one value"));
         }
-        Ok(Program { ops, depth: max })
+        Ok(Program {
+            ops: c.ops,
+            depth: c.max,
+        })
     }
 
     /// The formula's value for one peak, or `None` where it hit a null.
     pub fn eval(&self, v: &Vars) -> Option<f64> {
         let mut st: Vec<Option<f64>> = Vec::with_capacity(self.depth);
-        for op in &self.ops {
-            match *op {
+        let mut pc = 0usize;
+        while pc < self.ops.len() {
+            match self.ops[pc] {
+                Op::Jump(t) => {
+                    pc = t;
+                    continue;
+                }
+                Op::JumpIfFalsy(t) => {
+                    let c = st.pop().flatten();
+                    if !truthy(c) {
+                        pc = t;
+                        continue;
+                    }
+                }
+                Op::Eq => compare(&mut st, |a, b| a == b),
+                Op::Ne => compare(&mut st, |a, b| a != b),
+                Op::Lt => compare(&mut st, |a, b| a < b),
+                Op::Le => compare(&mut st, |a, b| a <= b),
+                Op::Gt => compare(&mut st, |a, b| a > b),
+                Op::Ge => compare(&mut st, |a, b| a >= b),
+                op => self.step(op, &mut st, v),
+            }
+            pc += 1;
+        }
+        st.pop().flatten()
+    }
+
+    fn step(&self, op: Op, st: &mut Vec<Option<f64>>, v: &Vars) {
+        {
+            match op {
                 Op::Num(n) => st.push(Some(n)),
                 Op::Var(k) => st.push(v.get(k)),
                 Op::Coalesce(n) => {
@@ -205,16 +252,16 @@ impl Program {
                     st.truncate(at);
                     st.push(picked);
                 }
-                Op::Add(n) => fold(&mut st, n, 0.0, |a, b| a + b),
-                Op::Mul(n) => fold(&mut st, n, 1.0, |a, b| a * b),
-                Op::Min(n) => fold1(&mut st, n, f64::min),
-                Op::Max(n) => fold1(&mut st, n, f64::max),
-                Op::Sub => binary(&mut st, |a, b| a - b),
-                Op::Div => binary(&mut st, |a, b| a / b),
-                Op::Pow => binary(&mut st, f64::powf),
-                Op::Neg => unary(&mut st, |a| -a),
-                Op::Abs => unary(&mut st, f64::abs),
-                Op::Sign => unary(&mut st, |a| {
+                Op::Add(n) => fold(st,n, 0.0, |a, b| a + b),
+                Op::Mul(n) => fold(st,n, 1.0, |a, b| a * b),
+                Op::Min(n) => fold1(st,n, f64::min),
+                Op::Max(n) => fold1(st,n, f64::max),
+                Op::Sub => binary(st,|a, b| a - b),
+                Op::Div => binary(st,|a, b| a / b),
+                Op::Pow => binary(st,f64::powf),
+                Op::Neg => unary(st,|a| -a),
+                Op::Abs => unary(st,f64::abs),
+                Op::Sign => unary(st,|a| {
                     // 0 for zero, so a peak sitting exactly on the boundary
                     // between dominant and subordinate is not thrown to one
                     // side. `f64::signum` returns 1.0 for +0.0, which would
@@ -227,14 +274,22 @@ impl Program {
                         0.0
                     }
                 }),
-                Op::Sqrt => unary(&mut st, f64::sqrt),
-                Op::Ln => unary(&mut st, f64::ln),
-                Op::Log2 => unary(&mut st, f64::log2),
-                Op::Log10 => unary(&mut st, f64::log10),
-                Op::Exp => unary(&mut st, f64::exp),
+                Op::Sqrt => unary(st,f64::sqrt),
+                Op::Ln => unary(st,f64::ln),
+                Op::Log2 => unary(st,f64::log2),
+                Op::Log10 => unary(st,f64::log10),
+                Op::Exp => unary(st,f64::exp),
+                // Handled by the caller, which owns the program counter.
+                Op::Jump(_)
+                | Op::JumpIfFalsy(_)
+                | Op::Eq
+                | Op::Ne
+                | Op::Lt
+                | Op::Le
+                | Op::Gt
+                | Op::Ge => unreachable!("control flow is dispatched in eval"),
             }
         }
-        st.pop().flatten()
     }
 
     /// The value as something sortable, worst-first for anything unusable.
@@ -252,12 +307,20 @@ impl Program {
     }
 }
 
-fn effect(op: Op) -> (usize, usize) {
-    match op {
-        Op::Num(_) | Op::Var(_) => (0, 1),
-        Op::Coalesce(n) | Op::Add(n) | Op::Mul(n) | Op::Min(n) | Op::Max(n) => (n, 1),
-        Op::Sub | Op::Div | Op::Pow => (2, 1),
-        _ => (1, 1),
+/// Emits ops while tracking what they do to the stack.
+struct Compiler {
+    ops: Vec<Op>,
+    /// Values on the stack at this point in the program.
+    depth: usize,
+    /// The most there will ever be, which is all `eval` needs to allocate.
+    max: usize,
+}
+
+impl Compiler {
+    fn push(&mut self, op: Op, pops: usize) {
+        self.ops.push(op);
+        self.depth = self.depth - pops + 1;
+        self.max = self.max.max(self.depth);
     }
 }
 
@@ -292,6 +355,17 @@ fn fold1(st: &mut Vec<Option<f64>>, n: usize, f: impl Fn(f64, f64) -> f64) {
     st.push(acc);
 }
 
+/// Comparisons return 1 or 0, and null in gives null out -- an unknown
+/// compares to nothing, and saying "false" would let a formula act on it.
+fn compare(st: &mut Vec<Option<f64>>, f: impl Fn(f64, f64) -> bool) {
+    let b = st.pop().flatten();
+    let a = st.pop().flatten();
+    st.push(match (a, b) {
+        (Some(a), Some(b)) => Some(f64::from(u8::from(f(a, b)))),
+        _ => None,
+    });
+}
+
 fn binary(st: &mut Vec<Option<f64>>, f: impl Fn(f64, f64) -> f64) {
     let b = st.pop().flatten();
     let a = st.pop().flatten();
@@ -306,7 +380,9 @@ fn unary(st: &mut Vec<Option<f64>>, f: impl Fn(f64) -> f64) {
     st.push(a.map(f));
 }
 
-fn walk(json: &Json, path: &str, depth: usize, ops: &mut Vec<Op>) -> Result<(), Error> {
+impl Compiler {
+fn walk(&mut self, json: &Json, path: &str, depth: usize) -> Result<(), Error> {
+    let ops = &mut self.ops;
     if depth > MAX_DEPTH {
         return Err(err(path, format!("nested deeper than {MAX_DEPTH}")));
     }
@@ -315,7 +391,7 @@ fn walk(json: &Json, path: &str, depth: usize, ops: &mut Vec<Op>) -> Result<(), 
     }
 
     if let Some(n) = json.as_f64() {
-        ops.push(Op::Num(n));
+        self.push(Op::Num(n), 0);
         return Ok(());
     }
 
@@ -343,15 +419,62 @@ fn walk(json: &Json, path: &str, depth: usize, ops: &mut Vec<Op>) -> Result<(), 
                 format!("unknown property `{var}`; expected one of {}", Var::NAMES),
             ));
         };
-        ops.push(Op::Var(v));
+        self.push(Op::Var(v), 0);
+        return Ok(());
+    }
+
+    // `case` compiles to jumps rather than to a value-consuming operator,
+    // because a choice has to *not evaluate* the branch it did not take.
+    // Multiplying by a 0/1 indicator cannot express that: null times zero is
+    // null, so a branch reading an absent prominence poisons the answer even
+    // where it was never wanted.
+    if name == "case" {
+        if args.len() < 3 || args.len() % 2 == 0 {
+            return Err(err(
+                path,
+                "case takes a condition, a value, optionally more pairs, \
+                 and a final fallback -- an odd number, at least three",
+            ));
+        }
+        let base = self.depth;
+        let mut max = base;
+        let mut ends: Vec<usize> = Vec::new();
+        let mut i = 0;
+        while i + 1 < args.len() {
+            self.depth = base;
+            self.walk(&args[i], &argpath(i), depth + 1)?;
+            let jf = self.ops.len();
+            self.ops.push(Op::JumpIfFalsy(usize::MAX));
+            self.depth -= 1; // the condition is consumed by the jump
+            self.walk(&args[i + 1], &argpath(i + 1), depth + 1)?;
+            max = max.max(self.depth);
+            ends.push(self.ops.len());
+            self.ops.push(Op::Jump(usize::MAX));
+            let here = self.ops.len();
+            self.ops[jf] = Op::JumpIfFalsy(here);
+            i += 2;
+        }
+        // The fallback. Every path arrives here having pushed nothing, and
+        // leaves having pushed exactly one value -- which is what makes the
+        // whole construct behave like any other expression node.
+        self.depth = base;
+        self.walk(&args[args.len() - 1], &argpath(args.len() - 1), depth + 1)?;
+        max = max.max(self.depth);
+        let end = self.ops.len();
+        for e in ends {
+            self.ops[e] = Op::Jump(end);
+        }
+        self.depth = base + 1;
+        self.max = self.max.max(max);
         return Ok(());
     }
 
     for (i, a) in args.iter().enumerate() {
-        walk(a, &argpath(i), depth + 1, ops)?;
+        self.walk(a, &argpath(i), depth + 1)?;
     }
 
     let n = args.len();
+    let ops = &mut self.ops;
     let at_least = |k: usize, ops: &mut Vec<Op>, op: Op| -> Result<(), Error> {
         if n < k {
             return Err(err(path, format!("{name} needs at least {k} arguments")));
@@ -376,6 +499,12 @@ fn walk(json: &Json, path: &str, depth: usize, ops: &mut Vec<Op>) -> Result<(), 
         "*" => at_least(1, ops, Op::Mul(n))?,
         "min" => at_least(1, ops, Op::Min(n))?,
         "max" => at_least(1, ops, Op::Max(n))?,
+        "==" => exactly(2, ops, Op::Eq)?,
+        "!=" => exactly(2, ops, Op::Ne)?,
+        "<" => exactly(2, ops, Op::Lt)?,
+        "<=" => exactly(2, ops, Op::Le)?,
+        ">" => exactly(2, ops, Op::Gt)?,
+        ">=" => exactly(2, ops, Op::Ge)?,
         // The one operator whose meaning depends on how many arguments it
         // has. Unambiguous in prefix form, where infix would have to guess.
         "-" => match n {
@@ -396,13 +525,19 @@ fn walk(json: &Json, path: &str, depth: usize, ops: &mut Vec<Op>) -> Result<(), 
             return Err(err(
                 path,
                 format!(
-                    "unknown operator `{other}`; expected one of get, coalesce, \
-                     +, -, *, /, ^, min, max, abs, sign, sqrt, ln, log2, log10, exp"
+                    "unknown operator `{other}`; expected one of get, coalesce, case, \
+                     +, -, *, /, ^, ==, !=, <, <=, >, >=, min, max, abs, sign, sqrt, \
+                     ln, log2, log10, exp"
                 ),
             ))
         }
     }
+    // Every operator above pops its arguments and pushes one result. `case`
+    // returned earlier, having done its own accounting.
+    self.depth = self.depth - n + 1;
+    self.max = self.max.max(self.depth);
     Ok(())
+}
 }
 
 #[cfg(test)]
@@ -548,6 +683,94 @@ mod tests {
                 e.message
             );
         }
+    }
+
+    /// The reason `case` exists at all: a choice must not evaluate the branch
+    /// it did not take. `["*", cond, x]` cannot express one, because null
+    /// times zero is null -- so a branch reading an absent prominence poisons
+    /// the answer even when the condition said not to look at it.
+    #[test]
+    fn case_does_not_evaluate_the_branch_it_skips() {
+        let v = peak(100.0, 1000.0); // prominence is None
+        // Arithmetic selection: the untaken branch still poisons it.
+        let poisoned = eval(
+            &json!(["+", ["*", 0, ["get", "prominence"]], ["*", 1, 42]]),
+            &v,
+        );
+        assert_eq!(poisoned, None, "arithmetic selection should still poison");
+
+        // case does not.
+        let f = json!(["case", ["==", 1, 0], ["get", "prominence"], 42]);
+        assert_eq!(eval(&f, &v), Some(42.0));
+
+        // And it takes the branch when the condition holds.
+        let f = json!(["case", ["==", 1, 1], 7, ["get", "prominence"]]);
+        assert_eq!(eval(&f, &v), Some(7.0));
+    }
+
+    #[test]
+    fn comparisons_yield_one_or_zero_and_pass_null_through() {
+        let v = peak(100.0, 1000.0);
+        assert_eq!(eval(&json!(["<", 1, 2]), &v), Some(1.0));
+        assert_eq!(eval(&json!([">", 1, 2]), &v), Some(0.0));
+        assert_eq!(eval(&json!([">=", 2, 2]), &v), Some(1.0));
+        assert_eq!(eval(&json!(["==", ["get", "dominance"], 100]), &v), Some(1.0));
+        // An unknown compares to nothing.
+        assert_eq!(eval(&json!(["<", ["get", "prominence"], 100]), &v), None);
+    }
+
+    /// A null or NaN condition is not true, so it falls through to the next
+    /// branch. Saying "false" would be the same answer but the wrong reason;
+    /// what matters is that it never *takes* a branch on an unknown.
+    #[test]
+    fn an_unknown_condition_falls_through() {
+        let v = peak(100.0, 1000.0);
+        let f = json!(["case", ["<", ["get", "prominence"], 100], 1, 2]);
+        assert_eq!(eval(&f, &v), Some(2.0));
+        let f = json!(["case", ["/", 0, 0], 1, 2]);
+        assert_eq!(eval(&f, &v), Some(2.0));
+    }
+
+    #[test]
+    fn case_chains_and_checks_its_shape() {
+        let v = peak(100.0, 1000.0);
+        let f = json!([
+            "case",
+            [">", ["get", "dominance"], 1000], 1,
+            [">", ["get", "dominance"], 50], 2,
+            3
+        ]);
+        assert_eq!(eval(&f, &v), Some(2.0));
+
+        // Every branch is compiled, including ones this peak will never
+        // reach, so a malformed branch is a 400 at request time rather than a
+        // surprise for whichever viewpoint first takes that path.
+        let unreachable_but_broken = json!([
+            "case",
+            [">", ["get", "dominance"], 1000], "big",
+            2
+        ]);
+        assert!(Program::compile(&unreachable_but_broken).is_err());
+
+        // An even argument count means a missing fallback.
+        assert!(Program::compile(&json!(["case", 1, 2])).is_err());
+        assert!(Program::compile(&json!(["case", 1, 2, 3, 4])).is_err());
+        assert!(Program::compile(&json!(["case", 1, 2, 3])).is_ok());
+    }
+
+    /// Jumps make the linear stack scan useless, so depth is now an invariant
+    /// of the walk. This is the assertion that it still holds.
+    #[test]
+    fn nested_cases_stay_balanced() {
+        let v = peak(-40.0, 8000.0);
+        let f = json!([
+            "+",
+            ["case", [">", ["get", "dominance"], 0],
+                     ["case", [">", ["get", "distance"], 5000], 1, 2],
+                     ["case", [">", ["get", "distance"], 5000], 3, 4]],
+            10
+        ]);
+        assert_eq!(eval(&f, &v), Some(13.0));
     }
 
     /// The path is what makes a nested mistake findable.

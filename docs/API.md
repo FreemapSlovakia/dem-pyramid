@@ -450,10 +450,32 @@ The shape is MapLibre's — JSON prefix arrays — **but this is not MapLibre
 expressions and does not implement them.** The syntax is borrowed because
 clients already read and write it; the operators are ours.
 
-**Operators.** `get` `coalesce` · `+` `-` `*` `/` `^` `min` `max` · `abs`
-`sign` `sqrt` `ln` `log2` `log10` `exp`. `+` `*` `min` `max` and `coalesce`
-take any number of arguments; `-` takes one (negate) or two (subtract).
-Everything is floating point, so `["/", 1, 2]` is 0.5.
+**Operators.** `get` `coalesce` `case` · `+` `-` `*` `/` `^` `min` `max` ·
+`==` `!=` `<` `<=` `>` `>=` · `abs` `sign` `sqrt` `ln` `log2` `log10` `exp`.
+`+` `*` `min` `max` and `coalesce` take any number of arguments; `-` takes one
+(negate) or two (subtract). Everything is floating point, so `["/", 1, 2]` is
+0.5, and comparisons yield 1 or 0 rather than a boolean.
+
+**`case`** takes a condition, a value, optionally more pairs, and a final
+fallback — an odd number of arguments, at least three:
+
+```jsonc
+// trust prominence only where it was matched closely; fall back to dominance
+"peak_rank": ["case",
+  ["<", ["coalesce", ["get","prom_dist_m"], 9999], 50], ["get", "prominence"],
+  ["get", "dominance"]]
+```
+
+**It genuinely does not evaluate the branch it skips**, which is the reason it
+exists. Selecting arithmetically cannot do that: `["+", ["*", 0, ["get",
+"prominence"]], ["*", 1, 42]]` is **null**, not 42, because null times zero is
+still null — so a branch reading an absent prominence poisons the answer even
+where the condition said not to look. A **null or `NaN` condition is not true**
+and falls through; an unknown is never a yes.
+
+Every branch is still *compiled*, so a mistake in one this viewpoint never
+reaches is a `400` now rather than a surprise at whichever viewpoint first
+takes that path.
 
 **Properties.** `dominance` `distance` `altitude` `ele` `x` `y` `revealed`
 `prominence` `prom_dist_m`. Spelled exactly as the payload spells them.
