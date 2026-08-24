@@ -69,15 +69,34 @@ mod round {
         }
     }
 
-    /// Three decimals for `rank`, whose scale is whatever the caller's formula
-    /// produces -- 2.04 for one peak and -11 960 for another in the same
-    /// response -- so a fixed absolute precision has to be fine enough for the
-    /// small end.
-    pub fn opt_d3<S: Serializer>(v: &Option<f64>, s: S) -> Result<S::Ok, S::Error> {
+    /// Significant digits, not decimal places, for `rank`.
+    ///
+    /// Its scale is entirely the caller's: `dominance / distance^2` produces
+    /// about 3.7e-7, and at three decimals every peak in the response
+    /// serializes as `0.0` while the ordering behind it is perfectly real --
+    /// which defeats the only reason the field exists. Six significant digits
+    /// hold both that and the -11 960 a near subordinate top scores under the
+    /// default formula.
+    pub fn opt_sig<S: Serializer>(v: &Option<f64>, s: S) -> Result<S::Ok, S::Error> {
         match v {
-            Some(v) => s.serialize_f64(to(*v, 3)),
+            Some(v) => s.serialize_f64(sig(*v, 6)),
             None => s.serialize_none(),
         }
+    }
+
+    fn sig(v: f64, digits: i32) -> f64 {
+        if !v.is_finite() || v == 0.0 {
+            return v;
+        }
+        let mag = v.abs().log10().floor();
+        // Beyond this the scaling itself overflows, and a value that extreme
+        // is already past anything a ranking distinguishes.
+        let shift = digits - 1 - mag as i32;
+        if !(-300..=300).contains(&shift) {
+            return v;
+        }
+        let f = 10f64.powi(shift);
+        (v * f).round() / f
     }
 }
 
@@ -136,7 +155,13 @@ pub struct Peak {
     /// and the reason a summit sits where it does stops being a guess. A
     /// client that re-ranks can also reuse the number instead of recomputing
     /// it.
-    #[serde(serialize_with = "round::opt_d3")]
+    ///
+    /// **`null` means the formula produced nothing usable for this peak** --
+    /// a null, a NaN or an infinity -- and it was sorted last. With
+    /// `peak_rank: ["get", "prominence"]` that is two thirds of them, since
+    /// most have no prominence. It is not "unranked": every returned peak was
+    /// ranked, and this one scored bottom.
+    #[serde(serialize_with = "round::opt_sig")]
     pub rank: Option<f64>,
 
     /// True topographic prominence, metres, or `null` where none is known.

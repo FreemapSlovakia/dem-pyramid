@@ -115,8 +115,15 @@ pub struct Request {
     depth_step: u16,
     #[serde(default = "d_peaks")]
     peaks: bool,
-    #[serde(default = "d_min_dom")]
-    min_dominance: f64,
+    /// Optional so that "not sent" is distinguishable from "sent as 30".
+    ///
+    /// It has to be, because the default is 30 and it is ANDed *before*
+    /// `peak_filter`. A filter saying "a real mountain however it reads from
+    /// here" -- low dominance, high prominence -- would never see those peaks:
+    /// the default threshold drops them first, and the filter can then only
+    /// narrow what is left. The feature's own motivating example did not work.
+    #[serde(default)]
+    min_dominance: Option<f64>,
     /// Keep at most this many peaks, most label-worthy first -- dominance
     /// discounted by distance, or by `peak_rank` if one is given. 0 is no cap,
     /// and no cap is the simplest correct answer -- see the docs.
@@ -476,7 +483,7 @@ async fn panorama_route(
         ("eye", req.eye),
         ("eye_search_radius", req.eye_search_radius),
         ("range", req.range),
-        ("min_dominance", req.min_dominance),
+        ("min_dominance", req.min_dominance.unwrap_or_default()),
         ("dither_strength", req.dither_strength),
     ] {
         if !v.is_finite() {
@@ -585,7 +592,6 @@ async fn panorama_route(
     let want_depth = req.depth;
     let format = req.format;
     let quality = req.quality.clamp(1, 100);
-    let min_dom = req.min_dominance;
     let max_peaks = req.max_peaks;
     let keep_revealed = req.revealed_peaks;
     let rank_power = peaks::DEFAULT_RANK_POWER;
@@ -604,6 +610,17 @@ async fn panorama_route(
             Err(e) => return bad(format!("peak_filter: {e}")),
         },
         None => None,
+    };
+    // The legacy default applies only when no filter was given. Keeping it
+    // alongside one would let a threshold nobody asked for veto the filter --
+    // and a filter can only ever narrow what reaches it, so the peaks a caller
+    // most wants back would be exactly the ones already gone. An explicit
+    // `min_dominance` is still honoured beside a filter; only the default
+    // steps aside.
+    let min_dom = match (req.min_dominance, &filter) {
+        (Some(v), _) => v,
+        (None, Some(_)) => f64::NEG_INFINITY,
+        (None, None) => d_min_dom(),
     };
 
     let render_cancel = cancel.clone();

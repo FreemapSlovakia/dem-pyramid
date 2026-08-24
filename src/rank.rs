@@ -254,8 +254,13 @@ impl Program {
                 }
                 Op::Add(n) => fold(st,n, 0.0, |a, b| a + b),
                 Op::Mul(n) => fold(st,n, 1.0, |a, b| a * b),
-                Op::Min(n) => fold1(st,n, f64::min),
-                Op::Max(n) => fold1(st,n, f64::max),
+                // Not `f64::min`/`f64::max`: those are IEEE minNum/maxNum and
+                // discard a NaN operand, so `["max", ["/",0,0], 5]` would
+                // score 5 and rank normally. Every other operator propagates
+                // badness, and a peak the formula could not score must never
+                // be *promoted* by that failure.
+                Op::Min(n) => fold1(st, n, |a, b| if a.is_nan() || b.is_nan() { f64::NAN } else { a.min(b) }),
+                Op::Max(n) => fold1(st, n, |a, b| if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) }),
                 Op::Sub => binary(st,|a, b| a - b),
                 Op::Div => binary(st,|a, b| a / b),
                 Op::Pow => binary(st,f64::powf),
@@ -330,7 +335,14 @@ struct Compiler {
 impl Compiler {
     fn push(&mut self, op: Op, pops: usize) {
         self.ops.push(op);
-        self.depth = self.depth - pops + 1;
+        // The linear balance scan went when `case` brought jumps, and this is
+        // what replaced its underflow check. Unreachable today -- both call
+        // sites pass 0 -- but release builds have overflow checks off, so a
+        // future caller getting it wrong would wrap to ~1.8e19, carry that
+        // into `max`, and reach `Vec::with_capacity`: an allocation abort
+        // instead of a compile error.
+        debug_assert!(self.depth >= pops, "stack underflow while compiling");
+        self.depth = self.depth.saturating_sub(pops) + 1;
         self.max = self.max.max(self.depth);
     }
 }
@@ -793,12 +805,30 @@ mod tests {
 
     #[test]
     fn oversized_expressions_are_refused() {
-        // Deeply nested rather than merely long, so both guards are exercised.
+        // Deep: 34 wrappers against a limit of 32.
         let mut f = json!(1);
         for _ in 0..MAX_DEPTH + 2 {
             f = json!(["-", f]);
         }
-        assert!(Program::compile(&f).is_err());
+        assert!(Program::compile(&f).is_err(), "depth limit");
+
+        // Long: this is what the old comment claimed to cover and did not --
+        // 34 nested ops are 34 ops, nowhere near 256, so only the depth guard
+        // ever fired and MAX_OPS had no test at all.
+        let wide: Vec<Json> = std::iter::once(json!("+"))
+            .chain(std::iter::repeat(json!(1)).take(MAX_OPS * 4))
+            .collect();
+        assert!(Program::compile(&Json::Array(wide)).is_err(), "op limit");
+
+        // And a shape that grows through `case`, whose jumps are emitted
+        // outside the counting path.
+        let mut chain: Vec<Json> = vec![json!("case")];
+        for _ in 0..MAX_OPS {
+            chain.push(json!([">", ["get", "dominance"], 1]));
+            chain.push(json!(1));
+        }
+        chain.push(json!(0));
+        assert!(Program::compile(&Json::Array(chain)).is_err(), "case chain");
     }
 
     /// The whole point of compiling to postfix: if it balances once it
@@ -813,18 +843,25 @@ mod tests {
             ["*", 0.3, ["coalesce", ["get", "prominence"], 0]]
         ]);
         let p = Program::compile(&f).unwrap();
-        // Whatever the data, the stack ends with exactly one value.
+        // Whatever the data, the answer is the arithmetic -- checked against
+        // it, not against "did not panic". The previous version of this test
+        // asserted `x || y || true`, which is a tautology, and would have
+        // passed had `eval` returned anything at all.
         for (dominance, distance, prom) in [
             (100.0, 1000.0, Some(400.0)),
             (-100.0, 1.0, None),
             (0.0, 0.0, Some(0.0)),
+            (-259.9, 2117.7, Some(486.0)),
         ] {
             let mut v = peak(dominance, distance);
             v.prominence = prom;
-            assert!(p.eval(&v).is_some() || prom.is_none() || true);
-            // The real assertion: it returns rather than panicking, and rank
-            // is always a usable f64.
-            assert!(p.rank(&v).is_finite() || p.rank(&v) == f64::NEG_INFINITY);
+            let want = crate::peaks::label_rank(dominance, distance, 0.5)
+                + 0.3 * prom.unwrap_or(0.0);
+            let got = p.eval(&v).expect("coalesce makes this total");
+            assert!(
+                (got - want).abs() < 1e-9 * want.abs().max(1.0),
+                "{dominance} at {distance} with {prom:?}: got {got}, want {want}"
+            );
         }
     }
 }
