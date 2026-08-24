@@ -152,6 +152,7 @@ pub struct Request {
 fn d_true() -> bool { true }
 fn d_rank_power() -> f64 { peaks::DEFAULT_RANK_POWER }
 fn d_profile_step() -> f64 { panorama::DEFAULT_PROFILE_STEP }
+fn d_gamma() -> f64 { 1.0 }
 
 #[derive(Deserialize, Clone, Copy, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -179,6 +180,15 @@ pub struct ViewshedRequest {
     /// Height above ground of what is being looked at; 0 is the ground.
     #[serde(default)]
     target_height: f64,
+    /// Curve on the overlay's opacity: `alpha ** (1/gamma)`, 0.1–10. Above 1
+    /// lifts grazing ground, which is most of a large viewshed, without
+    /// driving the near field solid the way a plain gain would.
+    #[serde(default = "d_gamma")]
+    gamma: f64,
+    /// Least opacity visible ground may take, 0–1. A stencil rather than a
+    /// shading. Hidden ground stays fully transparent regardless.
+    #[serde(default)]
+    alpha_floor: f64,
     /// `#rrggbb` for the visible area. Opacity carries the detail, so a flat
     /// colour is the point.
     #[serde(default)]
@@ -695,10 +705,20 @@ async fn viewshed_route(
         ("eye", req.eye),
         ("eye_search_radius", req.eye_search_radius),
         ("target_height", req.target_height),
+        ("gamma", req.gamma),
+        ("alpha_floor", req.alpha_floor),
     ] {
         if !v.is_finite() {
             return bad(format!("{name} must be a finite number"));
         }
+    }
+    // Rejected rather than clamped: a gamma of 0 is a division by zero and a
+    // negative one inverts the picture, showing least where the eye sees most.
+    if !(0.1..=10.0).contains(&req.gamma) {
+        return bad("gamma must lie within 0.1..10");
+    }
+    if !(0.0..=1.0).contains(&req.alpha_floor) {
+        return bad("alpha_floor must lie within 0..1");
     }
     if req.radius <= 0.0 || req.radius > MAX_VIEWSHED_RADIUS {
         return bad(format!("radius must lie within 0..{MAX_VIEWSHED_RADIUS} m"));
@@ -735,6 +755,8 @@ async fn viewshed_route(
         target_height: req.target_height.clamp(0.0, 1000.0),
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         colour: (colour.0 as u8, colour.1 as u8, colour.2 as u8),
+        gamma: req.gamma,
+        alpha_floor: req.alpha_floor,
     };
 
     let cancel = Cancel::default();

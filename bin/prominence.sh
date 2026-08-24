@@ -50,6 +50,10 @@ MIN_PROM=${MIN_PROM:-30}     # metres, matching the API's min_dominance floor
 MIN_ISO=${MIN_ISO:-1}        # km
 THREADS=${THREADS:-8}        # of 12; the box also serves tiles
 
+# 3601 x 3601 samples, two bytes each. A tile of any other size is a partial
+# write, and the reader aborts the whole run on one rather than skipping it.
+TILE_BYTES=$((3601 * 3601 * 2))
+
 HGT="$WORK/hgt-eu"
 OUT="$WORK/out-eu"
 ISO="$WORK/iso-eu"
@@ -62,21 +66,38 @@ step_tile() {
 			f=$(printf '%s/%s%02d%s%03d.hgt' "$HGT" \
 				"$([ $lat -ge 0 ] && echo N || echo S)" "${lat#-}" \
 				"$([ $lon -ge 0 ] && echo E || echo W)" "${lon#-}")
-			if [ -f "$f" ]; then
+			# Size, not existence. A tile interrupted mid-write is still a
+			# file, and the reader does not survive one: a short read gets
+			# past its length check and corrupts the heap, so the whole run
+			# aborts thousands of tiles later with "double free". Killing
+			# the first attempt mid-tiling left exactly one such file and
+			# cost two runs to find.
+			if [ -f "$f" ] && [ "$(stat -c%s "$f")" = "$TILE_BYTES" ]; then
 				skipped=$((skipped + 1))
 				continue
 			fi
+			rm -f "$f"
 			# -r near, not bilinear: resampling onto the 1-arcsecond grid
 			# shifts samples by up to half a pixel either way, and a shifted
 			# true elevation beats a smoothed summit when what matters is the
 			# height of cols and tops.
+			# Written under a temporary name and moved into place, so an
+			# interrupted run leaves no half-tile behind to be trusted later.
+			# SRTMHGT derives its geotransform from the filename, so the temp
+			# name has to keep it -- hence a suffix rather than a prefix.
 			gdal_translate -q -projwin "$lon" $((lat + 1)) $((lon + 1)) "$lat" \
 				-outsize 3601 3601 -r near -ot Int16 -a_nodata -32768 \
-				-of SRTMHGT "$SRC" "$f" 2>/dev/null || {
+				-of SRTMHGT "$SRC" "$f.part" 2>/dev/null || {
 				echo "warning: no data for $f, skipping" >&2
-				rm -f "$f"
+				rm -f "$f.part"
 				continue
 			}
+			if [ "$(stat -c%s "$f.part")" != "$TILE_BYTES" ]; then
+				echo "warning: $f came out $(stat -c%s "$f.part") bytes, discarding" >&2
+				rm -f "$f.part"
+				continue
+			fi
+			mv "$f.part" "$f"
 			n=$((n + 1))
 		done
 	done
@@ -85,8 +106,11 @@ step_tile() {
 
 step_prominence() {
 	mkdir -p "$OUT"
+	# `--` is load-bearing: a western bound is negative, and getopt_long reads
+	# a bare `-25` as the options -2 and -5 rather than as a coordinate. The
+	# Slovakia pilot ran entirely east of Greenwich and never saw it.
 	"$BIN/prominence" -i "$HGT" -o "$OUT" -f SRTM30 -t "$THREADS" \
-		-m "$MIN_PROM" "$S" "$N" "$W" "$E"
+		-m "$MIN_PROM" -- "$S" "$N" "$W" "$E"
 }
 
 step_merge() {
@@ -103,7 +127,7 @@ step_isolation() {
 	# -f needs deploy/mountains-isolation-format.patch; upstream hardcodes
 	# 3-arcsecond SRTM and would read these tiles with the wrong stride.
 	"$BIN/isolation" -i "$HGT" -o "$ISO" -f SRTM30 -t "$THREADS" \
-		-m "$MIN_ISO" "$S" "$N" "$W" "$E"
+		-m "$MIN_ISO" -- "$S" "$N" "$W" "$E"
 	echo "isolation files: $(ls "$ISO" | wc -l)"
 }
 
@@ -113,14 +137,25 @@ prominence) step_prominence ;;
 merge) step_merge ;;
 isolation) step_isolation ;;
 all)
+	# Prominence only. Isolation is a separate pass over the same tiles and
+	# stays available as `bin/prominence.sh isolation`, but the map renderer
+	# gets its isolation from OpenTopoMap's tool instead: that one is driven
+	# by the OSM peak list, so its output is keyed by `osm_id` and joins
+	# straight into the rendering database. Kirmse's is DEM-driven and would
+	# have to be matched back across a ~100 m radius, which is guesswork
+	# wherever two real summits sit inside it -- the three Rysy tops are
+	# 130 m apart and all called "Rysy". A misranked label in a panorama is a
+	# nuisance; on a map it is an error someone reports.
+	#
+	# Prominence has no such alternative, and its matching cost is acceptable
+	# because the value is an internal ranking prior rather than a number
+	# printed on a label.
 	echo "== tiling $((E - W))x$((N - S)) degrees =="
 	time step_tile
 	echo "== prominence =="
 	time step_prominence
 	echo "== merge =="
 	time step_merge
-	echo "== isolation =="
-	time step_isolation
 	;;
 *)
 	echo "usage: $0 [tile|prominence|merge|isolation|all]" >&2

@@ -40,6 +40,51 @@ pub struct Params {
     /// hides behind its own convexity long before a standing figure does.
     pub target_height: f64,
     pub colour: (u8, u8, u8),
+
+    /// Curve applied to the opacity, `alpha.powf(1.0 / gamma)`. 1 is the
+    /// measured value.
+    ///
+    /// The measurement is honest and hard to read. Opacity is the sine of the
+    /// angle between the line of sight and the ground, so most of a large
+    /// viewshed -- distant, gently sloping, seen near edge-on -- lands between
+    /// 0.05 and 0.15, and no amount of client-side opacity lifts it, because
+    /// the faintness is already in the pixels.
+    ///
+    /// A gamma curve lifts the faint end without flattening what is above it:
+    /// at 2, a 0.09 slope reads 0.30 and a 0.5 slope 0.71. A plain gain cannot
+    /// do that -- whatever multiplier rescues the far field drives the near
+    /// field to solid and throws away the projected-area gradation, which is
+    /// the thing worth having.
+    pub gamma: f64,
+    /// Least opacity any visible ground may take, 0..=1.
+    ///
+    /// For callers who want a stencil rather than a shading: "you can see this
+    /// at all" never falls below this, whatever the geometry says. Applied
+    /// after `gamma`, and only where something is visible -- ground that is
+    /// hidden stays fully transparent, or the answer would be a lie rather
+    /// than a faint one.
+    pub alpha_floor: f64,
+}
+
+impl Params {
+    /// Apply the opacity curve to one measured alpha.
+    ///
+    /// Both knobs are monotone, so applying them here -- once per pixel, after
+    /// the rays have been reduced by `fetch_max` -- gives the same answer as
+    /// applying them per sample, for a fraction of the work.
+    fn shape(&self, a: u8) -> u8 {
+        // 1 is the marcher's "visible but grazing" floor and 255 is face-on;
+        // the curve works in that span rather than in 0..255, so a floor of 0
+        // still cannot make visible ground vanish.
+        let v = f64::from(a - 1) / 254.0;
+        let v = if self.gamma == 1.0 {
+            v
+        } else {
+            v.powf(1.0 / self.gamma)
+        };
+        let v = v.max(self.alpha_floor).clamp(0.0, 1.0);
+        (v * 254.0).round() as u8 + 1
+    }
 }
 
 pub struct Out {
@@ -144,6 +189,7 @@ pub fn render(
         let a = a.load(Ordering::Relaxed);
         if a > 0 {
             let (x, y) = ((i % px) as u32, (i / px) as u32);
+            let a = p.shape(a);
             image.put_pixel(x, y, image::Rgba([p.colour.0, p.colour.1, p.colour.2, a]));
         }
     }
@@ -264,6 +310,70 @@ fn opacity(ray_t: f64, prev: Option<(f64, f64)>, d: f64, h: f64) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shaping(gamma: f64, alpha_floor: f64) -> Params {
+        Params {
+            lon: 20.0,
+            lat: 49.0,
+            eye_height: 1.7,
+            eye_search_radius: 10.0,
+            radius: 30_000.0,
+            scale: 20.0,
+            target_height: 0.0,
+            colour: (255, 214, 102),
+            gamma,
+            alpha_floor,
+        }
+    }
+
+    /// The curve has to lift the grazing end hard while leaving the ordering
+    /// and the extremes alone -- that is the whole reason it is a gamma rather
+    /// than a gain, which would drive the near field solid to rescue the far.
+    #[test]
+    fn gamma_lifts_the_faint_end_and_keeps_the_order() {
+        let p = shaping(2.0, 0.0);
+        let a = |v: f64| p.shape((v * 254.0).round() as u8 + 1);
+
+        // The numbers the request was made with: a 0.09 slope reads 0.30, a
+        // 0.5 slope reads 0.71.
+        assert!((f64::from(a(0.09) - 1) / 254.0 - 0.30).abs() < 0.01);
+        assert!((f64::from(a(0.5) - 1) / 254.0 - 0.71).abs() < 0.01);
+
+        // Endpoints are fixed points, so nothing saturates and nothing
+        // vanishes however hard the curve is pushed.
+        for gamma in [0.1, 1.0, 2.0, 10.0] {
+            let p = shaping(gamma, 0.0);
+            assert_eq!(p.shape(1), 1, "gamma {gamma} moved the grazing floor");
+            assert_eq!(p.shape(255), 255, "gamma {gamma} moved face-on");
+        }
+
+        // Monotone: brighter ground never comes out darker than fainter.
+        let p = shaping(2.5, 0.0);
+        for v in 1..255u8 {
+            assert!(p.shape(v) <= p.shape(v + 1), "order broke at {v}");
+        }
+
+        // 1 is exactly the measured value, unshaped.
+        let p = shaping(1.0, 0.0);
+        for v in 1..=255u8 {
+            assert_eq!(p.shape(v), v, "gamma 1 altered {v}");
+        }
+    }
+
+    /// The floor is for callers who want a stencil. It may not resurrect
+    /// ground that is not visible -- that is what the alpha channel means.
+    #[test]
+    fn the_floor_lifts_visible_ground_only() {
+        let p = shaping(1.0, 0.15);
+        // Barely visible is lifted to the floor...
+        assert!(f64::from(p.shape(1) - 1) / 254.0 >= 0.149);
+        // ...and strong ground is left alone.
+        assert_eq!(p.shape(255), 255);
+        // Hidden ground never reaches `shape` at all: the render writes only
+        // where alpha > 0, so a floor cannot paint what the eye cannot see.
+        let p = shaping(1.0, 1.0);
+        assert_eq!(p.shape(1), 255, "a floor of 1 is a plain stencil");
+    }
 
     /// Every bearing must land inside the raster, and in the quadrant it
     /// belongs to. A viewshed that silently drops three quarters of the

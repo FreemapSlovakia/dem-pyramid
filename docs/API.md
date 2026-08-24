@@ -664,6 +664,8 @@ Mercator, centred on the viewpoint, transparent where nothing is visible.
 | `eye_search_radius` | number | `10` | as for panoramas |
 | `target_height` | number | `0` | height of the thing looked *at* |
 | `color` | string | `#ffd666` | overlay colour, `#rrggbb` |
+| `gamma` | number | `1` | curve on the opacity, `alpha ** (1/gamma)` (0.1–10); above 1 lifts grazing ground |
+| `alpha_floor` | number | `0` | least opacity visible ground may take (0–1); a stencil rather than a shading |
 | `format` | string | `avif` | `avif` or `png` |
 | `quality` | int | `95` | AVIF quality |
 
@@ -694,8 +696,37 @@ area.
 
 One consequence worth expecting: ground close to the viewpoint on a convex
 summit reads faint, because you are looking along it rather than at it, even
-though it is unmistakably visible. If that reads wrong in the app, say so and
-the measure can take distance into account as well.
+though it is unmistakably visible.
+
+#### Making it read stronger
+
+The faintness is in the pixels, not in the compositing, so client-side opacity
+cannot recover it: most of a large viewshed is distant, gently sloping ground
+seen near edge-on, and lands at 0.05–0.15. **`gamma` reshapes it**, applying
+`alpha ** (1/gamma)`:
+
+| `gamma` | a 0.09 slope reads | a 0.5 slope reads |
+|---|---|---|
+| 1 (default, measured) | 0.09 | 0.50 |
+| 2 | **0.30** | 0.71 |
+| 3 | 0.45 | 0.79 |
+
+A curve rather than a gain, deliberately. Any multiplier large enough to
+rescue the far field drives the near field to solid and throws away the
+projected-area gradation, which is the part worth keeping — a gamma lifts the
+faint end while leaving the ordering intact and both endpoints fixed, so
+nothing saturates and nothing vanishes however hard it is pushed. Measured on
+a 25 km viewshed, mean alpha roughly doubles at `gamma: 2` and rises 2.5× at
+`gamma: 3`, with the shading structure still legible at both.
+
+`alpha_floor` is the blunter instrument: visible ground never falls below it,
+whatever the geometry says. `alpha_floor: 1` is a plain stencil — visible or
+not, nothing in between. **Neither knob can make hidden ground appear.** The
+render writes only where something is visible, so transparency still means
+exactly "not visible from here".
+
+`gamma: 2` is a good starting point for an overlay meant to be read at a
+glance; leave it at 1 when the opacity is being interpreted quantitatively.
 
 ### Cost
 
