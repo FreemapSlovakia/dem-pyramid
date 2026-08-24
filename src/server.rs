@@ -169,16 +169,19 @@ pub struct Request {
     /// Formula deciding which summits `max_peaks` keeps, as a MapLibre-shaped
     /// JSON prefix expression. See `rank`.
     ///
-    /// This is the only ranking knob. `peak_rank_power` used to sit beside it
-    /// and was strictly subsumed -- the expression reproduces it exactly, and
-    /// a test pins that -- so two parameters were doing one job.
+    /// The only ranking knob. `peak_rank_power` used to sit beside it and was
+    /// strictly subsumed, so two parameters were doing one job; omitting this
+    /// now runs the same expression the docs present as the default, because
+    /// that expression *is* the default -- see `peaks::default_rank`.
     #[serde(default)]
     peak_rank: Option<serde_json::Value>,
     /// Which peaks come back at all, as the same kind of expression.
     ///
     /// Supersedes `min_dominance` and `revealed_peaks`, which can each see one
-    /// field. Those still work and are applied alongside this one, so a
-    /// request sending both gets the intersection.
+    /// field. An **explicit** `min_dominance` still applies alongside this and
+    /// the two intersect; its default of 30 steps aside, or the threshold
+    /// would drop the low-dominance mountains a filter exists to catch before
+    /// the filter ever ran.
     #[serde(default)]
     peak_filter: Option<serde_json::Value>,
 }

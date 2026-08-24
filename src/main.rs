@@ -194,10 +194,15 @@ enum Command {
         /// .json extension.
         #[arg(long)]
         peaks_out: Option<PathBuf>,
-        /// Drop peaks standing less than this above their surroundings, metres.
-        /// Negative for tops their own ridge stands over.
-        #[arg(long, default_value_t = 30.0)]
-        min_dominance: f64,
+        /// Drop peaks standing less than this above their surroundings,
+        /// metres. Negative for tops their own ridge stands over.
+        ///
+        /// Deprecated in favour of --peak-filter, and its default of 30 steps
+        /// aside when one is given -- otherwise a threshold nobody asked for
+        /// would drop the low-dominance mountains a filter exists to catch,
+        /// before the filter ever ran.
+        #[arg(long)]
+        min_dominance: Option<f64>,
         /// Drop summits only --depth-lift brought into view, so labels name
         /// nothing the eye cannot see. Nothing is revealed without a lift.
         #[arg(long, default_value_t = false)]
@@ -419,7 +424,7 @@ fn main() -> Result<()> {
                 ("eye", eye),
                 ("eye-search-radius", eye_search_radius),
                 ("range", range),
-                ("min-dominance", min_dominance),
+                ("min-dominance", min_dominance.unwrap_or_default()),
                 ("dither-strength", dither_strength),
                 // `edge-hidden-ref` divides the hidden extent and the result
                 // goes through `clamp`, which passes a NaN straight out, so a
@@ -549,7 +554,13 @@ fn main() -> Result<()> {
                 peaks::select(
                     &mut cands,
                     &peaks::Selection {
-                        min_dominance,
+                        // Same rule as the server: the legacy default applies
+                        // only when no filter was given.
+                        min_dominance: match (min_dominance, &peak_filter) {
+                            (Some(v), _) => v,
+                            (None, Some(_)) => f64::NEG_INFINITY,
+                            (None, None) => 30.0,
+                        },
                         max_peaks,
                         height: stats.height,
                         keep_revealed: !no_revealed_peaks,

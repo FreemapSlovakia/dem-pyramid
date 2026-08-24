@@ -256,9 +256,14 @@ impl Program {
                 Op::Mul(n) => fold(st,n, 1.0, |a, b| a * b),
                 // Not `f64::min`/`f64::max`: those are IEEE minNum/maxNum and
                 // discard a NaN operand, so `["max", ["/",0,0], 5]` would
-                // score 5 and rank normally. Every other operator propagates
-                // badness, and a peak the formula could not score must never
-                // be *promoted* by that failure.
+                // score 5 and rank normally, and a peak the formula could not
+                // score must never be *promoted* by that failure.
+                //
+                // Every arithmetic operator propagates badness this way. The
+                // comparisons deliberately do not -- `["<", NaN, 5]` is 0,
+                // not null -- so a `case` on a NaN takes its else branch
+                // rather than yielding null. That is the one family this rule
+                // does not cover, and it is the family filters are built from.
                 Op::Min(n) => fold1(st, n, |a, b| if a.is_nan() || b.is_nan() { f64::NAN } else { a.min(b) }),
                 Op::Max(n) => fold1(st, n, |a, b| if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) }),
                 Op::Sub => binary(st,|a, b| a - b),
@@ -557,7 +562,17 @@ fn walk(&mut self, json: &Json, path: &str, depth: usize) -> Result<(), Error> {
     }
     // Every operator above pops its arguments and pushes one result. `case`
     // returned earlier, having done its own accounting.
-    self.depth = self.depth - n + 1;
+    //
+    // This is the subtraction that could actually underflow -- every non-case
+    // operator goes through it, where `Compiler::push` is only ever called
+    // with zero. It holds because each of the `n` arguments was walked and
+    // each walk leaves exactly one value, and because no zero-arity operator
+    // reaches here: `get` returns early, and every other arity check rejects
+    // n = 0 first. That is the invariant worth asserting, and a future
+    // operator taking a name argument the way `get` does is what would break
+    // it.
+    debug_assert!(self.depth >= n, "{name} popped more than it pushed");
+    self.depth = self.depth.saturating_sub(n) + 1;
     self.max = self.max.max(self.depth);
     Ok(())
 }
@@ -593,13 +608,12 @@ mod tests {
     /// default formula the only one there is.
     #[test]
     fn the_default_formula_weights_distance_on_both_sides_of_zero() {
-        let f = json!([
-            "/",
-            ["get", "dominance"],
-            ["^", ["max", ["get", "distance"], 1],
-                  ["*", 0.5, ["sign", ["get", "dominance"]]]]
-        ]);
-        let p = Program::compile(&f).unwrap();
+        // The *shipped* default, not a copy of it typed here. A local `json!`
+        // would test itself: changing 0.5 to 0.25 in `peaks::default_rank`
+        // would leave this green while silently falsifying the documentation,
+        // because every other assertion about the default is a monotonicity
+        // or sign property that any positive exponent satisfies.
+        let p = crate::peaks::default_rank();
 
         // Real numbers from the report that prompted the distance weighting.
         for (dominance, distance) in [

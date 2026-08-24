@@ -89,14 +89,28 @@ mod round {
             return v;
         }
         let mag = v.abs().log10().floor();
-        // Beyond this the scaling itself overflows, and a value that extreme
-        // is already past anything a ranking distinguishes.
-        let shift = digits - 1 - mag as i32;
-        if !(-300..=300).contains(&shift) {
-            return v;
-        }
+        // Clamped rather than escaped. Returning `v` untouched beyond the
+        // guard would emit seventeen digits for every peak -- a formula like
+        // `["*", 1e-300, ["get","dominance"]]` reaches it easily -- and
+        // seventeen digits per peak is the payload this module exists to
+        // prevent. Clamping rounds at the nearest shift that is representable
+        // instead, which is never worse than not rounding.
+        let shift = (digits - 1 - mag as i32).clamp(-300, 300);
         let f = 10f64.powi(shift);
-        (v * f).round() / f
+        let rounded = (v * f).round() / f;
+        // Six significant digits is coarser than three decimals once a value
+        // passes about 1000, and the default formula reaches -11 960 for a
+        // near subordinate top. So take whichever result lands nearer the
+        // original: three decimals wins at the large end, six significant
+        // digits at the small end where three decimals would round 3.7e-7 to
+        // nothing. That keeps both, and it matters because the docs promise a
+        // client can re-rank on this value and reproduce the server's cut.
+        let by_decimals = to(v, 3);
+        if (by_decimals - v).abs() <= (rounded - v).abs() {
+            by_decimals
+        } else {
+            rounded
+        }
     }
 }
 
@@ -317,7 +331,7 @@ fn split_csv(line: &str) -> Vec<String> {
 /// `max(distance, 1)` guards a viewpoint standing on the summit it is
 /// ranking, where `distance^0.5` would be zero and the division infinite.
 /// Continuous through zero: `sign` is 0 there, `distance^0` is 1, 0/1 is 0.
-fn default_rank() -> &'static crate::rank::Program {
+pub fn default_rank() -> &'static crate::rank::Program {
     static P: std::sync::OnceLock<crate::rank::Program> = std::sync::OnceLock::new();
     P.get_or_init(|| {
         crate::rank::Program::compile(&serde_json::json!([
@@ -384,8 +398,9 @@ fn vars(k: &Peak) -> crate::rank::Vars {
 /// Visibility was decided during the render, from the columns it marched
 /// anyway; `column` is `Some` exactly when a ray answered the peak.
 ///
-/// Ordered by [`label_rank`], not by dominance: see there for why metres are
-/// not a rank, and for the sign trap in fixing that.
+/// Ordered by `Selection::rank`, or by [`default_rank`] where none was given
+/// -- not by dominance. See [`default_rank`] for why metres are not a rank,
+/// and for the sign trap in fixing that.
 ///
 /// One policy, in one place. Both front-ends want the same answer, and while
 /// they each spelled it out the two copies drifted -- a cast here, a clause
@@ -417,11 +432,11 @@ pub fn select(peaks: &mut Vec<Peak>, s: &Selection) {
     // statement about the landscape -- "nothing flatter than this is a summit"
     // -- and would stop meaning anything in metres if distance entered it.
     // Only the cut, which is about label density in a picture, is ranked.
-    // `total_cmp`, not `partial_cmp().unwrap()`. Nothing reachable produces a
-    // NaN rank today -- both front-ends check `rank_power`, and dominance is
-    // guarded finite where it is computed -- but `label_rank` and `Selection`
-    // are public with public fields, so that guarantee lives entirely in
-    // validators in other files. This costs the same and cannot panic.
+    // `total_cmp`, not `partial_cmp().unwrap()`. A NaN cannot reach here --
+    // `Program::rank` folds every non-finite result to NEG_INFINITY, which is
+    // where the guarantee actually lives, not in any front-end validation of
+    // the sort a previous version of this comment credited. `total_cmp` costs
+    // the same and cannot panic whatever arrives.
     // Computed once per peak and kept, rather than recomputed inside the
     // comparator -- which is both cheaper and the only way the value can be
     // returned to the caller. An ordering nobody can see is one nobody can
@@ -639,9 +654,19 @@ mod tests {
         ];
         select(&mut peaks, &sel(0.0, 0));
         assert_eq!(peaks[0].osm_id, 2);
+        // Against the arithmetic, not against `default_rank()` -- comparing
+        // `select`'s output to the same call `select` made is
+        // `assert!((x - x).abs() < 1e-9)`, which no formula can fail. That is
+        // what this became when `label_rank`, the independent implementation
+        // it used to check against, was deleted.
         for p in &peaks {
-            let want = default_rank().rank(&vars(p));
-            assert!((p.rank.expect("rank is returned") - want).abs() < 1e-9);
+            let want = p.dominance / p.distance.max(1.0).sqrt();
+            assert!(
+                (p.rank.expect("rank is returned") - want).abs() < 1e-9,
+                "osm {} ranked {:?}, arithmetic says {want}",
+                p.osm_id,
+                p.rank
+            );
         }
     }
 
