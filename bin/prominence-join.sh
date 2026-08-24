@@ -25,11 +25,22 @@ PEAKS="${PEAKS:-$DEM_ROOT/peaks.gpkg}"
 MERGED="${MERGED:-$DEM_ROOT/scratch/out-eu/merged.txt}"
 WORK="${WORK:-$DEM_ROOT/scratch/join.db}"
 RADIUS=150
+# Beyond `RADIUS`, a summit is accepted only if its elevation agrees with the
+# OSM tag. Position alone is not enough that far out -- but position *and*
+# height agreeing is a much stronger claim than position alone at half the
+# distance, so the wider radius buys coverage without buying error.
+#
+# Measured before choosing them: of 32 206 unmatched peaks whose nearest
+# summit lay 150-400 m away, 27 911 agree within 50 m and 21 168 within 20 m.
+WIDE=400
+ELE_TOL=50
 DRY=
 
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--radius) RADIUS="$2"; shift 2 ;;
+	--wide) WIDE="$2"; shift 2 ;;
+	--ele-tol) ELE_TOL="$2"; shift 2 ;;
 	--dry-run) DRY=1; shift ;;
 	*) echo "usage: $0 [--radius M] [--dry-run]" >&2; exit 1 ;;
 	esac
@@ -59,7 +70,8 @@ rm -f "$WORK"
 # it is what identifies a peak to everyone else, and it survives the file being
 # rebuilt.
 ogr2ogr -f CSV /vsistdout/ "$PEAKS" -dialect SQLITE \
-	-sql "SELECT osm_id, ST_X(geom) AS lon, ST_Y(geom) AS lat FROM peaks" \
+	-sql "SELECT osm_id, ST_X(geom) AS lon, ST_Y(geom) AS lat, \
+	             CAST(ele_osm AS REAL) AS ele FROM peaks" \
 	> "$WORK.peaks.csv"
 
 # One degree of latitude is 111 320 m everywhere; longitude shrinks by cos(lat).
@@ -72,7 +84,7 @@ ogr2ogr -f CSV /vsistdout/ "$PEAKS" -dialect SQLITE \
 # is exactly the failure a radius this wide makes possible.
 sqlite3 "$WORK" <<SQL
 CREATE TABLE prom(lat REAL, lon REAL, ele REAL, col_lat REAL, col_lon REAL, prominence REAL);
-CREATE TABLE pk(osm_id INTEGER, lon REAL, lat REAL);
+CREATE TABLE pk(osm_id INTEGER, lon REAL, lat REAL, ele REAL);
 .mode csv
 .import '$MERGED' prom
 .import --skip 1 '$WORK.peaks.csv' pk
@@ -85,7 +97,7 @@ CREATE TABLE pk(osm_id INTEGER, lon REAL, lat REAL);
 -- 172 m at 72 N, the worst case in the window. Offsets keep the cell index
 -- positive so integer truncation cannot fold two cells together at 0.
 CREATE TABLE prom_cell AS
-SELECT rowid AS id, lat, lon, prominence,
+SELECT rowid AS id, lat, lon, ele, prominence,
        CAST((lat + 90.0) / 0.002 AS INTEGER) AS ci,
        CAST((lon + 180.0) / 0.005 AS INTEGER) AS cj
 FROM prom;
@@ -119,12 +131,27 @@ SELECT osm_id, prominence, d FROM (
          ) AS rn_summit
   FROM pk
   JOIN prom_cell c
-    ON c.ci BETWEEN CAST((pk.lat + 90.0) / 0.002 AS INTEGER) - 1
-                AND CAST((pk.lat + 90.0) / 0.002 AS INTEGER) + 1
-   AND c.cj BETWEEN CAST((pk.lon + 180.0) / 0.005 AS INTEGER) - 1
-                AND CAST((pk.lon + 180.0) / 0.005 AS INTEGER) + 1
+    -- Widened to reach $WIDE m: 0.002 deg of latitude is 222 m, so two cells
+    -- either way covers it, while 0.005 deg of longitude is only 172 m at
+    -- 72 N and needs three.
+    ON c.ci BETWEEN CAST((pk.lat + 90.0) / 0.002 AS INTEGER) - 2
+                AND CAST((pk.lat + 90.0) / 0.002 AS INTEGER) + 2
+   AND c.cj BETWEEN CAST((pk.lon + 180.0) / 0.005 AS INTEGER) - 3
+                AND CAST((pk.lon + 180.0) / 0.005 AS INTEGER) + 3
+  -- Eligibility is decided here, before the ranking, and the order matters:
+  -- filtering afterwards would let a close summit that fails the elevation
+  -- test shadow a slightly farther one that passes, and the peak would end up
+  -- with nothing rather than with the right answer.
+  WHERE sqrt(((c.lat - pk.lat) * 111320.0) * ((c.lat - pk.lat) * 111320.0)
+           + ((c.lon - pk.lon) * 111320.0 * cos(pk.lat * 3.14159265358979 / 180.0))
+           * ((c.lon - pk.lon) * 111320.0 * cos(pk.lat * 3.14159265358979 / 180.0))) <= $RADIUS
+     OR (pk.ele IS NOT NULL AND c.ele IS NOT NULL
+         AND abs(c.ele - pk.ele) <= $ELE_TOL
+         AND sqrt(((c.lat - pk.lat) * 111320.0) * ((c.lat - pk.lat) * 111320.0)
+                + ((c.lon - pk.lon) * 111320.0 * cos(pk.lat * 3.14159265358979 / 180.0))
+                * ((c.lon - pk.lon) * 111320.0 * cos(pk.lat * 3.14159265358979 / 180.0))) <= $WIDE)
 )
-WHERE rn = 1 AND rn_summit = 1 AND d <= $RADIUS;
+WHERE rn = 1 AND rn_summit = 1;
 SQL
 
 echo "loaded $(sqlite3 "$WORK" 'SELECT count(*) FROM prom') prominence points"
@@ -152,7 +179,9 @@ sqlite3 "$PEAKS" "DROP TABLE prom_match; PRAGMA journal_mode = DELETE;" >/dev/nu
 
 total=$(sqlite3 "$PEAKS" 'SELECT count(*) FROM peaks')
 matched=$(sqlite3 "$PEAKS" 'SELECT count(*) FROM peaks WHERE prominence IS NOT NULL')
-echo "matched $matched of $total peaks within ${RADIUS} m"
+echo "matched $matched of $total peaks"
+echo "  within ${RADIUS} m on position alone: $(sqlite3 "$PEAKS" "SELECT count(*) FROM peaks WHERE prom_dist_m <= $RADIUS")"
+echo "  ${RADIUS}-${WIDE} m on position and elevation agreeing to ${ELE_TOL} m: $(sqlite3 "$PEAKS" "SELECT count(*) FROM peaks WHERE prom_dist_m > $RADIUS")"
 echo "match distance: median $(sqlite3 "$PEAKS" 'SELECT round(prom_dist_m,1) FROM peaks WHERE prominence IS NOT NULL ORDER BY prom_dist_m LIMIT 1 OFFSET (SELECT count(*)/2 FROM peaks WHERE prominence IS NOT NULL)') m"
 echo "shared summits (one DEM top claimed by several OSM nodes):"
 sqlite3 "$PEAKS" "SELECT count(*) FROM (SELECT prominence, count(*) c FROM peaks WHERE prominence IS NOT NULL GROUP BY prominence HAVING c > 1)"
