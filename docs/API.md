@@ -42,8 +42,8 @@ All fields except `lon` and `lat` are optional.
 | `depth` | bool | `false` | include the distance buffer |
 | `depth_step` | int | `4` | depth quantisation; see [Depth](#depth) |
 | `peaks` | bool | `true` | include peak labels |
-| `min_dominance` | number | `30` | drop peaks standing less than this above their surroundings, metres; may be negative |
-| `max_peaks` | int | `0` | keep at most this many, most label-worthy first — *not* most dominant, see [What `max_peaks` keeps](#what-max_peaks-keeps); 0 is no cap |
+| `min_dominance` | number | `30` | **deprecated** — use `peak_filter`; drop peaks standing less than this above their surroundings, metres |
+| `max_peaks` | int | `0` | keep at most this many, in `peak_rank` order; 0 is no cap |
 | `format` | string | `avif` | image encoding: `avif` or `png` |
 | `quality` | int | `95` | AVIF quality, 1–100; ignored for PNG |
 | `dither_strength` | number | `1.5` | 8-bit dither amplitude, levels; 0 disables |
@@ -52,8 +52,9 @@ All fields except `lon` and `lat` are optional.
 | `ridge_color` | string | `#000000` | silhouette colour, `#rrggbb` or `#rgb` |
 | `ground_color` | string | `#3a4a34` | near-terrain colour, before haze |
 | `depth_lift` | number | `0` | degrees of extra elevation at `range`, tapering to nothing at the eye (0–45); see [Depth lift](#depth-lift) |
-| `revealed_peaks` | bool | `true` | let summits only `depth_lift` brought into view take label slots |
-| `peak_rank` | expression | — | formula deciding which summits `max_peaks` keeps; see [Ranking formula](#ranking-formula). Not needed unless you cap |
+| `revealed_peaks` | bool | `true` | **deprecated** — use `peak_filter`; let summits only `depth_lift` brought into view take label slots |
+| `peak_filter` | expression | — | which peaks come back at all; see [Filtering and ranking](#filtering-and-ranking) |
+| `peak_rank` | expression | — | what `max_peaks` orders by, and the `rank` returned with each peak |
 
 Image dimensions follow from the angles:
 
@@ -385,11 +386,35 @@ can assert the two agree rather than assume it.
 
 ### Peaks
 
-Only peaks that are **visible and pass `min_dominance`** are returned, sorted
-by label rank and then cut to `max_peaks`. Because the cut comes after the
-sort, a small `max_peaks` keeps the summits worth labelling rather than an
-arbitrary slice — it is the cheapest way to control label density, and it
-costs the server nothing.
+Peaks pass through three stages, in this order:
+
+1. **Filter** — `peak_filter` decides which come back at all.
+2. **Order** — `peak_rank` computes a number per peak; they are sorted by it,
+   descending, and it is returned as `rank`.
+3. **Cut** — `max_peaks` keeps the first *n*. `0`, the default, keeps all.
+
+Only peaks that are genuinely visible, answered by a ray and inside the frame
+reach stage 1 at all; that part is structural and not configurable.
+
+> ### Deprecated: `min_dominance` and `revealed_peaks`
+>
+> **Do not use these in new code, and remove them from existing code.** Both
+> will be deleted once nothing sends them.
+>
+> Each can see exactly one property, and `peak_filter` says everything they
+> say and more. They still work, and they are applied *alongside* a
+> `peak_filter` rather than instead of it, so a request sending both gets the
+> intersection — which is rarely what anyone means. The direct translations:
+>
+> | instead of | write |
+> |---|---|
+> | `"min_dominance": 30` | `"peak_filter": [">=", ["get","dominance"], 30]` |
+> | `"revealed_peaks": false` | `"peak_filter": ["==", ["get","revealed"], 0]` |
+>
+> Note that `min_dominance` **defaults to 30**, so it is filtering even when
+> you never mentioned it — at one 360° viewpoint that is 946 peaks returned
+> out of 2626 visible. To disable it while it still exists, send
+> `"min_dominance": -100000`.
 
 #### What `max_peaks` keeps
 
@@ -413,15 +438,53 @@ prompted this: a near subordinate top sat 2471st under raw dominance, **2627th**
 under naive division, and **1966th** under the rule above, which is what brings
 it inside a `max_peaks: 2000` cut.
 
-#### Ranking formula
+#### Filtering and ranking
 
-**You probably do not need this.** The whole apparatus exists because
-`max_peaks` truncates, and truncation is the only reason the server's opinion
-about ranking matters at all. Peaks cost about **58 bytes each on the wire**
-after rounding and gzip, so an uncapped 2631-peak view is ~153 KB — two map
-tiles. **Send `max_peaks: 0`, rank client-side, and none of this applies.**
+Both take the same kind of expression over the same peak properties.
+`peak_filter` decides what comes back; `peak_rank` decides the order and the
+`rank` value returned with each peak.
 
-If you do cap, the cut has to use *your* criterion or it discards exactly what
+**A filter earns its place where a threshold cannot go.** This says *a real
+mountain however it reads from here, or anything standing out locally* — two
+properties and a disjunction, which no single number expresses:
+
+```jsonc
+"peak_filter": ["case",
+  [">", ["coalesce", ["get","prominence"], 0], 300], 1,
+  [">", ["get","dominance"], 100]]
+```
+
+At one 360° viewpoint that takes 3032 peaks to 210, and it keeps Gerlachovský
+štít — whose `dominance` of 148 m from 31 km would never have earned it.
+
+> **A filter that yields null drops the peak.** Null is not a yes — the same
+> rule `case` uses for its conditions — and `prominence` and `prom_dist_m` are
+> null for about two thirds of peaks. So a filter that touches either one
+> silently removes all of them unless you say what an absence should count as.
+>
+> Measured on one 90° view of 542 visible peaks:
+>
+> | filter | peaks |
+> |---|---|
+> | `["<", ["get","prominence"], 100]` | **138** |
+> | `["<", ["coalesce", ["get","prominence"], 0], 100]` | **475** |
+>
+> Same intent, 337 peaks apart. The first asks "is its prominence under 100?"
+> and gets *no answer* for every unmatched peak, so they all go; the second
+> says "treat an absence as 0", and they all stay.
+>
+> Note that `coalesce` is not a formality that always changes something —
+> with `[">", …, 100]` the two forms agree exactly, because `0 > 100` is false
+> either way. **Which fallback you choose matters more than remembering to
+> write one.**
+
+**You may not need `peak_rank` at all.** It only matters because `max_peaks`
+truncates. Peaks cost about **58 bytes each on the wire** after rounding and
+gzip, so an uncapped 360° view — 3032 peaks at the densest viewpoint measured —
+is around 175 KB, about two map tiles. **Send `max_peaks: 0`, rank
+client-side, and the server's opinion never enters into it.**
+
+If you do cap, the cut must use *your* criterion or it discards exactly what
 you would have kept, and no re-ranking afterwards recovers it. One number
 cannot express how `dominance` and `prominence` should be weighed. So the
 formula can come in the request:
@@ -508,13 +571,14 @@ A misspelled property is the mistake most worth catching this way — MapLibre
 itself would return null for it and rank every peak identically, with nothing
 to say why.
 
-`min_dominance` still filters on **raw** metres, deliberately: it is a
-statement about the landscape — "nothing flatter than this is a summit" — and
-would stop meaning anything in metres if distance entered it. Only the cut is
-ranked. The two can in principle disagree, a near top failing the threshold
-while ranking above distant ones that pass; measured on the view above it does
-not happen at any cap, because the weighting already pushes deeply negative
-scores down, which is the same direction the threshold cuts in.
+Filtering and ranking stay separate stages, and that is deliberate: what comes
+back is one question, what order it comes back in is another, and collapsing
+them means a peak can be dropped for being badly *placed* rather than for being
+uninteresting. Where the deprecated `min_dominance` is still in play it filters
+on raw metres and can in principle disagree with the ranking — a near top
+failing the threshold while ranking above distant ones that pass. Measured on
+the view above it does not happen at any cap, because the weighting already
+pushes deeply negative scores down, the same direction the threshold cuts in.
 
 `dominance` itself is untouched in the payload, so a client is free to re-rank
 however it likes — the ordering only decides *which* peaks survive to be sent,
@@ -536,7 +600,8 @@ and with `max_peaks: 0` it decides nothing at all.
   "revealed": false,
   "dominance": 412.8,
   "prominence": 1518.0,
-  "prom_dist_m": 22.4
+  "prom_dist_m": 22.4,
+  "rank": 1.643
 }
 ```
 
@@ -553,6 +618,7 @@ and with `max_peaks: 0` it decides nothing at all.
 | `dominance` | **metres** the summit stands above the terrain around it, **signed**, measured from this viewpoint |
 | `prominence` | **metres** of true topographic prominence, precomputed and viewpoint-independent, or **`null` where no DEM summit could be matched** — which means "unknown", never "prominence 0". Null for about two thirds of peaks; see [Prominence](#prominence) |
 | `prom_dist_m` | **metres** between the OSM node and the DEM summit the prominence came from, or `null` alongside it. The match's own error bar — see the table under [Prominence](#prominence) for what each distance is worth |
+| `rank` | the value this peak was ordered by — whatever `peak_rank` computed, or the built-in criterion where none was given. Returned so an ordering can be **inspected rather than inferred**: send a formula and read back what it produced for each peak. A client that re-ranks can reuse it instead of recomputing. Peaks are sorted by it, descending |
 
 This is what makes a summit worth a label: one standing clear of its
 neighbours reads as a peak, one on a long level ridge does not, however tall
@@ -612,9 +678,9 @@ ground. What is gone is the systematic part.
 
 > **This changed the numbers.** A full-quality render now measures dominance on
 > a 0.2° grid rather than its own 0.017° rays, and scores shift accordingly:
-> median −4.8 m at one viewpoint, but reshaped rather than merely moved, and
-> **52 → 70 peaks cleared the default `min_dominance: 30`**. If your label
-> density was tuned against the old numbers, re-check it.
+> median −4.8 m at one viewpoint, but reshaped rather than merely moved, so
+> more peaks clear a given threshold than before. If your label density was
+> tuned against the old numbers, re-check it.
 
 **Visibility is a separate matter and still moves.** It is decided from the two
 rays bracketing each summit, which are 0.2° apart at preview quality and 0.017°
