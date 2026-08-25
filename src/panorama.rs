@@ -100,7 +100,17 @@ pub struct Params {
     /// the ground makes ridges read as folds rather than outlines.
     pub ridge_colour: (f64, f64, f64),
     /// Colour of near terrain, before haze washes it towards the sky.
+    ///
+    /// Ignored when `gradient` is set, which replaces the whole two-colour
+    /// blend rather than feeding it.
     pub ground_colour: (f64, f64, f64),
+    /// Stop list replacing the built-in `ground_colour`-to-sky haze.
+    ///
+    /// `None` keeps the original Beer-Lambert blend exactly, which is what
+    /// every request that predates this asks for -- the two curves are
+    /// different shapes, so the old one cannot be expressed as a stop list and
+    /// is kept rather than approximated. See [`crate::gradient`].
+    pub gradient: Option<crate::gradient::Gradient>,
     /// Multiplier on the dither applied at the final 8-bit quantisation; see
     /// `DEFAULT_DITHER`. 0 turns it off, which is how to tell dithering apart
     /// from anything else in a gradient.
@@ -531,6 +541,15 @@ pub struct Stats {
     /// to the ray spacing. Two requests agree about their peaks only if they
     /// agree about this, so the caller has to be able to see it.
     pub peak_profile_step: f64,
+    /// Where the ground gradient's far end landed, metres, or `None` when no
+    /// gradient was asked for.
+    ///
+    /// Reported for the same reason `peak_profile_step` is: `far_distance:
+    /// "auto"` measures the frame, so two renders of one viewpoint agree about
+    /// their colours only if they agree about this. A client that wants a
+    /// stable palette across a pan reads it once and sends it back as a
+    /// number.
+    pub far_distance: Option<f64>,
     /// Per-pixel distance, 16-bit log-encoded, 0 for sky. Written only if
     /// asked for; see `encode_depth`.
     pub depth: image::ImageBuffer<image::Luma<u16>, Vec<u16>>,
@@ -669,6 +688,10 @@ fn march_ray(
     coarsest: u32,
     finest: u32,
     col: &mut Column,
+    // Where to stop, metres. `p.max_range` unless a gradient asked to clip
+    // terrain past its far end, in which case marching further would only
+    // paint ground the picture is about to discard.
+    stop_at: f64,
     probe_d: &[f64],
     probe_h: &mut Vec<Horizon>,
     profile: Option<(&mut Profile, usize)>,
@@ -705,7 +728,7 @@ fn march_ray(
     let mut last_visible = ground_res(finest, p.lat);
 
     let mut d = ground_res(finest, p.lat);
-    while d < p.max_range {
+    while d < stop_at {
         let z = level_for(d, p.lat, coarsest, finest);
         let step = ground_res(z, p.lat);
 
@@ -814,7 +837,13 @@ fn march_ray(
 /// above and below within the same column -- which is what lets the whole
 /// render stream one output column at a time instead of materialising the
 /// full supersampled buffer.
-fn shade_column(col: &Column, p: &Params, alt_step: f64, height: usize) -> Vec<(f64, f64, f64)> {
+fn shade_column(
+    col: &Column,
+    p: &Params,
+    lut: Option<&crate::gradient::Lut>,
+    alt_step: f64,
+    height: usize,
+) -> Vec<(f64, f64, f64)> {
     let haze = 45_000.0_f64; // e-folding distance for the atmospheric blend
 
     // A raw depth ratio is the wrong test for a silhouette. Terrain receding at
@@ -877,18 +906,28 @@ fn shade_column(col: &Column, p: &Params, alt_step: f64, height: usize) -> Vec<(
         let alt = p.alt_max - (row as f64 + 0.5) * alt_step;
         let sky = sky_colour(alt);
         let d = col.dist[row];
-        if d.is_finite() {
+        if !d.is_finite() {
+            return sky;
+        }
+        match lut {
+            // The table holds the terrain's own contribution premultiplied,
+            // and the weight of the sky behind it, because a `sky` stop only
+            // means something once the row is known.
+            Some(lut) => {
+                let (rgb, w) = lut.at(d);
+                (rgb.0 + w * sky.0, rgb.1 + w * sky.1, rgb.2 + w * sky.2)
+            }
             // Near terrain is dark and saturated, far terrain washes out
             // towards the sky colour.
-            let t = 1.0 - (-d / haze).exp();
-            let base = p.ground_colour;
-            (
-                lerp(base.0, sky.0, t),
-                lerp(base.1, sky.1, t),
-                lerp(base.2, sky.2, t),
-            )
-        } else {
-            sky
+            None => {
+                let t = 1.0 - (-d / haze).exp();
+                let base = p.ground_colour;
+                (
+                    lerp(base.0, sky.0, t),
+                    lerp(base.1, sky.1, t),
+                    lerp(base.2, sky.2, t),
+                )
+            }
         }
     };
 
@@ -971,6 +1010,75 @@ fn shade_column(col: &Column, p: &Params, alt_step: f64, height: usize) -> Vec<(
             }
         })
         .collect()
+}
+
+/// How deep the terrain in frame actually runs, for `far_distance: "auto"`.
+///
+/// A coarse pre-pass rather than a first-class pass: it marches one ray per
+/// sampled output column at one sub-row per pixel, so it costs roughly
+/// `probes / (out_w * supersample_x)` of the render -- about two percent at
+/// the default quality -- and reuses `march_ray` unchanged, so it cannot
+/// disagree with the real render about geometry.
+///
+/// It has to happen before anything is shaded, which is the whole reason it is
+/// a separate pass: `shade_column` streams one column at a time and never sees
+/// the frame, so nothing inside it can know how far the terrain goes.
+#[allow(clippy::too_many_arguments)]
+fn measure_depth(
+    root: &Path,
+    doc: &Doc,
+    p: &Params,
+    cancel: &Cancel,
+    eye: f64,
+    coarsest: u32,
+    finest: u32,
+    out_w: usize,
+    out_h: usize,
+) -> Result<Vec<f64>> {
+    // Enough columns to characterise a frame, few enough to stay cheap. The
+    // percentile only has to land on the right rung of the ladder.
+    const PROBES: usize = 256;
+    let stride = out_w.div_ceil(PROBES).max(1);
+    let cols: Vec<usize> = (0..out_w).step_by(stride).collect();
+    // Chunked rather than one task per column: each task opens its own
+    // `Pyramid`, and that is worth amortising over a run of neighbouring
+    // bearings which share blocks anyway.
+    let chunk = cols.len().div_ceil(rayon::current_num_threads().max(1)).max(1);
+
+    let parts = cols
+        .par_chunks(chunk)
+        .map(|cs| -> Result<Vec<f64>> {
+            let mut pyr = Pyramid::open(root, doc)?;
+            let mut column = Column::new(out_h);
+            let mut probe_h: Vec<Horizon> = Vec::new();
+            let mut out = Vec::new();
+            for &oc in cs {
+                cancel.check()?;
+                column.dist.fill(f64::INFINITY);
+                column.cover.fill(0.0);
+                let az = p.az_start + (oc as f64 + 0.5) * p.step_deg;
+                march_ray(
+                    &mut pyr,
+                    p,
+                    eye,
+                    az,
+                    p.step_deg,
+                    out_h,
+                    coarsest,
+                    finest,
+                    &mut column,
+                    p.max_range,
+                    &[],
+                    &mut probe_h,
+                    None,
+                );
+                out.extend(column.dist.iter().copied().filter(|d| d.is_finite()));
+            }
+            Ok(out)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(parts.concat())
 }
 
 /// Ground elevation at the viewpoint, as the local maximum over a small disc.
@@ -1257,6 +1365,32 @@ pub fn render(
         eye
     };
 
+    // The gradient, resolved and baked once for the whole frame. `Auto` costs
+    // the pre-pass; a number costs nothing. Both land here rather than in the
+    // chunk loop because every column has to agree about the scale, or the
+    // picture is coloured by where its workers happened to split.
+    let (lut, far_distance) = match &p.gradient {
+        None => (None, None),
+        Some(g) => {
+            let far = match g.far {
+                crate::gradient::Far::Metres(m) => m,
+                crate::gradient::Far::Auto => crate::gradient::auto_far(
+                    measure_depth(root, doc, p, cancel, eye, coarsest, finest, out_w, out_h)?,
+                    p.max_range,
+                ),
+            };
+            (Some(g.bake(far)), Some(far))
+        }
+    };
+    // Terrain past the far end is dropped rather than painted in the last
+    // stop's colour, so the palette is spent on what the picture actually
+    // shows. Never raises the bound: a gradient cannot make the render march
+    // further than `range` asked it to.
+    let stop_at = match (&p.gradient, far_distance) {
+        (Some(g), Some(far)) if g.clip => p.max_range.min(far),
+        _ => p.max_range,
+    };
+
     // Each peak is answered by the two rays that *bracket* its bearing, not by
     // the one whose cell it happens to fall in. A single ray sits up to half a
     // ray-spacing off the true bearing -- 210 m of ground at 60 km on the
@@ -1379,7 +1513,7 @@ pub fn render(
                         .map(|c| (&mut profile, c - profile_from));
                     samples += march_ray(
                         &mut pyr, p, eye, az, alt_step, sub_h, coarsest, finest, &mut column,
-                        &probe_d, &mut probe_h, records,
+                        stop_at, &probe_d, &mut probe_h, records,
                     );
                     sky += column.dist.iter().filter(|d| d.is_infinite()).count();
 
@@ -1398,7 +1532,7 @@ pub fn render(
                             }
                         }
                     }
-                    shaded.push(shade_column(&column, p, alt_step, sub_h));
+                    shaded.push(shade_column(&column, p, lut.as_ref(), alt_step, sub_h));
                 }
                 for (orow, near) in nearest.iter().enumerate() {
                     depth[orow * cols + local] = encode_depth(*near);
@@ -1505,7 +1639,19 @@ pub fn render(
         // Against the same angle the marcher occluded by, so a peak is kept
         // exactly when the render drew its summit.
         let lifted = pk.altitude + p.lift_at(pk.distance);
-        pk.visible = clears(lifted, h0.drawn, h1.drawn, t);
+        // A summit standing on ground the render declined to draw is not
+        // visible in the picture, whatever the horizon says -- and the horizon
+        // would say yes, since clipping stops the marcher before it reaches
+        // anything that could occlude it. Without this a clipped gradient
+        // labels peaks floating in empty sky.
+        //
+        // Unconditional, though only clipping can make it bite: `peaks::load`
+        // already trims to exact great-circle `range` after its bounding-box
+        // query, so with no gradient `stop_at` is `max_range` and every peak
+        // passes. Stated as the invariant it is -- nothing past where the
+        // marcher stopped can be judged against a horizon that never got there
+        // -- rather than as a special case of clipping.
+        pk.visible = pk.distance <= stop_at && clears(lifted, h0.drawn, h1.drawn, t);
         // Asked of the true geometry, so it answers the question a reader of
         // the picture would ask: is that summit actually in sight from here,
         // or has the drawing lifted it out from behind something? Always false
@@ -1563,6 +1709,7 @@ pub fn render(
             blocks,
             sky_fraction: sky as f64 / cells.max(1) as f64,
             peak_profile_step: grid.step,
+            far_distance,
             depth: depth_img,
         },
     ))
@@ -2171,6 +2318,7 @@ mod tests {
             ridge_width: 1.0,
             ridge_colour: DEFAULT_RIDGE,
             ground_colour: DEFAULT_GROUND,
+            gradient: None,
             dither_strength: DEFAULT_DITHER,
             depth_lift,
             peak_profile_step: DEFAULT_PROFILE_STEP,

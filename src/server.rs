@@ -124,8 +124,19 @@ pub struct Request {
     #[serde(default)]
     ridge_color: Option<String>,
     /// `#rrggbb` for near terrain, before haze washes it towards the sky.
+    ///
+    /// Ignored when `ground_gradient` is given, which replaces the blend
+    /// rather than feeding it.
     #[serde(default)]
     ground_color: Option<String>,
+    /// Distance-to-colour ramp for the ground, replacing the built-in haze.
+    ///
+    /// `{"far_distance": "auto", "clip": true, "stops": [[0, "#3a4a34"],
+    /// [0.45, "#6f89a0"], [1, "sky"]]}`. Positions run 0 at the eye to 1 at
+    /// `far_distance`; see `crate::gradient`. Omitted, the original two-colour
+    /// haze renders exactly as it always has.
+    #[serde(default)]
+    ground_gradient: Option<serde_json::Value>,
     /// `avif` or `png`. AVIF is fifteen to thirty times smaller for the same
     /// picture; PNG is here for callers that predate it.
     #[serde(default)]
@@ -495,6 +506,17 @@ async fn panorama_route(
         (Err(e), _) | (_, Err(e)) => return bad(e),
     };
 
+    let range = req.range.clamp(1_000.0, 400_000.0);
+    let gradient = match &req.ground_gradient {
+        Some(v) => match crate::gradient::Gradient::parse(v)
+            .and_then(|g| crate::gradient::validate(&g, range).map(|()| g))
+        {
+            Ok(g) => Some(g),
+            Err(e) => return bad(e.to_string()),
+        },
+        None => None,
+    };
+
     let p = panorama::Params {
         lon: req.lon,
         lat: req.lat,
@@ -505,7 +527,7 @@ async fn panorama_route(
         alt_min: req.alt_min,
         alt_max: req.alt_max,
         step_deg: step,
-        max_range: req.range.clamp(1_000.0, 400_000.0),
+        max_range: range,
         edge_ratio: 1.35,
         edge_hidden_ref: 20_000.0,
         eye_level: false,
@@ -520,6 +542,7 @@ async fn panorama_route(
         ridge_width: req.ridge_width,
         ridge_colour,
         ground_colour,
+        gradient,
         dither_strength: req.dither_strength.clamp(0.0, 8.0),
         depth_lift: req.depth_lift,
         // Not a request field. It is the resolution `dominance` is measured
@@ -622,6 +645,11 @@ async fn panorama_route(
             // they agree here, so a client rendering a view twice can check
             // rather than assume.
             "peak_profile_step": stats.peak_profile_step,
+            // Where `ground_gradient` ended up, metres. Present only when one
+            // was asked for, and worth reading back when `far_distance` was
+            // `"auto"`: it was measured from this frame, so a client wanting
+            // one palette across a pan pins the number it gets here.
+            "far_distance": stats.far_distance,
             "samples": stats.samples,
             "depth": want_depth.then(|| serde_json::json!({
                 "encoding": "u16-le log, row delta-coded, gzip",

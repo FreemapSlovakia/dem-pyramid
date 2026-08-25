@@ -50,6 +50,7 @@ All fields except `lon` and `lat` are optional.
 | `ridge_width` | number | `1` | silhouette thickness in output pixels (0–20) |
 | `ridge_color` | string | `#000000` | silhouette colour, `#rrggbb` or `#rgb` |
 | `ground_color` | string | `#3a4a34` | near-terrain colour, before haze |
+| `ground_gradient` | object | — | distance-to-colour ramp replacing the built-in haze; see [Ground gradient](#ground-gradient) |
 | `depth_lift` | number | `0` | degrees of extra elevation at `range`, tapering to nothing at the eye (0–45); see [Depth lift](#depth-lift) |
 | `peak_filter` | expression | — | which peaks come back at all; see [Filtering and ranking](#filtering-and-ranking) |
 | `peak_rank` | expression | — | what `max_peaks` orders by, and the `rank` returned with each peak |
@@ -196,7 +197,9 @@ problem apart from anything else in the picture.
 ### Styling
 
 Four knobs, all optional, all defaulting to exactly what the renderer drew
-before they existed — omit them and nothing changes.
+before they existed — omit them and nothing changes. A fifth,
+[`ground_gradient`](#ground-gradient), replaces `ground_color` and the haze
+together and has a section of its own.
 
 `ridge_strength` is a gain on the alpha of the silhouettes the renderer
 strokes along ridge lines. It is a multiplier, not an opacity: the geometry
@@ -233,7 +236,9 @@ ink on dark ground gives an engraved effect.
 
 `ground_color` is near terrain before haze washes it towards the sky. Haze is
 unchanged, so a warm ground still fades to the same blue with distance —
-which is what keeps depth readable whatever colour you choose.
+which is what keeps depth readable whatever colour you choose. It is ignored
+when `ground_gradient` is given, which replaces the blend rather than feeding
+it.
 
 ```jsonc
 { "ridge_strength": 0 }                        // shaded relief, no linework
@@ -245,6 +250,115 @@ which is what keeps depth readable whatever colour you choose.
 
 Both colours take `#rrggbb` or `#rgb`, with or without the `#`. A malformed
 colour is a `400` naming the field, not a silently ignored parameter.
+
+### Ground gradient
+
+`ground_gradient` replaces the built-in `ground_color`-to-sky haze with a stop
+list. Send neither and nothing changes.
+
+```jsonc
+{
+  "ground_gradient": {
+    "far_distance": "auto",
+    "clip": true,
+    "stops": [[0, "#2d3b1c"], [0.34, "#4f8f8a"], [0.6, "#7290c4"], [1, "sky"]]
+  }
+}
+```
+
+**Stop positions run 0 at the eye to 1 at `far_distance`**, not in metres. The
+mapping is
+
+```
+s = 2d / (d + far_distance)
+```
+
+so `s = 1` lands exactly at `far_distance` — the palette is spent by the time
+the terrain runs out — and `s = 0.5` at `far_distance / 3`, which gives the
+foreground the compression a panorama wants. To place a stop at a distance you
+have in mind, that inverts: 30 km of a 100 km scene is `s = 0.46`.
+
+Positions must run 0 to 1 and must not go backwards. Two stops may share a
+position, which is how you ask for a hard band edge. Before the first stop and
+after the last the ramp holds, rather than extrapolating into colours you did
+not write down — so a list that starts at 0.2 simply paints everything nearer
+in its first colour.
+
+A stop is `#rrggbb`, `#rgb`, or the literal `"sky"`, which means the sky colour
+at that row. `"sky"` is what makes distant terrain fade into the horizon
+instead of edging against it; it is not required, and ending on a fixed colour
+gives the hard skyline a poster or engraving wants.
+
+#### `far_distance`
+
+Metres, or `"auto"` to measure the terrain actually in frame. It comes back in
+[`meta`](#meta) either way.
+
+`"auto"` runs a coarse pre-pass — one ray per sampled column, about two percent
+of the render — takes the 99th percentile of what it saw, and rounds up to a
+fixed ladder (1, 2, 3, 5, 7, 10, 15, 20, 30, 50, 70, 100, 150, 200, 300,
+400 km). The ladder is there because the raw measurement would recolour the
+whole picture, foreground included, every time a far range slid into frame
+while panning. Rounding means the scale moves only when the scene genuinely
+changes depth.
+
+**Send a number whenever more than one image has to agree.** Four 90° requests
+stitched into a 360° each measure their own frame, and the seams then show as
+colour steps; two viewpoints compared side by side get different scales, so the
+same distance reads differently in each. The pattern is: render once with
+`"auto"`, read `far_distance` out of `meta`, and send that number for the rest.
+
+Too small a value is not an error and does not clamp — it just spends the
+palette early. `far_distance` 12 000 on a 150 km scene washes everything past a
+few kilometres into the last stop, which is a usable fog effect and a
+surprise if you meant to see those ridges.
+
+#### `clip`
+
+Default `true`: terrain beyond `far_distance` is not drawn, rather than painted
+in the last stop's colour. That is what keeps the whole palette on what the
+picture actually shows. It also makes the render cheaper, since the marcher
+stops sooner — the sample from the tuning runs went from 32.2 M to 27.1 M.
+
+At `"auto"` this drops the one percent past the percentile. With a number you
+chose, it drops whatever you said you did not want. Peaks standing on clipped
+ground are reported `visible: false`, since a label over terrain the render
+declined to draw would float in empty sky.
+
+Set it to `false` to clamp instead, which is the safer thing if you are pinning
+a `far_distance` across a pan and would rather a range that wanders past it
+stay visible in a flat colour than disappear.
+
+#### Working with it
+
+Most of a summit panorama's frame is near-field: from a 2645 m viewpoint the
+bottom half of a −7°..2° frame is only 16–60 km, and the far ranges live in a
+few rows against the horizon. So a gradient's effect concentrates near the
+skyline unless something gives it vertical room — which is exactly what
+[`depth_lift`](#depth-lift) does, and the two together are worth more than
+either alone.
+
+```jsonc
+// closest to the old look, but the far ranges separate
+{ "ground_gradient": { "stops": [[0, "#3a4a34"], [0.45, "#6f89a0"], [1, "sky"]] } }
+
+// hand-drawn layering: warm near, violet far
+{ "ground_gradient": { "stops": [[0, "#2f4020"], [0.25, "#4a6b4e"],
+                                 [0.5, "#5f8298"], [0.75, "#8a92bd"], [1, "sky"]] } }
+
+// hard horizon, no fade into sky
+{ "ground_gradient": { "stops": [[0, "#2b3a1c"], [0.6, "#6d7f9c"], [1, "#b9a7c8"]] } }
+
+// pinned, for stitching or comparison
+{ "ground_gradient": { "far_distance": 150000,
+                       "stops": [[0, "#2d3b1c"], [1, "sky"]] } }
+```
+
+At most 32 stops, and at least two. A malformed gradient is a `400` naming what
+was wrong — including an unknown key, which is rejected here rather than
+ignored as elsewhere in the request, because a misspelled `stops` would
+otherwise render a silently ungradiented picture that reads as the feature not
+working.
 
 ### Depth lift
 
@@ -368,6 +482,7 @@ That is why `meta` can be `JSON.parse`d directly.
   "alt_min": -8, "alt_max": 8,
   "step_deg": 0.05,
   "peak_profile_step": 0.2,
+  "far_distance": 150000,
   "samples": 26092800,
   "depth": {
     "encoding": "u16-le log, row delta-coded, gzip",
@@ -381,6 +496,12 @@ That is why `meta` can be `JSON.parse`d directly.
 already including `eye`. `peak_profile_step` reports the grid `dominance` was
 measured on; it is fixed, and is here only so a client rendering a view twice
 can assert the two agree rather than assume it.
+
+`far_distance` is `null` unless you sent a `ground_gradient`, and reports where
+its ramp ended up in metres. Read it when you sent `"auto"`: that measures
+*this* frame, so it is the one thing about your own request you cannot work out
+from what you sent — and pinning the number it returns is how several renders
+are made to agree about colour. See [Ground gradient](#ground-gradient).
 
 ### Peaks
 

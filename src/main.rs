@@ -13,6 +13,7 @@ mod check;
 mod config;
 mod footprints;
 mod gdal_cli;
+mod gradient;
 mod grid;
 mod panorama;
 mod peaks;
@@ -161,6 +162,16 @@ enum Command {
         /// Near-terrain colour, #rrggbb, before haze washes it out.
         #[arg(long)]
         ground_color: Option<String>,
+        /// Distance-to-colour ramp for the ground, as JSON, replacing the
+        /// built-in --ground-color haze. See docs/API.md.
+        ///
+        ///   {"far_distance": "auto", "clip": true,
+        ///    "stops": [[0, "#3a4a34"], [0.45, "#6f89a0"], [1, "sky"]]}
+        ///
+        /// Positions run 0 at the eye to 1 at far_distance, which is either a
+        /// number of metres or "auto" to measure the terrain in frame.
+        #[arg(long)]
+        ground_gradient: Option<String>,
         /// Also write a 16-bit greyscale depth image, log-encoded, 0 for sky.
         ///
         /// Lets the client answer "how far is that ridge" for any pixel.
@@ -377,6 +388,7 @@ fn main() -> Result<()> {
             depth_lift,
             ridge_color,
             ground_color,
+            ground_gradient,
             depth_out,
             depth_raw,
             depth_step,
@@ -433,6 +445,17 @@ fn main() -> Result<()> {
             };
             let peak_rank = compile("peak-rank", &peak_rank)?;
             let peak_filter = compile("peak-filter", &peak_filter)?;
+            // Same reason: a bad stop list should cost a message, not a march.
+            let gradient = match &ground_gradient {
+                Some(src) => {
+                    let json: serde_json::Value = serde_json::from_str(src)
+                        .context("--ground-gradient is not valid JSON")?;
+                    let g = gradient::Gradient::parse(&json)?;
+                    gradient::validate(&g, range)?;
+                    Some(g)
+                }
+                None => None,
+            };
             let p = panorama::Params {
                 lon,
                 lat,
@@ -462,6 +485,7 @@ fn main() -> Result<()> {
                     Some(s) => panorama::parse_colour(s)?,
                     None => panorama::DEFAULT_GROUND,
                 },
+                gradient,
             };
             let t0 = std::time::Instant::now();
             // Nothing cancels a CLI render; the flag exists for the server.
@@ -502,6 +526,12 @@ fn main() -> Result<()> {
                 100.0 * (1.0 - stats.sky_fraction),
                 100.0 * stats.sky_fraction
             );
+            // Where the ramp ended up, which is the one thing about a gradient
+            // the caller cannot work out from what they sent when they asked
+            // for "auto".
+            if let Some(far) = stats.far_distance {
+                println!("gradient   far {:.0} m ({:.1} km)", far, far / 1000.0);
+            }
             println!("wrote      {}", out.display());
 
             if let Some(dpath) = depth_out {
