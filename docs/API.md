@@ -312,6 +312,8 @@ stitched into a 360° each measure their own frame, and the seams then show as
 colour steps; two viewpoints compared side by side get different scales, so the
 same distance reads differently in each. The pattern is: render once with
 `"auto"`, read `far_distance` out of `meta`, and send that number for the rest.
+That round-trip always works — `"auto"` is capped at `range`, so it never hands
+back a number the same request would then refuse.
 
 Too small a value is not an error and does not clamp — it just spends the
 palette early. `far_distance` 12 000 on a 150 km scene washes everything past a

@@ -165,11 +165,15 @@ enum Command {
         /// Distance-to-colour ramp for the ground, as JSON, replacing the
         /// built-in --ground-color haze. See docs/API.md.
         ///
-        ///   {"far_distance": "auto", "clip": true,
+        ///   {"far_distance": "auto",
         ///    "stops": [[0, "#3a4a34"], [0.45, "#6f89a0"], [1, "sky"]]}
         ///
         /// Positions run 0 at the eye to 1 at far_distance, which is either a
         /// number of metres or "auto" to measure the terrain in frame.
+        ///
+        /// "clip" drops terrain past far_distance instead of holding the last
+        /// colour. Off by default, and ignored under "auto", which measures a
+        /// percentile and so would always cut something.
         #[arg(long)]
         ground_gradient: Option<String>,
         /// Also write a 16-bit greyscale depth image, log-encoded, 0 for sky.

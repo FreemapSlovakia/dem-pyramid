@@ -131,10 +131,13 @@ pub struct Request {
     ground_color: Option<String>,
     /// Distance-to-colour ramp for the ground, replacing the built-in haze.
     ///
-    /// `{"far_distance": "auto", "clip": true, "stops": [[0, "#3a4a34"],
-    /// [0.45, "#6f89a0"], [1, "sky"]]}`. Positions run 0 at the eye to 1 at
-    /// `far_distance`; see `crate::gradient`. Omitted, the original two-colour
-    /// haze renders exactly as it always has.
+    /// `{"far_distance": "auto", "stops": [[0, "#3a4a34"], [0.45, "#6f89a0"],
+    /// [1, "sky"]]}`. Positions run 0 at the eye to 1 at `far_distance`; see
+    /// `crate::gradient`. Omitted, the original two-colour haze renders
+    /// exactly as it always has.
+    ///
+    /// `clip` drops terrain past `far_distance` rather than holding the last
+    /// stop's colour. Off by default, and ignored under `"auto"`.
     #[serde(default)]
     ground_gradient: Option<serde_json::Value>,
     /// `avif` or `png`. AVIF is fifteen to thirty times smaller for the same

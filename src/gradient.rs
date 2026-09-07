@@ -63,9 +63,16 @@ const LADDER: [f64; 16] = [
 /// frame a 15 km scale while one sector of it saw past 50 km.
 ///
 /// Not the maximum: one gap between ridges seeing 250 km would stretch the
-/// ramp for the whole picture. 0.95 leaves a couple of probe columns outside,
-/// which at 256 probes is about 2% of the horizontal field -- narrow enough to
-/// be a gap rather than a view.
+/// ramp for the whole picture.
+///
+/// Over the bearings that found ground, not over all of them -- `measure_depth`
+/// drops a ray that saw only sky, since scoring it zero would drag the scale
+/// down by however much of the frame is air. So the 5% discarded is 5% of the
+/// *terrain-bearing* rays, not of the field of view: in a frame where a tenth
+/// of the bearings see ground, it is half a percent of the horizontal field,
+/// and a col looking 250 km can hold more than 5% of a small sample and set the
+/// scale by itself. Only the colour suffers when it does -- `auto` no longer
+/// bounds the render -- and pinning `far_distance` is the way out.
 const AUTO_PERCENTILE: f64 = 0.95;
 
 /// What a stop paints.
@@ -292,13 +299,23 @@ pub fn ladder_up(d: f64) -> f64 {
 /// The depth `far_distance: "auto"` resolves to, from how far each probe ray
 /// saw -- one entry per bearing, not per pixel. Empty means a frame with no
 /// terrain in it at all.
-pub fn auto_far(mut sightlines: Vec<f64>, fallback: f64) -> f64 {
-    if sightlines.is_empty() {
-        return ladder_up(fallback);
-    }
-    let k = (((sightlines.len() - 1) as f64) * AUTO_PERCENTILE).round() as usize;
-    let (_, nth, _) = sightlines.select_nth_unstable_by(k, f64::total_cmp);
-    ladder_up(*nth)
+pub fn auto_far(mut sightlines: Vec<f64>, max_range: f64) -> f64 {
+    let far = if sightlines.is_empty() {
+        ladder_up(max_range)
+    } else {
+        let k = (((sightlines.len() - 1) as f64) * AUTO_PERCENTILE).round() as usize;
+        let (_, nth, _) = sightlines.select_nth_unstable_by(k, f64::total_cmp);
+        ladder_up(*nth)
+    };
+    // Never past `range`. `LADDER` rounds up to fixed rungs while `range` is
+    // any number in [1000, 400000], so the two disagree constantly: a 12 km
+    // render measuring 12 km reported 15 km. That breaks the round-trip the
+    // docs prescribe -- read `far_distance` from `meta`, send it back to pin
+    // the palette -- because `validate` refuses a far end past `range`. It
+    // also puts the last stop out of reach, `s` topping out at
+    // `2 * range / (range + far)`, which is the one thing this mapping exists
+    // to guarantee. Only the 300 km default hid it, by being a rung itself.
+    far.min(max_range)
 }
 
 /// Reject a gradient whose numbers would render, but not into a picture --
@@ -396,7 +413,7 @@ mod tests {
         // ramp for the whole picture.
         let mut d: Vec<f64> = (0..1000).map(|i| f64::from(i) * 10.0).collect();
         d.push(300_000.0);
-        assert_eq!(auto_far(d, 1.0), 10_000.0);
+        assert_eq!(auto_far(d, 400_000.0), 10_000.0);
     }
 
     /// The bug this cost a wrong panorama to find: a 360 view ringed by close
@@ -410,13 +427,27 @@ mod tests {
         // 90% of bearings stop at 8 km, 10% of them see 60 km.
         let mut sightlines = vec![8_000.0; 230];
         sightlines.extend(std::iter::repeat_n(60_000.0, 26));
-        assert_eq!(auto_far(sightlines, 1.0), 70_000.0);
+        assert_eq!(auto_far(sightlines, 400_000.0), 70_000.0);
 
         // Still robust to a genuine outlier: two bearings out of 256 slipping
         // through a col are a gap, not a view.
         let mut sightlines = vec![8_000.0; 254];
         sightlines.extend([250_000.0, 250_000.0]);
-        assert_eq!(auto_far(sightlines, 1.0), 10_000.0);
+        assert_eq!(auto_far(sightlines, 400_000.0), 10_000.0);
+    }
+
+    /// The rungs are fixed and `range` is not, so rounding up crosses it all
+    /// the time -- a 12 km render measuring 12 km reported 15 km. `meta` then
+    /// held a number the docs tell clients to send back and `validate`
+    /// refuses, and `s` could not reach the last stop.
+    #[test]
+    fn auto_never_reports_past_range() {
+        assert_eq!(auto_far(vec![11_800.0; 100], 12_000.0), 12_000.0);
+        assert_eq!(auto_far(vec![24_000.0; 100], 25_000.0), 25_000.0);
+        // The empty-frame fallback rounds up too, and must not escape either.
+        assert_eq!(auto_far(vec![], 250_000.0), 250_000.0);
+        // A rung at or below `range` is still returned untouched.
+        assert_eq!(auto_far(vec![48_000.0; 100], 300_000.0), 50_000.0);
     }
 
     #[test]
