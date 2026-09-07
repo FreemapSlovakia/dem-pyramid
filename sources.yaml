@@ -243,6 +243,35 @@ sources:
     nodata: declared # -99999
     bbox: [-63.160712, 17.862626, -62.782578, 18.133906]
 
+  - id: be
+    api_name: be
+    path: /fm/storage1/dtm/be/be.vrt
+    priority: 168
+    native_res: 1.0
+    crs: EPSG:3812 # Belgian Lambert 2008 -- WKT carries no authority code
+    nodata: declared # -9999
+    bbox: [2.450366, 49.484611, 6.461476, 51.544824]
+    note: >-
+      One VRT over six regional rasters -- Flanders as a single sheet, then
+      Brabant Wallon, Hainaut, Liege, Luxembourg and Namur. Their rectangles
+      overhang into France, the Netherlands and Germany, so the footprint is
+      the union of those rectangles rather than the bbox, and real coverage is
+      carried by the declared nodata.
+
+  - id: lu
+    api_name: lu
+    path: /fm/storage1/dtm/lu/lu.vrt
+    priority: 167
+    native_res: 1.0
+    crs: EPSG:2169 # LUREF / Luxembourg TM -- northing-first, no authority code
+    nodata: declared # -9999
+    bbox: [5.732435, 49.446686, 6.534803, 50.182726]
+    note: >-
+      Overlaps the `be` bbox, since the Belgian province of Luxembourg sits
+      alongside the country of the same name. Only the bboxes overlap -- both
+      are national datasets that stop at the border and declare nodata beyond
+      it -- so the relative priority of the two never actually decides a pixel.
+
   - id: it
     api_name: it
     path: /fm/storage1/dtm/it/it.tif
