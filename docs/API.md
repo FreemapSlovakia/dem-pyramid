@@ -260,7 +260,6 @@ list. Send neither and nothing changes.
 {
   "ground_gradient": {
     "far_distance": "auto",
-    "clip": true,
     "stops": [[0, "#2d3b1c"], [0.34, "#4f8f8a"], [0.6, "#7290c4"], [1, "sky"]]
   }
 }
@@ -295,12 +294,18 @@ Metres, or `"auto"` to measure the terrain actually in frame. It comes back in
 [`meta`](#meta) either way.
 
 `"auto"` runs a coarse pre-pass — one ray per sampled column, about two percent
-of the render — takes the 99th percentile of what it saw, and rounds up to a
-fixed ladder (1, 2, 3, 5, 7, 10, 15, 20, 30, 50, 70, 100, 150, 200, 300,
-400 km). The ladder is there because the raw measurement would recolour the
-whole picture, foreground included, every time a far range slid into frame
-while panning. Rounding means the scale moves only when the scene genuinely
-changes depth.
+of the render — records **how far each of those rays sees**, takes the 95th
+percentile of that, and rounds up to a fixed ladder (1, 2, 3, 5, 7, 10, 15, 20,
+30, 50, 70, 100, 150, 200, 300, 400 km). The ladder is there because the raw
+measurement would recolour the whole picture, foreground included, every time a
+far range slid into frame while panning. Rounding means the scale moves only
+when the scene genuinely changes depth.
+
+One value per **bearing**, not per pixel, and the difference is not academic:
+near terrain fills far more of the frame than distant terrain does, so
+averaging over pixels lets a wide field drown out the sector that can actually
+see. A 360° view ringed by close hills measured 15 km per-pixel while one
+eastward sector of it reached past 100 km.
 
 **Send a number whenever more than one image has to agree.** Four 90° requests
 stitched into a 360° each measure their own frame, and the seams then show as
@@ -315,19 +320,27 @@ surprise if you meant to see those ridges.
 
 #### `clip`
 
-Default `true`: terrain beyond `far_distance` is not drawn, rather than painted
-in the last stop's colour. That is what keeps the whole palette on what the
-picture actually shows. It also makes the render cheaper, since the marcher
-stops sooner — the sample from the tuning runs went from 32.2 M to 27.1 M.
+Default `false`. Set it and terrain beyond `far_distance` is not drawn at all,
+rather than painted in the last stop's colour. It also makes the render
+cheaper, since the marcher stops sooner. Peaks standing on clipped ground come
+back `visible: false`, since a label over terrain the render declined to draw
+would float in empty sky.
 
-At `"auto"` this drops the one percent past the percentile. With a number you
-chose, it drops whatever you said you did not want. Peaks standing on clipped
-ground are reported `visible: false`, since a label over terrain the render
-declined to draw would float in empty sky.
+> **`clip` is ignored with `far_distance: "auto"`**, and the combination is
+> accepted rather than rejected so an existing client keeps working — it simply
+> does not clip.
+>
+> It used to clip, and that was a bug worth stating plainly: `"auto"` is a
+> percentile, so it always sits *below* the farthest terrain in frame, and how
+> far below depends on the composition of the picture rather than on anything
+> in the request. A 360° panorama came back missing every hill between 15 km
+> and 100 km. No choice of percentile fixes it — the statistic that makes a
+> good colour scale is not the one that makes a safe render bound.
 
-Set it to `false` to clamp instead, which is the safer thing if you are pinning
-a `far_distance` across a pan and would rather a range that wanders past it
-stay visible in a flat colour than disappear.
+So clip only against a number you wrote down, where there is no surprise: it is
+`range` for the marcher without also being `range` for `depth_lift`, which is
+the one thing plain `range` cannot express. If you do not need that distinction,
+use `range` and leave this alone.
 
 #### Working with it
 

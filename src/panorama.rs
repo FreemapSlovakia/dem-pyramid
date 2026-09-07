@@ -1072,7 +1072,23 @@ fn measure_depth(
                     &mut probe_h,
                     None,
                 );
-                out.extend(column.dist.iter().copied().filter(|d| d.is_finite()));
+                // One value per bearing -- how far this ray sees -- not one
+                // per pixel. Per-pixel weights the answer by how much screen
+                // area terrain covers, and near terrain covers almost all of
+                // it: in a 360 frame ringed by hills, over 99% of pixels sat
+                // inside 15 km while the one sector that mattered saw past
+                // 50 km. The percentile discarded it, and with `clip` on those
+                // hills stopped being rendered at all. "How far does this view
+                // see" is a question about bearings.
+                let far = column
+                    .dist
+                    .iter()
+                    .copied()
+                    .filter(|d| d.is_finite())
+                    .fold(f64::NEG_INFINITY, f64::max);
+                if far.is_finite() {
+                    out.push(far);
+                }
             }
             Ok(out)
         })
@@ -1386,8 +1402,22 @@ pub fn render(
     // stop's colour, so the palette is spent on what the picture actually
     // shows. Never raises the bound: a gradient cannot make the render march
     // further than `range` asked it to.
-    let stop_at = match (&p.gradient, far_distance) {
-        (Some(g), Some(far)) if g.clip => p.max_range.min(far),
+    //
+    // Only ever against a `far_distance` the caller wrote down. Clipping to a
+    // measured one deletes terrain nobody asked to lose: `auto` is a
+    // percentile, so by construction it sits below the farthest thing in
+    // frame, and the amount it cuts depends on the composition of the frame
+    // rather than on anything in the request. That cost a real panorama --
+    // a 360 view whose eastward sector genuinely reached past 50 km was
+    // clipped at 15 -- and no choice of percentile fixes it, because the
+    // statistic that makes a good colour scale is not the one that makes a
+    // safe render bound. So under `auto` the ramp still ends at the measured
+    // distance and everything beyond simply holds the last stop's colour.
+    let stop_at = match &p.gradient {
+        Some(g) if g.clip => match g.far {
+            crate::gradient::Far::Metres(m) => p.max_range.min(m),
+            crate::gradient::Far::Auto => p.max_range,
+        },
         _ => p.max_range,
     };
 

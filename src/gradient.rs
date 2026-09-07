@@ -55,13 +55,18 @@ const LADDER: [f64; 16] = [
     70_000.0, 100_000.0, 150_000.0, 200_000.0, 300_000.0, 400_000.0,
 ];
 
-/// Fraction of measured depths that must fall inside `far_distance` when it is
-/// resolved automatically.
+/// Fraction of probe *bearings* that must see no farther than `far_distance`
+/// when it is resolved automatically.
 ///
-/// Not the maximum: one sliver of horizon seen through a col would stretch the
-/// ramp for the entire picture, and every ridge that mattered would land in
-/// its first third. The tail past this is what `clip` then drops.
-const AUTO_PERCENTILE: f64 = 0.99;
+/// Over one value per ray -- the farthest terrain along it -- not over every
+/// sampled depth. See `measure_depth`, where weighting by pixel gave a 360
+/// frame a 15 km scale while one sector of it saw past 50 km.
+///
+/// Not the maximum: one gap between ridges seeing 250 km would stretch the
+/// ramp for the whole picture. 0.95 leaves a couple of probe columns outside,
+/// which at 256 probes is about 2% of the horizontal field -- narrow enough to
+/// be a gap rather than a view.
+const AUTO_PERCENTILE: f64 = 0.95;
 
 /// What a stop paints.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -89,12 +94,14 @@ pub struct Gradient {
     /// Stop marching at `far` rather than painting everything beyond it in the
     /// last stop's colour.
     ///
-    /// Clamping is the safe default in the abstract, but it means the ramp
-    /// ends before the picture does, and the caller asked for the palette to
-    /// be spent on what is drawn. Dropping the tail costs a percent of the
-    /// terrain at `Auto` and nothing at all when `far` is a number the caller
-    /// chose. It also makes the render cheaper, since the marcher stops
-    /// sooner.
+    /// Only honoured with an explicit `Far::Metres`, and off by default. A
+    /// setting whose job is colour must not quietly decide what the picture
+    /// contains, and under `Far::Auto` that is exactly what it did: the bound
+    /// came from a percentile of the frame's own terrain, so it always sat
+    /// below the farthest thing in view and cut more the wider the field. With
+    /// a number the caller wrote down there is no such surprise -- it is
+    /// `range` for the marcher without also being `range` for `depth_lift`,
+    /// which is the one thing `range` cannot express.
     pub clip: bool,
     stops: Vec<(f64, Stop)>,
 }
@@ -204,12 +211,9 @@ impl Gradient {
         struct Spec {
             #[serde(default)]
             far_distance: Option<FarSpec>,
-            #[serde(default = "yes")]
+            #[serde(default)]
             clip: bool,
             stops: Vec<(f64, String)>,
-        }
-        fn yes() -> bool {
-            true
         }
 
         // Unknown keys are rejected here where they are ignored elsewhere in
@@ -285,14 +289,15 @@ pub fn ladder_up(d: f64) -> f64 {
         .unwrap_or(LADDER[LADDER.len() - 1])
 }
 
-/// The depth `far_distance: "auto"` resolves to, from every distance the
-/// probe rays saw. Empty means a frame with no terrain in it at all.
-pub fn auto_far(mut depths: Vec<f64>, fallback: f64) -> f64 {
-    if depths.is_empty() {
+/// The depth `far_distance: "auto"` resolves to, from how far each probe ray
+/// saw -- one entry per bearing, not per pixel. Empty means a frame with no
+/// terrain in it at all.
+pub fn auto_far(mut sightlines: Vec<f64>, fallback: f64) -> f64 {
+    if sightlines.is_empty() {
         return ladder_up(fallback);
     }
-    let k = (((depths.len() - 1) as f64) * AUTO_PERCENTILE).round() as usize;
-    let (_, nth, _) = depths.select_nth_unstable_by(k, f64::total_cmp);
+    let k = (((sightlines.len() - 1) as f64) * AUTO_PERCENTILE).round() as usize;
+    let (_, nth, _) = sightlines.select_nth_unstable_by(k, f64::total_cmp);
     ladder_up(*nth)
 }
 
@@ -394,6 +399,26 @@ mod tests {
         assert_eq!(auto_far(d, 1.0), 10_000.0);
     }
 
+    /// The bug this cost a wrong panorama to find: a 360 view ringed by close
+    /// hills, with one sector that sees a long way. Weighted per pixel the far
+    /// sector is a fraction of a percent of the frame and the percentile threw
+    /// it away -- 15 km for a view that reached past 50 -- and with `clip` on
+    /// those hills were then not rendered at all. One entry per bearing is what
+    /// makes the sector count for its width rather than its screen area.
+    #[test]
+    fn a_narrow_sector_that_sees_far_still_sets_the_scale() {
+        // 90% of bearings stop at 8 km, 10% of them see 60 km.
+        let mut sightlines = vec![8_000.0; 230];
+        sightlines.extend(std::iter::repeat_n(60_000.0, 26));
+        assert_eq!(auto_far(sightlines, 1.0), 70_000.0);
+
+        // Still robust to a genuine outlier: two bearings out of 256 slipping
+        // through a col are a gap, not a view.
+        let mut sightlines = vec![8_000.0; 254];
+        sightlines.extend([250_000.0, 250_000.0]);
+        assert_eq!(auto_far(sightlines, 1.0), 10_000.0);
+    }
+
     #[test]
     fn bad_gradients_are_refused() {
         for bad in [
@@ -409,10 +434,12 @@ mod tests {
         }
     }
 
+    /// Clip is off unless asked for, because it decides what the picture
+    /// contains and the rest of this struct only decides its colour.
     #[test]
-    fn far_distance_defaults_to_auto_and_clip_to_on() {
+    fn far_distance_defaults_to_auto_and_clip_to_off() {
         let g = grad(json!({"stops": [[0, "#000"], [1, "#fff"]]}));
         assert_eq!(g.far, Far::Auto);
-        assert!(g.clip);
+        assert!(!g.clip);
     }
 }
