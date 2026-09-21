@@ -59,6 +59,7 @@ struct Inner {
     busy: bool,
     waiting: Vec<Waiter>,
     next_seq: u64,
+    shutting_down: bool,
 }
 
 impl Inner {
@@ -118,6 +119,10 @@ impl Queue {
         let (rx, depth) = {
             let mut inner = self.0.lock().unwrap();
 
+            if inner.shutting_down {
+                return Err(Rejected::ShuttingDown);
+            }
+
             // Drop waiters that have hung up. Their futures are gone, but the
             // entries survive until the next release() scan -- which only
             // happens when the current render ends. Clients are told to abort
@@ -152,6 +157,20 @@ impl Queue {
             Ok(permit) => Ok((permit, depth)),
             Err(_) => Err(Rejected::ShuttingDown),
         }
+    }
+
+    /// Refuse everything queued, so a drain waits only for the render already
+    /// marching.
+    ///
+    /// The listener closes at the same moment, so a waiter's answer has
+    /// nowhere to go: finishing the queue would spend the stop timeout
+    /// rendering for clients that are gone, and a queue of viewsheds outlasts
+    /// it and takes the in-flight render down with it. Dropping a waiter hangs
+    /// up its sender, which is what `acquire` already reads as `ShuttingDown`.
+    pub fn shutdown(&self) {
+        let mut inner = self.0.lock().unwrap();
+        inner.shutting_down = true;
+        inner.waiting.clear();
     }
 
     fn release(&self) {

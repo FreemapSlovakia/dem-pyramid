@@ -295,6 +295,7 @@ pub async fn serve(
         jobs: Jobs::new(),
     };
 
+    let queue = ctx.queue.clone();
     let app = Router::new()
         .route("/panorama", post(panorama_route))
         .route("/viewshed", post(viewshed_route))
@@ -313,8 +314,9 @@ pub async fn serve(
     println!("listening on {listen}");
     // SIGTERM as well as SIGINT, because systemd restarts with SIGTERM and an
     // unhandled one is a default-disposition kill: a deploy would drop whatever
-    // is rendering rather than letting it finish. The drain is bounded by
-    // `MAX_QUEUE` and, past that, by `TimeoutStopSec` in the unit.
+    // is rendering rather than letting it finish. What is left to drain is one
+    // render, the queue behind it having been shed; `TimeoutStopSec` in the
+    // unit bounds even that.
     let mut sigterm = signal(SignalKind::terminate())?;
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -322,6 +324,9 @@ pub async fn serve(
                 _ = tokio::signal::ctrl_c() => {}
                 _ = sigterm.recv() => {}
             }
+            // The listener closes with this future, so a queued request has
+            // nowhere to send its answer.
+            queue.shutdown();
             println!("draining: not accepting new requests");
         })
         .await?;
