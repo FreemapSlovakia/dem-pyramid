@@ -41,10 +41,12 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    # Two release builds, two restarts and two health polls in the worst case:
-    # the unhappy path rolls back, and being killed midway through that would
-    # leave the binary neither version with nothing in the log to say so.
-    timeout-minutes: 30
+    # The unhappy path is the one to size for: three nice'd compiles (build,
+    # test, rollback build), two restarts that can each sit for the unit's
+    # TimeoutStopSec, and two health polls -- on a box that is serving tiles
+    # throughout. Being killed midway through a rollback would leave the binary
+    # built from neither commit, with nothing in the log to say so.
+    timeout-minutes: 45
     steps:
       - name: Deploy to fm6
         env:

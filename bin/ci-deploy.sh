@@ -8,6 +8,12 @@
 # This one only ever deploys a commit that is already on origin/main, so what
 # is running can be named: `git -C /fm/storage2/dem/build rev-parse HEAD`.
 #
+# One deploy behind itself: ssh starts this file, and the reset below replaces
+# it. Harmless -- git renames over the path, so the running shell keeps reading
+# the inode it opened -- but a change to this script takes effect on the deploy
+# after the one that ships it. Worth knowing before concluding a fix did not
+# work.
+#
 # Built here rather than on the runner because the binary links fm6's libgdal
 # (3.10.3) and a runner would build against whatever Ubuntu ships. glibc is not
 # the reason -- fm6's 2.41 is newer than a runner's -- but the soname is.
@@ -73,6 +79,8 @@ if [[ -n "$sha" && ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
 	exit 64
 fi
 
+mkdir -p "$(dirname "$LAST_GOOD")"
+
 cd "$BUILD_DIR"
 git rev-parse --git-dir >/dev/null 2>&1 || {
 	echo "ci-deploy: $BUILD_DIR is not a checkout -- see the setup in this script" >&2
@@ -105,15 +113,18 @@ nice -n 19 "$CARGO" build --release --quiet
 # then disagree with the running binary about until the next deploy.
 nice -n 19 "$CARGO" test --release --quiet
 
-# The unit carries TimeoutStopSec, which bounds the drain, so shipping the
-# binary without it deploys half the change: systemd's 90 s default kills a
-# render the drain was added to finish.
+# Every step that must not be skipped says `|| return 1` rather than leaning on
+# `set -e`: bash suppresses errexit inside a function called from an `&&` chain,
+# so a failing `cp` here would otherwise be swallowed and the rollback would
+# report success with the broken unit still installed.
 install_unit() {
-	if ! sudo cmp -s deploy/terrain.service /etc/systemd/system/terrain.service; then
-		echo "ci-deploy: unit changed, installing"
-		sudo cp deploy/terrain.service /etc/systemd/system/terrain.service
-		sudo systemctl daemon-reload
-	fi
+	sudo cmp -s deploy/terrain.service /etc/systemd/system/terrain.service && return 0
+	# The unit carries TimeoutStopSec, which bounds the drain, so shipping the
+	# binary without it deploys half the change: systemd's 90 s default kills a
+	# render the drain was added to finish.
+	echo "ci-deploy: unit changed, installing"
+	sudo cp deploy/terrain.service /etc/systemd/system/terrain.service || return 1
+	sudo systemctl daemon-reload || return 1
 }
 
 # The restart drains the render in flight, so it can sit for minutes; by the
@@ -130,13 +141,33 @@ healthy() {
 	return 1
 }
 
-install_unit
-sudo systemctl restart terrain
+rollback() {
+	git reset --quiet --hard "$back" || return 1
+	nice -n 19 "$CARGO" build --release --quiet || return 1
+	# The unit too: the commit that just failed may be the one that installed a
+	# broken one, and an old binary under it is not a rollback.
+	install_unit || return 1
+	sudo systemctl restart terrain || true
+	healthy
+}
+
+install_unit || {
+	echo "ci-deploy: could not install the unit" >&2
+	exit 1
+}
+
+# Not left to `set -e`: a restart that fails is exactly when the rollback below
+# is needed, and dying here would skip it silently. `healthy` decides instead.
+sudo systemctl restart terrain || true
 
 if healthy; then
 	echo "ci-deploy: healthy at $(git rev-parse --short HEAD)"
-	mkdir -p "$(dirname "$LAST_GOOD")"
-	echo "$target" >"$LAST_GOOD"
+	# Bookkeeping must not fail a deploy that worked, so a write that cannot
+	# land is a warning. Via a temp file, because a half-written sha here is a
+	# refused rollback later.
+	if ! { printf '%s\n' "$target" >"$LAST_GOOD.tmp" && mv "$LAST_GOOD.tmp" "$LAST_GOOD"; }; then
+		echo "ci-deploy: warning: could not record $target as known-good" >&2
+	fi
 	exit 0
 fi
 
@@ -146,20 +177,18 @@ fi
 echo "ci-deploy: unhealthy after restart" >&2
 systemctl --no-pager --lines=20 status terrain >&2 || true
 
+# Held to what `$sha` is held to. It comes from a file rather than from the
+# runner, but a garbled or garbage-collected sha here fails the reset, and a
+# reset that fails mid-rollback would leave the checkout wherever it stopped.
 back="$(cat "$LAST_GOOD" 2>/dev/null || true)"
-if [[ -z "$back" || "$back" == "$target" ]]; then
+if [[ -z "$back" || ! "$back" =~ ^[0-9a-f]{40}$ || "$back" == "$target" ]] ||
+	! git merge-base --is-ancestor "$back" origin/main 2>/dev/null; then
 	echo "ci-deploy: nothing known-good to roll back to; service is down at $target" >&2
 	exit 1
 fi
 
 echo "ci-deploy: rolling back to $back" >&2
-git reset --quiet --hard "$back"
-# The unit too: the commit that just failed may be the one that installed a
-# broken one, and an old binary under it is not a rollback.
-if nice -n 19 "$CARGO" build --release --quiet &&
-	install_unit &&
-	sudo systemctl restart terrain &&
-	healthy; then
+if rollback; then
 	echo "ci-deploy: rolled back to $back, healthy" >&2
 else
 	echo "ci-deploy: rollback FAILED -- service is down; last known good was $back" >&2
