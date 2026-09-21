@@ -437,6 +437,8 @@ fn main() -> Result<()> {
                 anyhow::ensure!(v.is_finite(), "--{name} must be a finite number");
             }
             anyhow::ensure!(range > 0.0, "--range must be positive");
+            // The frame the server refuses too: `render` divides by the height.
+            panorama::frame(fov, alt_min, alt_max, step)?;
             // Compiled before the render, like the server does, so a typo
             // costs a message rather than twenty seconds of marching.
             let compile = |flag: &str, src: &Option<String>| -> Result<Option<rank::Program>> {

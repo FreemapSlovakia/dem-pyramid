@@ -31,8 +31,8 @@ All fields except `lon` and `lat` are optional.
 | `lon`, `lat` | number | — | viewpoint, WGS84 degrees |
 | `az` | number | `0` | azimuth of the **left edge**, degrees clockwise from north |
 | `fov` | number | `360` | horizontal field of view, degrees (0.1–360) |
-| `alt_min` | number | `-18` | bottom of frame, degrees below horizontal |
-| `alt_max` | number | `12` | top of frame, degrees above horizontal |
+| `alt_min` | number | `-18` | bottom of frame, degrees below horizontal (−90–90) |
+| `alt_max` | number | `12` | top of frame, degrees above horizontal (−90–90); must exceed `alt_min` |
 | `step` | number | `0.05` | degrees per output pixel (minimum 0.005; the two caps below usually bind first) |
 | `eye` | number | `1.7` | eye height above ground, metres |
 | `eye_search_radius` | number | `10` | see [Viewpoint elevation](#viewpoint-elevation) (0–200) |

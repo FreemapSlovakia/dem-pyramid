@@ -1311,6 +1311,22 @@ fn dominance_m(
     }
 }
 
+/// The frame `render` allocates, rounded the way it rounds.
+///
+/// Shared with both front-ends so the rule lives in one place, like
+/// `validate_style`: rounded rather than truncated, so a caller is told the
+/// size it will actually get, and never empty -- a fov or a band shorter than
+/// half a step rounds away, and a zero dimension divides by zero below.
+pub fn frame(az_span: f64, alt_min: f64, alt_max: f64, step_deg: f64) -> Result<(usize, usize)> {
+    let w = (az_span / step_deg).round() as usize;
+    let h = ((alt_max - alt_min) / step_deg).round() as usize;
+    anyhow::ensure!(
+        w > 0 && h > 0,
+        "{w}x{h} is empty; step must be smaller than both fov and the altitude band"
+    );
+    Ok((w, h))
+}
+
 pub fn render(
     root: &Path,
     doc: &Doc,
@@ -1323,8 +1339,7 @@ pub fn render(
     let (ssx, ssy) = (p.supersample_x.max(1), p.supersample_y.max(1));
     let want_peaks = !peaks.is_empty();
 
-    let out_w = (p.az_span / p.step_deg).round() as usize;
-    let out_h = ((p.alt_max - p.alt_min) / p.step_deg).round() as usize;
+    let (out_w, out_h) = frame(p.az_span, p.alt_min, p.alt_max, p.step_deg)?;
     // Columns, because the marcher already pauses at each one to check for
     // cancellation. They are not equal work -- a column of sky is cheaper than
     // one of near terrain -- so the percentage drifts a little from the truth

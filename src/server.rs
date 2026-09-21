@@ -538,22 +538,13 @@ async fn panorama_route(
         return bad("quality must lie within 1..100");
     }
 
-    // Rounded, not truncated, to match what `render` will actually allocate --
-    // otherwise the dimensions validated here are up to a row and a column
-    // short of the buffers the limit is meant to bound, and the message quotes
-    // a size the caller never asked for.
-    let width = (req.fov / req.step).round() as usize;
-    let height = ((req.alt_max - req.alt_min) / req.step).round() as usize;
-    // Either dimension rounding away -- a band or a fov shorter than half a
-    // step -- clears both caps below, because `width * 0` is under any pixel
-    // limit and a short band buys no rays. `render` then divides by the
-    // height.
-    if width == 0 || height == 0 {
-        return bad(format!(
-            "{width}x{height} is empty; step must be smaller than both fov and \
-             the altitude band"
-        ));
-    }
+    // `render`'s own rounding, and its refusal of an empty frame: either
+    // dimension rounding away clears both caps below, because `width * 0` is
+    // under any pixel limit and a short band buys no rays.
+    let (width, height) = match panorama::frame(req.fov, req.alt_min, req.alt_max, req.step) {
+        Ok(wh) => wh,
+        Err(e) => return bad(e.to_string()),
+    };
     if width.checked_mul(height).is_none_or(|n| n > MAX_PIXELS) {
         return bad(format!(
             "{width}x{height} exceeds the {MAX_PIXELS} pixel limit; raise step or narrow fov"
