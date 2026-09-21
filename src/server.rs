@@ -34,7 +34,17 @@ use crate::{avif, panorama, peaks, viewshed};
 /// the caller -- just a bound on how much work one request can demand.
 const MAX_PIXELS: usize = 24_000_000;
 const MAX_SUPERSAMPLE: u32 = 9;
-const MIN_STEP: f64 = 0.02;
+/// Not a cost bound -- `MAX_PIXELS` and `MAX_RAYS` are. It is where the 6 m
+/// pyramid stops having anything finer to say, and what keeps a negative
+/// `step` out of the marcher. A `step` too coarse for the fov or the band
+/// casts to a width of 0 the same way, and is caught by the empty-dimension
+/// check below.
+const MIN_STEP: f64 = 0.005;
+/// Rays -- `width * supersample_x` -- which is what the marcher runs and so
+/// what the wall clock follows. `MAX_PIXELS` does not bound it: a short band
+/// lets `step` fall far enough to multiply columns while the pixel count stays
+/// put. A full turn 0.02 degrees per pixel at 9 rays is this many, about 65 s.
+const MAX_RAYS: usize = 162_000;
 /// Beyond this a viewshed is mostly answering questions about the curvature of
 /// the earth, and the cost grows with the square of it.
 const MAX_VIEWSHED_RADIUS: f64 = 300_000.0;
@@ -144,7 +154,8 @@ pub struct Request {
     /// picture; PNG is here for callers that predate it.
     #[serde(default)]
     format: Format,
-    /// AVIF quality, 1-100. Ignored for PNG, which is lossless.
+    /// AVIF quality, 1-100. PNG is lossless and ignores it, but still
+    /// range-checks it rather than making the bounds depend on `format`.
     #[serde(default = "d_quality")]
     quality: u8,
     /// Multiplier on the 8-bit dither. 0 disables it, which is how to tell
@@ -483,17 +494,70 @@ async fn panorama_route(
         return bad("alt_max must exceed alt_min");
     }
 
-    let step = req.step.max(MIN_STEP);
-    let fov = req.fov.clamp(0.1, 360.0);
+    // Out of range is a 400, never a clamp. A caller sizes its own request
+    // against these -- `step`, `fov` and `supersample_x` decide the two caps
+    // below, and the first two are the geometry it inverts the picture with --
+    // so a value quietly rewritten leaves it reasoning about a render it did
+    // not get.
+    if req.step < MIN_STEP {
+        return bad(format!("step must be at least {MIN_STEP}"));
+    }
+    if !(0.1..=360.0).contains(&req.fov) {
+        return bad("fov must lie within 0.1..360");
+    }
+    if !(1..=MAX_SUPERSAMPLE).contains(&req.supersample_x)
+        || !(1..=MAX_SUPERSAMPLE).contains(&req.supersample_y)
+    {
+        return bad(format!(
+            "supersampling must lie within 1..{MAX_SUPERSAMPLE}"
+        ));
+    }
+    if !(1_000.0..=400_000.0).contains(&req.range) {
+        return bad("range must lie within 1000..400000 m");
+    }
+    if !(0.0..=200.0).contains(&req.eye_search_radius) {
+        return bad("eye_search_radius must lie within 0..200 m");
+    }
+    if !(0.0..=8.0).contains(&req.dither_strength) {
+        return bad("dither_strength must lie within 0..8");
+    }
+    if req.depth_step < 1 {
+        return bad("depth_step must be at least 1");
+    }
+    if !(1..=100).contains(&req.quality) {
+        return bad("quality must lie within 1..100");
+    }
+
     // Rounded, not truncated, to match what `render` will actually allocate --
     // otherwise the dimensions validated here are up to a row and a column
     // short of the buffers the limit is meant to bound, and the message quotes
     // a size the caller never asked for.
-    let width = (fov / step).round() as usize;
-    let height = ((req.alt_max - req.alt_min) / step).round() as usize;
+    let width = (req.fov / req.step).round() as usize;
+    let height = ((req.alt_max - req.alt_min) / req.step).round() as usize;
+    // Either dimension rounding away -- a band or a fov shorter than half a
+    // step -- clears both caps below, because `width * 0` is under any pixel
+    // limit and a short band buys no rays. `render` then divides by the
+    // height.
+    if width == 0 || height == 0 {
+        return bad(format!(
+            "{width}x{height} is empty; step must be smaller than both fov and \
+             the altitude band"
+        ));
+    }
     if width.checked_mul(height).is_none_or(|n| n > MAX_PIXELS) {
         return bad(format!(
             "{width}x{height} exceeds the {MAX_PIXELS} pixel limit; raise step or narrow fov"
+        ));
+    }
+    // The time bound, where the pixel count is only the size of the answer:
+    // these are the rays `render` marches, and a short band buys none of them
+    // back.
+    let rays = width * req.supersample_x as usize;
+    if rays > MAX_RAYS {
+        return bad(format!(
+            "{width} columns at supersample_x {} is {rays} rays, over the \
+             {MAX_RAYS} limit; raise step, narrow fov or supersample less",
+            req.supersample_x
         ));
     }
 
@@ -509,10 +573,9 @@ async fn panorama_route(
         (Err(e), _) | (_, Err(e)) => return bad(e),
     };
 
-    let range = req.range.clamp(1_000.0, 400_000.0);
     let gradient = match &req.ground_gradient {
         Some(v) => match crate::gradient::Gradient::parse(v)
-            .and_then(|g| crate::gradient::validate(&g, range).map(|()| g))
+            .and_then(|g| crate::gradient::validate(&g, req.range).map(|()| g))
         {
             Ok(g) => Some(g),
             Err(e) => return bad(e.to_string()),
@@ -524,18 +587,18 @@ async fn panorama_route(
         lon: req.lon,
         lat: req.lat,
         eye_height: req.eye,
-        eye_search_radius: req.eye_search_radius.clamp(0.0, 200.0),
+        eye_search_radius: req.eye_search_radius,
         az_start: req.az,
-        az_span: fov,
+        az_span: req.fov,
         alt_min: req.alt_min,
         alt_max: req.alt_max,
-        step_deg: step,
-        max_range: range,
+        step_deg: req.step,
+        max_range: req.range,
         edge_ratio: 1.35,
         edge_hidden_ref: 20_000.0,
         eye_level: false,
-        supersample_x: req.supersample_x.clamp(1, MAX_SUPERSAMPLE),
-        supersample_y: req.supersample_y.clamp(1, MAX_SUPERSAMPLE),
+        supersample_x: req.supersample_x,
+        supersample_y: req.supersample_y,
         // Unbounded above: the composite clamps alpha to 1 anyway, so a large
         // value only makes the linework solid and costs nothing. A ceiling
         // here would silently rewrite the caller's number instead. Negative is
@@ -546,7 +609,7 @@ async fn panorama_route(
         ridge_colour,
         ground_colour,
         gradient,
-        dither_strength: req.dither_strength.clamp(0.0, 8.0),
+        dither_strength: req.dither_strength,
         depth_lift: req.depth_lift,
         // Not a request field. It is the resolution `dominance` is measured
         // at, which exists so two renders of one viewpoint agree -- and the
@@ -578,11 +641,6 @@ async fn panorama_route(
     let peaks_file = ctx.peaks_file.clone();
     let root = ctx.root.clone();
     let doc = ctx.doc.clone();
-    let depth_step = req.depth_step.max(1);
-    let want_depth = req.depth;
-    let format = req.format;
-    let quality = req.quality.clamp(1, 100);
-    let max_peaks = req.max_peaks;
     // Compiled here, before a render slot is taken, so a bad formula costs the
     // caller a 400 rather than costing everyone twenty seconds of queue.
     let rank = match &req.peak_rank {
@@ -627,7 +685,7 @@ async fn panorama_route(
         peaks::select(
             &mut found,
             &peaks::Selection {
-                max_peaks,
+                max_peaks: req.max_peaks,
                 height: stats.height,
                 rank,
                 filter,
@@ -654,11 +712,11 @@ async fn panorama_route(
             // one palette across a pan pins the number it gets here.
             "far_distance": stats.far_distance,
             "samples": stats.samples,
-            "depth": want_depth.then(|| serde_json::json!({
+            "depth": req.depth.then(|| serde_json::json!({
                 "encoding": "u16-le log, row delta-coded, gzip",
                 "near_m": panorama::DEPTH_NEAR,
                 "far_m": panorama::DEPTH_FAR,
-                "step": depth_step,
+                "step": req.depth_step,
                 "sky": 0,
             })),
             "peaks": found,
@@ -670,8 +728,11 @@ async fn panorama_route(
         // Encoding is seconds of work holding the render permit, so a client
         // that hung up during the march must not buy the next one a wait.
         anyhow::ensure!(!cancel.is_cancelled(), "cancelled");
-        let (name, bytes) = match format {
-            Format::Avif => ("panorama.avif", avif::encode(&img, quality, avif::SPEED)?),
+        let (name, bytes) = match req.format {
+            Format::Avif => (
+                "panorama.avif",
+                avif::encode(&img, req.quality, avif::SPEED)?,
+            ),
             Format::Png => {
                 let mut png = std::io::Cursor::new(Vec::new());
                 img.write_to(&mut png, image::ImageFormat::Png)?;
@@ -680,11 +741,11 @@ async fn panorama_route(
         };
         parts.push(("image".into(), Some(name.into()), bytes));
 
-        if want_depth {
+        if req.depth {
             parts.push((
                 "depth".into(),
                 Some("depth.bin.gz".into()),
-                panorama::depth_bytes(&stats.depth, depth_step)?,
+                panorama::depth_bytes(&stats.depth, req.depth_step)?,
             ));
         }
         if let Some(job) = &job {
@@ -746,16 +807,28 @@ async fn viewshed_route(
             return bad(format!("{name} must be a finite number"));
         }
     }
-    // Rejected rather than clamped: a gamma of 0 is a division by zero and a
-    // negative one inverts the picture, showing least where the eye sees most.
+    // Rejected rather than clamped, as everywhere here: a gamma of 0 is a
+    // division by zero and a negative one inverts the picture, showing least
+    // where the eye sees most.
     if !(0.1..=10.0).contains(&req.gamma) {
         return bad("gamma must lie within 0.1..10");
     }
     if !(0.0..=1.0).contains(&req.alpha_floor) {
         return bad("alpha_floor must lie within 0..1");
     }
+    if !(0.0..=200.0).contains(&req.eye_search_radius) {
+        return bad("eye_search_radius must lie within 0..200 m");
+    }
+    if !(0.0..=1_000.0).contains(&req.target_height) {
+        return bad("target_height must lie within 0..1000 m");
+    }
+    if !(1..=100).contains(&req.quality) {
+        return bad("quality must lie within 1..100");
+    }
     if req.radius <= 0.0 || req.radius > MAX_VIEWSHED_RADIUS {
-        return bad(format!("radius must lie within 0..{MAX_VIEWSHED_RADIUS} m"));
+        return bad(format!(
+            "radius must be positive and at most {MAX_VIEWSHED_RADIUS} m"
+        ));
     }
     if req.scale <= 0.0 {
         return bad("scale must be positive");
@@ -785,10 +858,10 @@ async fn viewshed_route(
         lon: req.lon,
         lat: req.lat,
         eye_height: req.eye,
-        eye_search_radius: req.eye_search_radius.clamp(0.0, 200.0),
+        eye_search_radius: req.eye_search_radius,
         radius: req.radius,
         scale: req.scale,
-        target_height: req.target_height.clamp(0.0, 1000.0),
+        target_height: req.target_height,
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         colour: (colour.0 as u8, colour.1 as u8, colour.2 as u8),
         gamma: req.gamma,
@@ -808,7 +881,7 @@ async fn viewshed_route(
         }
     };
 
-    let (root, doc, format, quality) = (ctx.root.clone(), ctx.doc.clone(), req.format, req.quality);
+    let (root, doc) = (ctx.root.clone(), ctx.doc.clone());
     let work = cancel.clone();
     let built = tokio::task::spawn_blocking(move || -> Result<Vec<Part>> {
         let _permit = permit;
@@ -836,10 +909,10 @@ async fn viewshed_route(
         });
 
         let mut png = std::io::Cursor::new(Vec::new());
-        let (name, bytes) = match format {
+        let (name, bytes) = match req.format {
             Format::Avif => (
                 "viewshed.avif",
-                avif::encode_rgba(&out.image, quality.clamp(1, 100), avif::SPEED)?,
+                avif::encode_rgba(&out.image, req.quality, avif::SPEED)?,
             ),
             Format::Png => {
                 out.image.write_to(&mut png, image::ImageFormat::Png)?;

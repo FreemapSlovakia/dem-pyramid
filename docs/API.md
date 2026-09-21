@@ -33,19 +33,19 @@ All fields except `lon` and `lat` are optional.
 | `fov` | number | `360` | horizontal field of view, degrees (0.1–360) |
 | `alt_min` | number | `-18` | bottom of frame, degrees below horizontal |
 | `alt_max` | number | `12` | top of frame, degrees above horizontal |
-| `step` | number | `0.05` | degrees per output pixel (minimum 0.02) |
+| `step` | number | `0.05` | degrees per output pixel (minimum 0.005; the two caps below usually bind first) |
 | `eye` | number | `1.7` | eye height above ground, metres |
 | `eye_search_radius` | number | `10` | see [Viewpoint elevation](#viewpoint-elevation) (0–200) |
 | `range` | number | `300000` | maximum distance considered, metres (1 000–400 000) |
 | `supersample_x` | int | `9` | rays per output pixel horizontally (1–9) |
 | `supersample_y` | int | `9` | sub-rows per output pixel vertically (1–9) |
 | `depth` | bool | `false` | include the distance buffer |
-| `depth_step` | int | `4` | depth quantisation; see [Depth](#depth) |
+| `depth_step` | int | `4` | depth quantisation, 1 or more; see [Depth](#depth) |
 | `peaks` | bool | `true` | include peak labels |
 | `max_peaks` | int | `0` | keep at most this many, in `peak_rank` order; 0 is no cap |
 | `format` | string | `avif` | image encoding: `avif` or `png` |
-| `quality` | int | `95` | AVIF quality, 1–100; ignored for PNG |
-| `dither_strength` | number | `1.5` | 8-bit dither amplitude, levels; 0 disables |
+| `quality` | int | `95` | AVIF quality, 1–100; PNG ignores it but still rejects values outside the range |
+| `dither_strength` | number | `1.5` | 8-bit dither amplitude, levels (0–8); 0 disables |
 | `ridge_strength` | number | `1` | multiplier on the silhouettes' alpha; 0 removes them, no upper bound |
 | `ridge_width` | number | `1` | silhouette thickness in output pixels (0–20) |
 | `ridge_color` | string | `#000000` | silhouette colour, `#rrggbb` or `#rgb` |
@@ -62,12 +62,30 @@ width  = round(fov / step)
 height = round((alt_max - alt_min) / step)
 ```
 
-`width × height` may not exceed 24 000 000. A 360° view at the default step is
-7200 × 600.
+Both must come out at least 1: a fov or an altitude band shorter than half a
+`step` rounds the frame away entirely, which is a `400`.
+
+Two caps bound a render, and a request over either is a `400` naming it:
+
+```
+width × height            ≤ 24 000 000   how big the answer is
+width × supersample_x     ≤ 162 000      how long it takes
+```
+
+A 360° view at the default step is 7200 × 600. A narrow slice can be rendered
+finer than a full turn, but the two caps pay out differently: the ray cap runs
+with `fov/step`, so **halving the fov buys half the step**, while the pixel cap
+runs with `fov/step²` and buys only a factor of √2. Against the pixel cap a
+full turn over the default band stops at about `step 0.0212`, and a 180° slice
+at about `step 0.0150`.
 
 ### What the parameters cost
 
-`supersample_x` multiplies the number of rays and is the main cost.
+Wall time follows the ray count, `width × supersample_x`, at roughly 0.4 ms
+each: `supersample_x` multiplies the rays and is the main cost, and the pixel
+count is only the size of the answer. A short vertical band therefore costs the
+same as a tall one.
+
 `supersample_y` costs no extra rays — it only changes buffer size — but is
 needed for a different reason: where several ridges fall inside one output
 pixel, only the nearest survives without it.
@@ -1037,16 +1055,16 @@ Mercator, centred on the viewpoint, transparent where nothing is visible.
 | field | type | default | meaning |
 |---|---|---|---|
 | `lon`, `lat` | number | — | viewpoint |
-| `radius` | number | `30000` | how far to look, ground metres (max 300 000) |
-| `scale` | number | `20` | ground metres per pixel |
+| `radius` | number | `30000` | how far to look, ground metres; positive, at most 300 000 |
+| `scale` | number | `20` | ground metres per pixel, positive |
 | `eye` | number | `1.7` | eye height above ground |
-| `eye_search_radius` | number | `10` | as for panoramas |
-| `target_height` | number | `0` | height of the thing looked *at* |
+| `eye_search_radius` | number | `10` | as for panoramas (0–200) |
+| `target_height` | number | `0` | height of the thing looked *at*, metres (0–1000) |
 | `color` | string | `#ffd666` | overlay colour, `#rrggbb` |
 | `gamma` | number | `1` | curve on the opacity, `alpha ** (1/gamma)` (0.1–10); above 1 lifts grazing ground |
 | `alpha_floor` | number | `0` | least opacity visible ground may take (0–1); a stencil rather than a shading |
 | `format` | string | `avif` | `avif` or `png` |
-| `quality` | int | `95` | AVIF quality |
+| `quality` | int | `95` | AVIF quality, 1–100; PNG ignores it but still rejects values outside the range |
 
 `radius` and `scale` together fix the image size — `2 × radius / scale` on a
 side — and are **validated together**, because neither looks unreasonable
@@ -1264,19 +1282,19 @@ so it can be panned continuously or tiled as a cylinder.
 
 | status | when |
 |---|---|
-| `400` | `alt_max` not greater than `alt_min`; pixel limit exceeded |
+| `400` | `alt_max` not greater than `alt_min`; a frame that rounds to zero columns or rows; pixel or ray limit exceeded |
 | `500` | render failed — most often the viewpoint has no elevation data |
 | `503` | shutting down |
 
-Most out-of-range numbers are clamped rather than rejected — `range`, `fov`,
-`step`, the supersampling factors, `eye_search_radius`, `dither_strength`. The
-exceptions are the ones where silently rewriting the request would hide a real
-mistake, and they answer `400` naming the field: `alt_min` or `alt_max` outside
-−90–90, `depth_lift` outside 0–45, `ridge_width` outside 0–20, a negative
-`ridge_strength`, a malformed colour,
-and a non-finite value in any numeric field — though the JSON parser refuses
-`NaN` and `Infinity` before the check ever sees them, so that one is belt and
-braces rather than something you can trigger.
+**Nothing is clamped.** Any number outside the range given for it in the
+tables above is a `400` naming the field, on both endpoints — a request served
+at values it did not ask for is a render the caller cannot reason about, and it
+hides whatever sent the wrong number. `ridge_strength` is the one field with no
+upper bound, so only a negative one is refused.
+
+A non-finite value in any numeric field is refused the same way, though the
+JSON parser rejects `NaN` and `Infinity` before the check ever sees them, so
+that one is belt and braces rather than something you can trigger.
 
 ## Caveats worth surfacing to users
 
