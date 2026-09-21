@@ -1,0 +1,58 @@
+# Deploy main to fm6.
+#
+# The runner builds nothing: it asks fm6 to deploy a commit, and bin/ci-deploy.sh
+# on fm6 does the rest. That script is pinned as the deploy key's forced command,
+# so this workflow cannot ask fm6 for anything else even if the key leaks -- which
+# matters more than usual, because the login it uses has passwordless sudo.
+#
+# A self-hosted runner would be simpler and is the wrong shape here: the repository
+# is public, so a pull request from a fork could run its own code on the runner, and
+# the runner would be the box that serves the site.
+#
+# One-time setup, including the two secrets, is documented in bin/ci-deploy.sh.
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    # Docs-only commits should not restart the service and drop a render.
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'bin/ci-deploy.sh'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+concurrency:
+  # Never two deploys at once, and no cancelling one midway: it holds a build
+  # and a restart on a live service.
+  group: deploy-fm6
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # A drain can take the unit's full TimeoutStopSec (300 s) before the build
+    # even starts.
+    timeout-minutes: 20
+    steps:
+      - name: Deploy to fm6
+        env:
+          DEPLOY_KEY: ${{ secrets.FM6_DEPLOY_KEY }}
+          KNOWN_HOSTS: ${{ secrets.FM6_KNOWN_HOSTS }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/id_deploy ~/.ssh/known_hosts
+          # The build prints nothing for minutes; keepalives stop the hop in
+          # between deciding the connection is idle and dropping the deploy.
+          ssh -i ~/.ssh/id_deploy -p 21122 \
+              -o IdentitiesOnly=yes \
+              -o ServerAliveInterval=30 \
+              -o ServerAliveCountMax=20 \
+              martin@fm6.freemap.sk "$SHA"
