@@ -17,9 +17,11 @@ on:
   push:
     branches: [main]
     # Docs-only commits should not restart the service and drop a render.
-    # Everything the running service reads belongs here, not just what it is
-    # built from: sources.yaml is loaded from the working directory on every
-    # render, so a commit that only adds a source is a deploy too.
+    # Everything the service reads belongs here, not just what it is built
+    # from. sources.yaml is loaded once at startup from the working directory,
+    # which is the checkout -- so a commit that only adds a source reaches
+    # production exactly when something restarts the service, and this job is
+    # that something.
     paths:
       - 'src/**'
       - 'Cargo.toml'
@@ -39,9 +41,10 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    # A drain can take the unit's full TimeoutStopSec (300 s) before the build
-    # even starts.
-    timeout-minutes: 20
+    # Two release builds, two restarts and two health polls in the worst case:
+    # the unhappy path rolls back, and being killed midway through that would
+    # leave the binary neither version with nothing in the log to say so.
+    timeout-minutes: 30
     steps:
       - name: Deploy to fm6
         env:

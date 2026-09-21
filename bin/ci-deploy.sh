@@ -55,6 +55,13 @@ BUILD_DIR="${BUILD_DIR:-/fm/storage2/dem/build}"
 HEALTH="${HEALTH:-http://127.0.0.1:3100/health}"
 # Spelled out because a forced command gets a minimal PATH, as in sync.sh.
 CARGO="${CARGO:-$HOME/.cargo/bin/cargo}"
+# The last sha that was built, restarted and answered /health -- which is not
+# the same as the checkout's previous HEAD. A re-run deploys what is already
+# checked out, and a failed test run leaves the checkout moved while the old
+# binary keeps serving; rolling back to HEAD would rebuild the bad commit in
+# the first case and an untested one in the second. Outside the checkout, so
+# reset and clean cannot take it.
+LAST_GOOD="${LAST_GOOD:-/fm/storage2/dem/state/last-good-deploy}"
 
 # Under `command=` the argument arrives here instead of in "$@".
 sha="${1:-${SSH_ORIGINAL_COMMAND:-}}"
@@ -101,35 +108,60 @@ nice -n 19 "$CARGO" test --release --quiet
 # The unit carries TimeoutStopSec, which bounds the drain, so shipping the
 # binary without it deploys half the change: systemd's 90 s default kills a
 # render the drain was added to finish.
-if ! sudo cmp -s deploy/terrain.service /etc/systemd/system/terrain.service; then
-	echo "ci-deploy: unit changed, installing"
-	sudo cp deploy/terrain.service /etc/systemd/system/terrain.service
-	sudo systemctl daemon-reload
-fi
+install_unit() {
+	if ! sudo cmp -s deploy/terrain.service /etc/systemd/system/terrain.service; then
+		echo "ci-deploy: unit changed, installing"
+		sudo cp deploy/terrain.service /etc/systemd/system/terrain.service
+		sudo systemctl daemon-reload
+	fi
+}
 
+# The restart drains the render in flight, so it can sit for minutes; by the
+# time it returns the new process is up or systemd has given up on it. Asking
+# anyway, because a binary that starts and immediately fails leaves
+# `Restart=on-failure` looping and the unit briefly looking fine.
+healthy() {
+	for _ in $(seq 30); do
+		if curl --silent --fail --max-time 2 "$HEALTH" >/dev/null; then
+			return 0
+		fi
+		sleep 1
+	done
+	return 1
+}
+
+install_unit
 sudo systemctl restart terrain
 
-# The restart drains in-flight renders, so it can sit for minutes; by the time
-# it returns the new process is up or systemd has given up on it. Health is
-# still worth asking about, because a binary that starts and immediately fails
-# leaves `Restart=on-failure` looping and the unit briefly looking fine.
-for _ in $(seq 30); do
-	if curl --silent --fail --max-time 2 "$HEALTH" >/dev/null; then
-		echo "ci-deploy: healthy at $(git rev-parse --short HEAD)"
-		exit 0
-	fi
-	sleep 1
-done
+if healthy; then
+	echo "ci-deploy: healthy at $(git rev-parse --short HEAD)"
+	mkdir -p "$(dirname "$LAST_GOOD")"
+	echo "$target" >"$LAST_GOOD"
+	exit 0
+fi
 
 # It built and the tests passed, so this is a failure only the running service
-# could show. Nothing else will put the site back: without this the bad binary
-# keeps looping under Restart=on-failure until someone rebuilds by hand.
-echo "ci-deploy: unhealthy after restart; rolling back to $was" >&2
+# could show -- and nothing else will put the site back: the bad binary would
+# keep looping under Restart=on-failure until someone rebuilt it by hand.
+echo "ci-deploy: unhealthy after restart" >&2
 systemctl --no-pager --lines=20 status terrain >&2 || true
-git reset --quiet --hard "$was"
-if nice -n 19 "$CARGO" build --release --quiet && sudo systemctl restart terrain; then
-	echo "ci-deploy: rolled back to $was" >&2
+
+back="$(cat "$LAST_GOOD" 2>/dev/null || true)"
+if [[ -z "$back" || "$back" == "$target" ]]; then
+	echo "ci-deploy: nothing known-good to roll back to; service is down at $target" >&2
+	exit 1
+fi
+
+echo "ci-deploy: rolling back to $back" >&2
+git reset --quiet --hard "$back"
+# The unit too: the commit that just failed may be the one that installed a
+# broken one, and an old binary under it is not a rollback.
+if nice -n 19 "$CARGO" build --release --quiet &&
+	install_unit &&
+	sudo systemctl restart terrain &&
+	healthy; then
+	echo "ci-deploy: rolled back to $back, healthy" >&2
 else
-	echo "ci-deploy: rollback FAILED -- service is down at $target" >&2
+	echo "ci-deploy: rollback FAILED -- service is down; last known good was $back" >&2
 fi
 exit 1
