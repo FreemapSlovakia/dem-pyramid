@@ -1318,6 +1318,10 @@ fn dominance_m(
 /// size it will actually get, and never empty -- a fov or a band shorter than
 /// half a step rounds away, and a zero dimension divides by zero below.
 pub fn frame(az_span: f64, alt_min: f64, alt_max: f64, step_deg: f64) -> Result<(usize, usize)> {
+    // Before the divisions, because a zero step makes both infinite and a
+    // float-to-integer cast saturates rather than wrapping: the emptiness
+    // check below would wave through a frame of usize::MAX columns.
+    anyhow::ensure!(step_deg > 0.0, "step must be positive");
     let w = (az_span / step_deg).round() as usize;
     let h = ((alt_max - alt_min) / step_deg).round() as usize;
     anyhow::ensure!(
@@ -2560,6 +2564,22 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The frame both front-ends are held to: empty rounds away, and a zero
+    /// step saturates the cast instead of overflowing it, so it has to go
+    /// before the division rather than after.
+    #[test]
+    fn an_empty_or_stepless_frame_is_refused() {
+        assert_eq!(frame(360.0, -18.0, 12.0, 0.05).unwrap(), (7200, 600));
+        // Rounded, so half a step still buys a row.
+        assert_eq!(frame(1.0, 0.0, 0.03, 0.05).unwrap().1, 1);
+        // Shorter than half a step, in either dimension.
+        assert!(frame(360.0, 0.0, 0.01, 0.05).is_err());
+        assert!(frame(0.02, -18.0, 12.0, 0.05).is_err());
+        for bad in [0.0, -0.05, f64::NAN] {
+            assert!(frame(360.0, -18.0, 12.0, bad).is_err(), "step {bad}");
         }
     }
 
