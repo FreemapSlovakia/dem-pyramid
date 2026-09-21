@@ -17,10 +17,15 @@ on:
   push:
     branches: [main]
     # Docs-only commits should not restart the service and drop a render.
+    # Everything the running service reads belongs here, not just what it is
+    # built from: sources.yaml is loaded from the working directory on every
+    # render, so a commit that only adds a source is a deploy too.
     paths:
       - 'src/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'sources.yaml'
+      - 'deploy/terrain.service'
       - 'bin/ci-deploy.sh'
       - '.github/workflows/deploy.yml'
   workflow_dispatch:

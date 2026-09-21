@@ -12,7 +12,22 @@
 # (3.10.3) and a runner would build against whatever Ubuntu ships. glibc is not
 # the reason -- fm6's 2.41 is newer than a runner's -- but the soname is.
 #
-# ## One-time setup on fm6
+# The nginx side is not deployed here: bin/deploy-nginx.sh writes under
+# /etc/nginx and reloads nginx, which is a different blast radius and a
+# different review. The systemd unit is installed below, because the drain
+# added with it is only as long as TimeoutStopSec says.
+#
+# ## One-time setup
+#
+# Two repository secrets, which .github/workflows/deploy.yml reads:
+#
+#   FM6_DEPLOY_KEY    the private half of the key pinned below
+#   FM6_KNOWN_HOSTS   fm6's host key, in the bracketed form a non-default port
+#                     takes: `[fm6.freemap.sk]:21122 ssh-ed25519 AAAA...`.
+#                     `ssh-keyscan fm6.freemap.sk` does not produce that form,
+#                     and the plain one fails every deploy at host-key
+#                     verification with nothing here to explain why. Take it
+#                     from `ssh-keyscan -p 21122 fm6.freemap.sk`.
 #
 # The build directory is an rsync target today and has to become a checkout,
 # which sync.sh keeps working with (it excludes .git, and rsync does not delete
@@ -83,6 +98,15 @@ nice -n 19 "$CARGO" build --release --quiet
 # then disagree with the running binary about until the next deploy.
 nice -n 19 "$CARGO" test --release --quiet
 
+# The unit carries TimeoutStopSec, which bounds the drain, so shipping the
+# binary without it deploys half the change: systemd's 90 s default kills a
+# render the drain was added to finish.
+if ! sudo cmp -s deploy/terrain.service /etc/systemd/system/terrain.service; then
+	echo "ci-deploy: unit changed, installing"
+	sudo cp deploy/terrain.service /etc/systemd/system/terrain.service
+	sudo systemctl daemon-reload
+fi
+
 sudo systemctl restart terrain
 
 # The restart drains in-flight renders, so it can sit for minutes; by the time
@@ -97,6 +121,15 @@ for _ in $(seq 30); do
 	sleep 1
 done
 
-echo "ci-deploy: unhealthy after restart; deployed $target, previous was $was" >&2
+# It built and the tests passed, so this is a failure only the running service
+# could show. Nothing else will put the site back: without this the bad binary
+# keeps looping under Restart=on-failure until someone rebuilds by hand.
+echo "ci-deploy: unhealthy after restart; rolling back to $was" >&2
 systemctl --no-pager --lines=20 status terrain >&2 || true
+git reset --quiet --hard "$was"
+if nice -n 19 "$CARGO" build --release --quiet && sudo systemctl restart terrain; then
+	echo "ci-deploy: rolled back to $was" >&2
+else
+	echo "ci-deploy: rollback FAILED -- service is down at $target" >&2
+fi
 exit 1
