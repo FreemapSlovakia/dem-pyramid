@@ -1311,6 +1311,10 @@ fn dominance_m(
     }
 }
 
+/// A frame side past any render worth asking for, and far enough below
+/// `usize::MAX` that the products `render` forms from it cannot overflow.
+const MAX_FRAME_SIDE: usize = 1 << 30;
+
 /// The frame `render` allocates, rounded the way it rounds.
 ///
 /// Shared with both front-ends so the rule lives in one place, like
@@ -1318,12 +1322,21 @@ fn dominance_m(
 /// size it will actually get, and never empty -- a fov or a band shorter than
 /// half a step rounds away, and a zero dimension divides by zero below.
 pub fn frame(az_span: f64, alt_min: f64, alt_max: f64, step_deg: f64) -> Result<(usize, usize)> {
-    // Before the divisions, because a zero step makes both infinite and a
-    // float-to-integer cast saturates rather than wrapping: the emptiness
-    // check below would wave through a frame of usize::MAX columns.
     anyhow::ensure!(step_deg > 0.0, "step must be positive");
-    let w = (az_span / step_deg).round() as usize;
-    let h = ((alt_max - alt_min) / step_deg).round() as usize;
+    // Measured before the cast, which saturates rather than wrapping: a step
+    // small enough to overflow the quotient would otherwise arrive as
+    // usize::MAX columns, pass the emptiness check below, and wrap in the
+    // multiplications `render` does with it. The server never gets here --
+    // MIN_STEP and MAX_PIXELS run first -- but the CLI has neither.
+    let (wq, hq) = (
+        (az_span / step_deg).round(),
+        ((alt_max - alt_min) / step_deg).round(),
+    );
+    anyhow::ensure!(
+        wq <= MAX_FRAME_SIDE as f64 && hq <= MAX_FRAME_SIDE as f64,
+        "a frame of {wq}x{hq} is past anything renderable; raise step"
+    );
+    let (w, h) = (wq as usize, hq as usize);
     anyhow::ensure!(
         w > 0 && h > 0,
         "{w}x{h} is empty; step must be smaller than both fov and the altitude band"
@@ -2581,6 +2594,9 @@ mod tests {
         for bad in [0.0, -0.05, f64::NAN] {
             assert!(frame(360.0, -18.0, 12.0, bad).is_err(), "step {bad}");
         }
+        // Positive, but small enough that the cast would saturate instead.
+        assert!(frame(360.0, -18.0, 12.0, 1e-20).is_err());
+        assert!(frame(360.0, -18.0, 12.0, f64::MIN_POSITIVE).is_err());
     }
 
     /// A falling lift would report summits the eye can see as hidden, so it
