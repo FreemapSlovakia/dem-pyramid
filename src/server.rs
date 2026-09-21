@@ -23,6 +23,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::signal::unix::{SignalKind, signal};
 
 use crate::config::Doc;
 use crate::panorama::Cancel;
@@ -310,9 +311,18 @@ pub async fn serve(
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
     println!("listening on {listen}");
+    // SIGTERM as well as SIGINT, because systemd restarts with SIGTERM and an
+    // unhandled one is a default-disposition kill: a deploy would drop whatever
+    // is rendering rather than letting it finish. The drain is bounded by
+    // `MAX_QUEUE` and, past that, by `TimeoutStopSec` in the unit.
+    let mut sigterm = signal(SignalKind::terminate())?;
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+            println!("draining: not accepting new requests");
         })
         .await?;
     Ok(())

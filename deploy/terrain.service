@@ -49,6 +49,12 @@ IOSchedulingPriority=6
 MemoryHigh=8G
 MemoryMax=12G
 
+# The service drains on SIGTERM instead of dropping renders, so a restart has
+# to wait for what is in flight. A render is about 25 s and the queue admits
+# ten waiters; 300 s matches nginx's `proxy_read_timeout`, past which the
+# client has been cut off anyway and finishing its render helps nobody.
+TimeoutStopSec=300
+
 Restart=on-failure
 RestartSec=5
 
