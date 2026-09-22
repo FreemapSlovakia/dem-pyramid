@@ -18,7 +18,7 @@
 set -euo pipefail
 
 DEM_ROOT="${DEM_ROOT:-/fm/storage2/dem}"
-TOOL="$DEM_ROOT/build/target/release/dem-tool"
+TOOL="${TOOL:-$DEM_ROOT/build/target/release/dem-tool}"
 cd "$DEM_ROOT/build"
 
 BBOX="${1:--25,30,45,72}"

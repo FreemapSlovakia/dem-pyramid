@@ -147,7 +147,7 @@ else
 	exit 1
 fi
 
-./target/release/dem-tool check
+./target/release/dem-tool check --elevation-sources "$ELEVATION_SOURCES"
 
 # Every step that must not be skipped says `|| return 1` rather than leaning on
 # `set -e`: bash suppresses errexit inside a function called from an `&&` chain,

@@ -27,9 +27,12 @@ TOOL="${TOOL:-$DEM_ROOT/build/target/release/dem-tool}"
 cd "${BUILD_DIR:-$DEM_ROOT/build}"
 export TOOL
 
-# Central Europe, then the Alps and the west, then Iberia and Britain, then the
-# Nordic bulk, then the overseas departments.
-DEFAULT_ORDER=(
+# Preferred order, not the list: central Europe first so the pyramid is usable
+# within a day, then the Alps and the west, Iberia and Britain, the Nordic bulk
+# -- se+fi+no are 59% of the tiles -- and the overseas departments. Anything the
+# sources hold that is not named here follows, in priority order, so a dataset
+# added upstream is built rather than quietly skipped.
+PREFERRED=(
   sk cz at hr si pl
   ch it fr
   es_29 es_30 es_31 en
@@ -39,7 +42,18 @@ DEFAULT_ORDER=(
 
 sources=("$@")
 if [ ${#sources[@]} -eq 0 ]; then
-  sources=("${DEFAULT_ORDER[@]}")
+  mapfile -t all < <("$TOOL" json | python3 -c 'import json,sys; [print(s["id"]) for s in json.load(sys.stdin)["sources"]]')
+  [ ${#all[@]} -gt 0 ] || { echo "build-all: no sources -- run dem-tool refresh" >&2; exit 1; }
+
+  sources=()
+  for id in "${PREFERRED[@]}"; do
+    for have in "${all[@]}"; do
+      [ "$id" = "$have" ] && sources+=("$id") && break
+    done
+  done
+  for have in "${all[@]}"; do
+    case " ${sources[*]} " in *" $have "*) ;; *) sources+=("$have") ;; esac
+  done
 fi
 
 started=$(date +%s)
@@ -48,7 +62,14 @@ skipped=0
 
 for id in "${sources[@]}"; do
   fp="$DEM_ROOT/footprints/$id.gpkg"
-  mapfile -t tiles < <("$TOOL" cover "$id" | tail -n +2)
+  # Not in a process substitution: `set -e` does not see a failure there, and
+  # an unknown id would read as a source with nothing to build rather than as
+  # the mistake it is.
+  cover=$("$TOOL" cover "$id") || {
+    echo "build-all: $id: no such source" >&2
+    exit 1
+  }
+  mapfile -t tiles < <(printf '%s\n' "$cover" | tail -n +2)
   echo "=== $id: ${#tiles[@]} candidate tiles  ($(date -Is))"
 
   for t in "${tiles[@]}"; do

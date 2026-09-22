@@ -26,6 +26,10 @@ fn differences(was: &Source, now: &Source) -> Vec<String> {
         }
     };
 
+    // Both are path components for norm/ and footprints/, so a rename
+    // silently repoints every tile the source has already built.
+    note("id", was.id.clone(), now.id.clone());
+    note("dir", was.dir.clone(), now.dir.clone());
     note("api_name", was.api_name.clone(), now.api_name.clone());
     note(
         "priority",
@@ -188,7 +192,9 @@ mod tests {
         let was = source("sk", 1.0);
 
         for mutate in [
-            (|s: &mut Source| s.api_name = "other".into()) as fn(&mut Source),
+            (|s: &mut Source| s.id = "other".into()) as fn(&mut Source),
+            |s| s.dir = "020-other".into(),
+            |s| s.api_name = "other".into(),
             |s| s.priority = 1,
             |s| s.nodata = Nodata::Value(-9999.0),
             |s| s.finest_level = 12,

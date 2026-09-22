@@ -358,7 +358,14 @@ fn main() -> Result<()> {
                 &entries,
             )?;
 
-            refresh::write(&cli.root, &derived)?;
+            // Written only once every dataset has been read. A cache silently
+            // missing a source that was merely unreadable for a moment builds a
+            // mosaic with a hole in it, and nothing downstream would say so.
+            if failed > 0 {
+                anyhow::bail!("{failed} dataset(s) could not be read");
+            }
+
+            refresh::write(&cache, &derived)?;
 
             for s in &derived {
                 println!(
@@ -371,12 +378,8 @@ fn main() -> Result<()> {
                 "\n{} of {} datasets measured into {}",
                 derived.len(),
                 entries.len(),
-                refresh::cache_path(&cli.root).display()
+                cache.display()
             );
-
-            if failed > 0 {
-                anyhow::bail!("{failed} dataset(s) could not be read");
-            }
         }
         Command::Check { elevation_sources } => check::run(&doc, &elevation_sources)?,
         Command::Footprints { only } => {

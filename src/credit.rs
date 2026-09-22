@@ -141,12 +141,18 @@ pub fn load_entries(dir: &Path) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
-/// Credit lines by `api_name`. Several datasets share a name -- Spain is four,
-/// France seven and Sonny fourteen -- so their credits merge under it, deduped.
+/// Credit lines by `api_name`, for the datasets the pyramid builds. Several
+/// share a name -- Spain is four, France seven -- so their credits merge under
+/// it, deduped.
+///
+/// Only the ones it builds: a dataset the list carries but the pyramid does
+/// not would otherwise lend its licence line to every render naming that
+/// model, which is the miscrediting `check_attributions` keys on the file to
+/// avoid.
 pub fn credits_of(entries: &[Entry]) -> Credits {
     let mut credits: Credits = HashMap::new();
 
-    for entry in entries {
+    for entry in entries.iter().filter(|e| e.pyramid) {
         let into = credits.entry(entry.name.clone()).or_default();
 
         for attr in &entry.attributions {

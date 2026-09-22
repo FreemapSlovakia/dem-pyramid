@@ -91,23 +91,43 @@ fn fill_nodata_of(nodata: Option<f64>) -> Option<u32> {
     (nodata == Some(0.0)).then_some(FILL_NODATA_MD)
 }
 
-fn bbox_of(info: &serde_json::Value, path: &str) -> Result<[f64; 4]> {
-    let ring = info["wgs84Extent"]["coordinates"][0]
-        .as_array()
-        .with_context(|| format!("{path}: no wgs84Extent"))?;
+/// The source's extent in lon/lat.
+///
+/// Not `gdalinfo`'s `wgs84Extent`: that is the four corners transformed, and a
+/// projected edge bows away from the straight line between them -- a fifth of
+/// a degree for a UTM-width extent at high latitude, always outwards, so the
+/// corner hull clips it. `gdalwarp` walks the edges to size its output, so a
+/// VRT costs no pixels and answers with the extent the build itself would use.
+fn bbox_of(path: &str) -> Result<[f64; 4]> {
+    let tmp = std::env::temp_dir().join(format!(
+        "dem-extent-{}-{}.vrt",
+        std::process::id(),
+        path.bytes().map(u64::from).sum::<u64>()
+    ));
 
-    let (mut w, mut s, mut e, mut n) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    let out = tmp.to_string_lossy().into_owned();
 
-    for p in ring {
-        let (lon, lat) = (
-            p[0].as_f64().context("non-numeric extent")?,
-            p[1].as_f64().context("non-numeric extent")?,
-        );
-        w = w.min(lon);
-        s = s.min(lat);
-        e = e.max(lon);
-        n = n.max(lat);
-    }
+    gdal_cli::run(
+        "gdalwarp",
+        &["-q", "-of", "VRT", "-t_srs", "EPSG:4326", path, &out],
+    )
+    .with_context(|| format!("{path}: could not compute the reprojected extent"))?;
+
+    let info = gdal_cli::info_json(&out);
+
+    std::fs::remove_file(tmp).ok();
+
+    let info = info?;
+    let c = &info["cornerCoordinates"];
+
+    let at = |corner: &str, i: usize| -> Result<f64> {
+        c[corner][i]
+            .as_f64()
+            .with_context(|| format!("{path}: no {corner} corner"))
+    };
+
+    let (w, n) = (at("upperLeft", 0)?, at("upperLeft", 1)?);
+    let (e, s) = (at("lowerRight", 0)?, at("lowerRight", 1)?);
 
     if w >= e || s >= n {
         bail!("{path}: degenerate extent");
@@ -148,7 +168,7 @@ pub fn derive(entry: &Entry, coarsest: u32, finest: u32) -> Result<Source> {
             Some(_) => Nodata::Declared("declared".to_owned()),
             None => bail!("{}: declares no nodata", entry.dir),
         },
-        bbox: bbox_of(&info, &entry.file)?,
+        bbox: bbox_of(&entry.file)?,
         finest_level,
         resampling: resampling_of(native_res, finest_level),
         footprint: footprint_of(&entry.file),
@@ -183,15 +203,13 @@ pub fn derive_all(entries: &[Entry], coarsest: u32, finest: u32) -> (Vec<Source>
     (out, failed)
 }
 
-pub fn write(root: &Path, derived: &[Source]) -> Result<()> {
-    let path = cache_path(root);
-
+pub fn write(path: &Path, derived: &[Source]) -> Result<()> {
     std::fs::create_dir_all(path.parent().context("no parent")?)?;
 
     // Through a temp file: a half-written cache is a build against nothing.
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_string_pretty(derived)? + "\n")?;
-    std::fs::rename(&tmp, &path)?;
+    std::fs::rename(&tmp, path)?;
 
     Ok(())
 }
@@ -204,7 +222,7 @@ mod tests {
     fn an_id_drops_the_prefix_and_keeps_the_rest() {
         assert_eq!(id_of("010-sk"), "sk");
         assert_eq!(id_of("090-es-29"), "es_29");
-        assert_eq!(id_of("140-fr-fr1-lamb93-ign69"), "fr_fr1_lamb93_ign69");
+        assert_eq!(id_of("250-sonny-de"), "sonny_de");
     }
 
     /// Ascending directories, descending priority.

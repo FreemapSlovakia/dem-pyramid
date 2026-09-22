@@ -4,7 +4,7 @@
 set -euo pipefail
 
 DEM_ROOT="${DEM_ROOT:-/fm/storage2/dem}"
-TOOL="$DEM_ROOT/build/target/release/dem-tool"
+TOOL="${TOOL:-$DEM_ROOT/build/target/release/dem-tool}"
 
 running=$(tmux has-session -t build 2>/dev/null && echo yes || echo no)
 echo "build session running: $running"
