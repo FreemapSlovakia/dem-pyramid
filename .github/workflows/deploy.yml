@@ -17,16 +17,13 @@ on:
   push:
     branches: [main]
     # Docs-only commits should not restart the service and drop a render.
-    # Everything the service reads belongs here, not just what it is built
-    # from. sources.yaml is loaded once at startup from the working directory,
-    # which is the checkout -- so a commit that only adds a source reaches
-    # production exactly when something restarts the service, and this job is
-    # that something.
+    # The sources themselves no longer live here: they come from the elevation
+    # API's list and are measured into a cache on the data host, so adding one
+    # reaches production through `dem-tool refresh` rather than through a commit.
     paths:
       - 'src/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - 'sources.yaml'
       - 'deploy/terrain.service'
       - 'bin/ci-deploy.sh'
       - '.github/workflows/deploy.yml'

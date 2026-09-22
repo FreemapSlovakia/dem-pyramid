@@ -1,16 +1,16 @@
 //! Coverage footprint per source.
 //!
-//! Two modes, chosen per source in sources.yaml:
+//! Two modes, chosen by whether there is a VRT to read rectangles out of:
 //!
 //!   tiles  Union of the VRT's source rectangles, read straight out of the VRT
 //!          XML. Exact for the tile canvas, and costs seconds -- no pixel is
 //!          touched. This is what makes the dirty-tile set for an incremental
 //!          rebuild precise.
 //!
-//!   bbox   The declared lon/lat box. Used for single-file sources, which all
-//!          declare correct nodata, so their real edge is resolved at warp time
-//!          and a conservative footprint only means rebuilding a few extra
-//!          tiles.
+//!   bbox   The source's measured lon/lat box. Used for single-file sources,
+//!          which all declare correct nodata, so their real edge is resolved at
+//!          warp time and a conservative footprint only means rebuilding a few
+//!          extra tiles.
 //!
 //! Deliberately NOT gdal_footprint: that derives the outline from pixel values,
 //! which would mean reading all 6.7 TB of source data.
@@ -246,11 +246,13 @@ fn build(src: &Source, out_dir: &Path, tmp_dir: &Path) -> Result<Info> {
                 })
                 .collect();
 
-            // Prefer the dataset's own WKT; fall back to the declared code.
-            // Keeping the authority matters for datum shifts -- OSGB36 read
-            // through a bare PROJ.4 string lands ~100 m off.
+            // Prefer the WKT out of the VRT we are already parsing; ask GDAL
+            // for the dataset's otherwise. Keeping the authority matters for
+            // datum shifts -- OSGB36 read through a bare PROJ.4 string lands
+            // ~100 m off.
             let s_srs = if vrt.srs_wkt.is_empty() {
-                gdal_cli::srs_wkt(&src.crs).unwrap_or_else(|| src.crs.clone())
+                gdal_cli::srs_wkt(&src.path)
+                    .with_context(|| format!("{}: no coordinate system", src.path))?
             } else {
                 vrt.srs_wkt.clone()
             };

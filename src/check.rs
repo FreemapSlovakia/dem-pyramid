@@ -1,172 +1,124 @@
-//! Re-measure every source and fail on any drift from sources.yaml.
+//! Is the cache still what the data says?
 //!
-//! Two comparisons, both of them the same idea: sources.yaml declares, and
-//! something else is asked whether it agrees. The rasters are asked with GDAL,
-//! headers only -- no pixel is read -- which has already caught nodata
-//! sentinels that differ between files of the same country. The elevation
-//! API's source list is asked about the values the two share, which had drifted
-//! apart over a month before anything looked.
+//! `refresh` measures the sources and writes what the build needs; everything
+//! downstream reads that rather than the rasters, which is what keeps a build
+//! from opening a 44 MB VRT once per tile just to ask its resolution. The cost
+//! is that the cache can fall behind: a source regenerated upstream, a dataset
+//! added to the list, a raster whose nodata changed.
+//!
+//! So this re-measures and holds the answer against the cache. Headers only --
+//! no pixel is read. It has already caught nodata sentinels that differ
+//! between files of the same country.
 
 use anyhow::{Result, bail};
 use std::path::Path;
 
-use crate::config::Doc;
-use crate::{credit, gdal_cli};
+use crate::config::{Doc, Source};
+use crate::{credit, refresh};
 
-pub fn run(doc: &Doc, elevation_sources: &Path) -> Result<()> {
-    // The list first: it opens nothing large, so a config disagreement is
-    // reported in a moment rather than after every raster header has been read.
-    elevation_list(doc, elevation_sources)?;
+/// Everything a build would read, compared field by field.
+fn differences(was: &Source, now: &Source) -> Vec<String> {
+    let mut notes = Vec::new();
 
-    let mut problems = 0usize;
-
-    for s in &doc.sources {
-        let mut notes: Vec<String> = Vec::new();
-
-        if !std::path::Path::new(&s.path).exists() {
-            println!("FAIL {}: missing {}", s.id, s.path);
-            problems += 1;
-            continue;
+    let mut note = |what: &str, a: String, b: String| {
+        if a != b {
+            notes.push(format!("{what}: cached {a}, measured {b}"));
         }
+    };
 
-        let info = match gdal_cli::info_json(&s.path) {
-            Ok(v) => v,
-            Err(e) => {
-                println!("FAIL {}: {e}", s.id);
-                problems += 1;
-                continue;
-            }
-        };
-
-        // Resolution. GEDTM30 is in degrees; convert before comparing.
-        if let Some(res) = info["geoTransform"][1].as_f64() {
-            let res_m = if s.crs == "EPSG:4326" {
-                res * 111_320.0
-            } else {
-                res.abs()
-            };
-            if (res_m - s.native_res).abs() > 0.05 * s.native_res {
-                notes.push(format!("res {res_m:.4} m != yaml {}", s.native_res));
-            }
-        } else {
-            notes.push("no geotransform".into());
-        }
-
-        if !gdal_cli::crs_matches(&s.path, &s.crs) {
-            let name = info["coordinateSystem"]["wkt"]
-                .as_str()
-                .and_then(|w| w.split('"').nth(1))
-                .unwrap_or("?")
-                .to_owned();
-            notes.push(format!("CRS is {name:?}, yaml says {}", s.crs));
-        }
-
-        let declared = info["bands"][0]["noDataValue"].as_f64();
-        match (s.nodata.is_declared(), declared) {
-            (true, None) => {
-                notes.push("yaml says nodata is declared but the dataset declares none".into())
-            }
-            (false, Some(d)) => {
-                let want = s.nodata.value().unwrap_or(f64::NAN);
-                if (d - want).abs() > 1e-6 {
-                    notes.push(format!(
-                        "yaml overrides nodata to {want} while the dataset \
-                         declares {d}"
-                    ));
-                }
-            }
-            _ => {}
-        }
-
-        if notes.is_empty() {
-            let size = format!(
-                "{}x{}",
-                info["size"][0].as_i64().unwrap_or(0),
-                info["size"][1].as_i64().unwrap_or(0)
-            );
-            let nd = declared.map_or_else(
-                || "none".to_owned(),
-                |v| {
-                    // Float-max sentinels (sk, gedtm30) are unreadable in
-                    // decimal.
-                    if v.abs() >= 1e6 {
-                        format!("{v:e}")
-                    } else {
-                        v.to_string()
-                    }
-                },
-            );
-            println!("ok   {:14} {size} nodata={nd}", s.id);
-        } else {
-            problems += 1;
-            println!("FAIL {}", s.id);
-            for n in &notes {
-                println!("       {n}");
-            }
-        }
-    }
-
-    if problems > 0 {
-        bail!("\n{problems} source(s) disagree with sources.yaml");
-    }
-    println!(
-        "\nall {} sources agree with sources.yaml",
-        doc.sources.len()
+    note("api_name", was.api_name.clone(), now.api_name.clone());
+    note(
+        "priority",
+        was.priority.to_string(),
+        now.priority.to_string(),
+    );
+    note("nodata", was.nodata.to_string(), now.nodata.to_string());
+    note(
+        "finest_level",
+        was.finest_level.to_string(),
+        now.finest_level.to_string(),
+    );
+    note("resampling", was.resampling.clone(), now.resampling.clone());
+    note(
+        "footprint",
+        format!("{:?}", was.footprint),
+        format!("{:?}", now.footprint),
+    );
+    note(
+        "fill_nodata_md",
+        format!("{:?}", was.fill_nodata_md),
+        format!("{:?}", now.fill_nodata_md),
     );
 
-    Ok(())
-}
-
-/// Compare sources.yaml against the elevation API's own list, which lives in
-/// its own repository and is a checkout on the serving host.
-///
-/// Only the values both consumers hold: the file each source reads, the model
-/// it is reported under, and the order they are tried in. Everything else in
-/// sources.yaml is how the pyramid is built, which is no concern of the API's.
-fn elevation_list(doc: &Doc, dir: &Path) -> Result<()> {
-    let entries = credit::load_entries(dir)?;
-    let mut problems = 0usize;
-
-    println!("against the elevation source list at {}", dir.display());
-
-    // By file rather than by name: a name is a model and several datasets share
-    // one, but the file is the dataset.
-    let mut placed = Vec::new();
-
-    for source in &doc.sources {
-        let Some(entry) = entries.iter().find(|e| e.file == source.path) else {
-            println!("FAIL {}: {} is in no source.json", source.id, source.path);
-            problems += 1;
-            continue;
-        };
-
-        if entry.name != source.api_name {
-            println!(
-                "FAIL {}: api_name {} here, {} in {}",
-                source.id, source.api_name, entry.name, entry.dir
-            );
-            problems += 1;
-            continue;
-        }
-
-        placed.push((source.id.as_str(), entry.dir.as_str(), source.priority));
+    // Measured, so a hair of float drift between GDAL versions is not news.
+    if (was.native_res - now.native_res).abs() > 0.05 * now.native_res {
+        notes.push(format!(
+            "native_res: cached {:.4} m, measured {:.4} m",
+            was.native_res, now.native_res
+        ));
     }
 
-    // Both lists are precedence orders written in opposite directions:
-    // priority descending here, directory ascending there. Only the pyramid's
-    // own sources are compared -- the list is a superset, and the ones it
-    // holds that the pyramid does not build cannot reorder anything here.
-    let mut by_priority = placed.clone();
-    by_priority.sort_by_key(|&(_, _, priority)| -priority);
+    // A box that moved by a fraction of a degree is the same box; anything
+    // more changes which tiles the source is asked for.
+    let moved = was
+        .bbox
+        .iter()
+        .zip(&now.bbox)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
 
-    let mut by_dir = placed.clone();
-    by_dir.sort_by_key(|&(_, dir, _)| dir);
+    if moved > 0.001 {
+        notes.push(format!(
+            "bbox: cached {:?}, measured {:?}",
+            was.bbox, now.bbox
+        ));
+    }
 
-    for (a, b) in by_priority.iter().zip(&by_dir) {
-        if a.0 != b.0 {
+    notes
+}
+
+pub fn run(doc: &Doc, elevation_sources: &Path) -> Result<()> {
+    let entries = credit::load_entries(elevation_sources)?;
+
+    // The licence rule first: it costs nothing and is the one failure here
+    // that is not merely a stale number.
+    credit::check_attributions(doc, &entries)?;
+
+    let (measured, unreadable) =
+        refresh::derive_all(&entries, doc.grid.coarsest_level, doc.grid.finest_level);
+
+    let mut problems = unreadable;
+
+    for now in &measured {
+        match doc.sources.iter().find(|s| s.path == now.path) {
+            None => {
+                println!(
+                    "FAIL {}: in the source list, missing from the cache",
+                    now.id
+                );
+                problems += 1;
+            }
+            Some(was) => {
+                let notes = differences(was, now);
+
+                if notes.is_empty() {
+                    println!("ok   {:14} {}", now.id, now.path);
+                } else {
+                    println!("FAIL {}", now.id);
+                    for n in &notes {
+                        println!("       {n}");
+                    }
+                    problems += notes.len();
+                }
+            }
+        }
+    }
+
+    for was in &doc.sources {
+        if !measured.iter().any(|m| m.path == was.path) {
             println!(
-                "FAIL {}: sits where {} does in the elevation list ({} vs {})",
-                a.0, b.0, a.1, b.1
+                "FAIL {}: in the cache, no longer built by the source list",
+                was.id
             );
             problems += 1;
         }
@@ -174,20 +126,13 @@ fn elevation_list(doc: &Doc, dir: &Path) -> Result<()> {
 
     if problems > 0 {
         bail!(
-            "\n{problems} disagreement(s) with the elevation source list.\n\
-             Change whichever side is stale: sources.yaml here, or the entry in\n\
-             github.com/FreemapSlovakia/elevation-sources."
+            "\n{problems} disagreement(s) with the data.\n\
+             Run `dem-tool refresh` to bring the cache up to date, then rebuild \
+             whatever the changed values affect."
         );
     }
 
-    // The one rule that is a licence requirement rather than a consistency
-    // one, so it is worth saying it passed.
-    credit::check_attributions(doc, &entries)?;
-
-    println!(
-        "ok   all {} sources agree with the elevation list, and each has a credit",
-        placed.len()
-    );
+    println!("\nthe cache agrees with all {} sources", measured.len());
 
     Ok(())
 }
@@ -195,169 +140,65 @@ fn elevation_list(doc: &Doc, dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{FootprintMode, Grid, Nodata, Source};
+    use crate::config::{FootprintMode, Nodata};
 
-    fn source(id: &str, api_name: &str, priority: i64, path: &str) -> Source {
+    fn source(id: &str, native_res: f64) -> Source {
         Source {
             id: id.into(),
-            api_name: api_name.into(),
-            path: path.into(),
-            priority,
-            native_res: 1.0,
-            crs: "EPSG:4326".into(),
+            dir: format!("010-{id}"),
+            api_name: id.into(),
+            path: format!("/dtm/{id}.tif"),
+            priority: 100,
+            native_res,
             bbox: [0.0, 0.0, 1.0, 1.0],
             nodata: Nodata::Declared("declared".into()),
             finest_level: 14,
             resampling: "average".into(),
             footprint: FootprintMode::Bbox,
             fill_nodata_md: None,
-            rebuild_vrt: false,
         }
     }
 
-    fn doc(mut sources: Vec<Source>) -> Doc {
-        sources.sort_by_key(|s| -s.priority);
+    #[test]
+    fn an_unchanged_source_reports_nothing() {
+        assert!(differences(&source("sk", 1.0), &source("sk", 1.0)).is_empty());
+    }
 
-        Doc {
-            grid: Grid {
-                crs: "EPSG:3857".into(),
-                tile_px: 512,
-                block_px: 512,
-                finest_level: 14,
-                coarsest_level: 8,
-            },
-            sources,
+    /// Float noise between GDAL versions is not a change; a real resolution
+    /// change is.
+    #[test]
+    fn resolution_tolerates_noise_but_not_a_change() {
+        assert!(differences(&source("sk", 1.0), &source("sk", 1.0000001)).is_empty());
+        assert_eq!(differences(&source("sk", 1.0), &source("sk", 2.0)).len(), 1);
+    }
+
+    #[test]
+    fn a_moved_box_is_reported() {
+        let was = source("sk", 1.0);
+        let mut now = source("sk", 1.0);
+        now.bbox = [0.0, 0.0, 1.5, 1.0];
+
+        assert_eq!(differences(&was, &now).len(), 1);
+    }
+
+    /// Every field the build reads is compared, so a change in any one of them
+    /// is caught rather than silently built against.
+    #[test]
+    fn each_build_input_is_compared() {
+        let was = source("sk", 1.0);
+
+        for mutate in [
+            (|s: &mut Source| s.api_name = "other".into()) as fn(&mut Source),
+            |s| s.priority = 1,
+            |s| s.nodata = Nodata::Value(-9999.0),
+            |s| s.finest_level = 12,
+            |s| s.resampling = "bilinear".into(),
+            |s| s.footprint = FootprintMode::Tiles,
+            |s| s.fill_nodata_md = Some(5),
+        ] {
+            let mut now = source("sk", 1.0);
+            mutate(&mut now);
+            assert_eq!(differences(&was, &now).len(), 1);
         }
-    }
-
-    /// Writes a tree shaped like the real one: a directory per dataset, named
-    /// so the prefix orders them.
-    fn tree(dir: &Path, entries: &[(&str, &str, &str)]) {
-        for (sub, name, file) in entries {
-            let d = dir.join(sub);
-            std::fs::create_dir_all(&d).unwrap();
-            std::fs::write(
-                d.join("source.json"),
-                format!(r#"{{"name":"{name}","file":"{file}","attributions":[{{"name":"c"}}]}}"#),
-            )
-            .unwrap();
-        }
-    }
-
-    fn tmp(label: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "dem-check-{label}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    #[test]
-    fn an_agreeing_list_passes() {
-        let d = tmp("agree");
-        tree(
-            &d,
-            &[
-                ("010-sk", "sk", "/dtm/sk.tif"),
-                ("999-g", "g", "/dtm/g.tif"),
-            ],
-        );
-
-        let doc = doc(vec![
-            source("sk", "sk", 230, "/dtm/sk.tif"),
-            source("g", "g", 0, "/dtm/g.tif"),
-        ]);
-
-        assert!(elevation_list(&doc, &d).is_ok());
-        std::fs::remove_dir_all(&d).ok();
-    }
-
-    /// The lu drift: sources.yaml read a VRT wrapper while the list read the
-    /// raster underneath it.
-    #[test]
-    fn a_file_the_list_does_not_name_is_caught() {
-        let d = tmp("file");
-        tree(&d, &[("010-lu", "lu", "/dtm/lu/luxembourg.tif")]);
-
-        let doc = doc(vec![source("lu", "lu", 167, "/dtm/lu/lu.vrt")]);
-
-        assert!(elevation_list(&doc, &d).is_err());
-        std::fs::remove_dir_all(&d).ok();
-    }
-
-    /// The be/it/en drift: same datasets, opposite precedence.
-    #[test]
-    fn a_reordered_list_is_caught() {
-        let d = tmp("order");
-        tree(
-            &d,
-            &[
-                ("210-it", "it", "/dtm/it.tif"),
-                ("240-be", "be", "/dtm/be.vrt"),
-            ],
-        );
-
-        // Here be outranks it; in the list it outranks be.
-        let doc = doc(vec![
-            source("be", "be", 168, "/dtm/be.vrt"),
-            source("it", "it", 165, "/dtm/it.tif"),
-        ]);
-
-        assert!(elevation_list(&doc, &d).is_err());
-        std::fs::remove_dir_all(&d).ok();
-    }
-
-    #[test]
-    fn a_mismatched_api_name_is_caught() {
-        let d = tmp("name");
-        tree(&d, &[("010-sk", "slovakia", "/dtm/sk.tif")]);
-
-        let doc = doc(vec![source("sk", "sk", 230, "/dtm/sk.tif")]);
-
-        assert!(elevation_list(&doc, &d).is_err());
-        std::fs::remove_dir_all(&d).ok();
-    }
-
-    /// The list is a superset: entries the pyramid does not build are not a
-    /// disagreement, and cannot reorder the ones it does.
-    #[test]
-    fn entries_the_pyramid_does_not_build_are_ignored() {
-        let d = tmp("superset");
-        tree(
-            &d,
-            &[
-                ("010-sk", "sk", "/dtm/sk.tif"),
-                ("500-sonny-de", "sonny", "/dtm/sonny/de.tif"),
-                ("999-g", "g", "/dtm/g.tif"),
-            ],
-        );
-
-        let doc = doc(vec![
-            source("sk", "sk", 230, "/dtm/sk.tif"),
-            source("g", "g", 0, "/dtm/g.tif"),
-        ]);
-
-        assert!(elevation_list(&doc, &d).is_ok());
-        std::fs::remove_dir_all(&d).ok();
-    }
-
-    #[test]
-    fn a_source_with_no_credit_is_caught() {
-        let d = tmp("credit");
-        std::fs::create_dir_all(d.join("010-sk")).unwrap();
-        std::fs::write(
-            d.join("010-sk/source.json"),
-            r#"{"name":"sk","file":"/dtm/sk.tif","attributions":[]}"#,
-        )
-        .unwrap();
-
-        let doc = doc(vec![source("sk", "sk", 230, "/dtm/sk.tif")]);
-
-        assert!(elevation_list(&doc, &d).is_err());
-        std::fs::remove_dir_all(&d).ok();
     }
 }

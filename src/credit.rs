@@ -77,6 +77,10 @@ struct SourceJson {
     file: String,
     #[serde(default)]
     attributions: Vec<Attribution>,
+    /// Whether the pyramid builds this dataset. The one thing about a dataset
+    /// that cannot be measured from it.
+    #[serde(default)]
+    pyramid: bool,
 }
 
 /// One dataset in the elevation API's list.
@@ -90,6 +94,8 @@ pub struct Entry {
     /// The raster, absolute, as GDAL opens it.
     pub file: String,
     pub attributions: Vec<Attribution>,
+    /// Whether the pyramid builds this dataset.
+    pub pyramid: bool,
 }
 
 /// Reads the elevation API's source tree: one subdirectory per dataset, each
@@ -126,6 +132,7 @@ pub fn load_entries(dir: &Path) -> Result<Vec<Entry>> {
             name: parsed.name,
             file: parsed.file,
             attributions: parsed.attributions,
+            pyramid: parsed.pyramid,
         });
     }
 
@@ -329,18 +336,17 @@ mod tests {
     fn source(id: &str, api_name: &str, priority: i64, bbox: [f64; 4]) -> Source {
         Source {
             id: id.into(),
+            dir: format!("100-{id}"),
             api_name: api_name.into(),
             path: String::new(),
             priority,
             native_res: 1.0,
-            crs: "EPSG:4326".into(),
             bbox,
             nodata: Nodata::Declared("declared".into()),
             finest_level: 14,
             resampling: "bilinear".into(),
             footprint: FootprintMode::Bbox,
             fill_nodata_md: None,
-            rebuild_vrt: false,
         }
     }
 
@@ -551,6 +557,7 @@ mod tests {
             dir: dir.into(),
             name: name.into(),
             file: file.into(),
+            pyramid: true,
             attributions: if credited {
                 vec![Attribution {
                     name: "DMR 5.0: ÚGKK SR".into(),

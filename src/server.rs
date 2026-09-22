@@ -294,9 +294,9 @@ fn d_dither() -> f64 {
 pub struct Ctx {
     root: PathBuf,
     doc: Arc<Doc>,
-    /// Read once at startup from the elevation API's source tree, not from
-    /// `sources.yaml`; `serve` refuses to start unless every source it
-    /// serves is named there, with a credit.
+    /// Read once at startup from the elevation API's source list; `serve`
+    /// refuses to start unless every source it serves is named there, with a
+    /// credit.
     credits: Arc<credit::Credits>,
     peaks_file: Option<PathBuf>,
     /// One render at a time: a single render already saturates nine cores, so

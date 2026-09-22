@@ -117,15 +117,14 @@ nice -n 19 "$CARGO" build --release --quiet
 # then disagree with the running binary about until the next deploy.
 nice -n 19 "$CARGO" test --release --quiet
 
-# sources.yaml and the elevation API's own source list hold the same facts about
-# the same datasets -- which file each reads, under which name, in which order --
-# and they had drifted apart for a month before anyone looked. `check` compares
-# them and fails, so a deploy cannot carry the disagreement into production.
+# The pyramid's sources come from the elevation API's list and everything about
+# them is measured from the rasters, so the only thing that can be wrong here is
+# a cache that has fallen behind the data. `check` re-measures and fails if it
+# has, rather than letting a deploy build against last month's geometry.
 #
 # Fetched first, and the working tree required clean: the list is authoritative
-# from its repository, so comparing against a copy someone edited here would
-# check sources.yaml against a local opinion rather than against the published
-# list. `--elevation-sources` is left at its default, which is this path.
+# from its repository, so a copy edited in place would check the cache against a
+# local opinion rather than against what is published.
 if [ -d "$ELEVATION_SOURCES/.git" ]; then
 	git -C "$ELEVATION_SOURCES" fetch --quiet origin || {
 		echo "ci-deploy: could not fetch the elevation source list" >&2

@@ -115,14 +115,7 @@ pub fn warp_env(g: &Grid, s: &Source, tx: u32, ty: u32, root: &str) -> Result<St
         Nodata::Declared(_) => String::new(),
     };
 
-    // Sources flagged rebuild_vrt are read through our own regenerated VRT,
-    // never the original -- see si, whose upstream VRT declares no nodata and
-    // therefore returns 0 over three neighbouring countries.
-    let src_path = if s.rebuild_vrt {
-        format!("{root}/vrt/{}.vrt", s.id)
-    } else {
-        s.path.clone()
-    };
+    let src_path = s.path.clone();
 
     let mut out = String::new();
     out.push_str(&format!("SRC_ID={}\n", s.id));

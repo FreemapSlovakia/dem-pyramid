@@ -9,8 +9,7 @@ lives on fm6 under `/fm/storage2/dem`.
 ## Layout
 
 ```
-sources.yaml            every DTM source: path, priority, nodata, footprint
-src/                    dem-tool: config validation, drift check, footprints
+src/                    dem-tool: source measurement, staleness check, footprints
 bin/run.sh              deprioritised, logged step runner
 bin/sync.sh             push to fm6 and build there
 ```

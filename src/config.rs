@@ -1,4 +1,9 @@
-//! sources.yaml: model, defaults resolution and validation.
+//! The sources the pyramid is built from, and the grid it is built on.
+//!
+//! Nothing here is authored. The datasets come from the elevation API's source
+//! list, everything about them is measured from the rasters by `refresh`, and
+//! this reads back what it cached. The validation below is what the cache is
+//! held to before anything builds against it.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -38,19 +43,6 @@ pub enum Nodata {
     Declared(String),
 }
 
-impl Nodata {
-    pub fn is_declared(&self) -> bool {
-        matches!(self, Self::Declared(_))
-    }
-
-    pub fn value(&self) -> Option<f64> {
-        match self {
-            Self::Value(v) => Some(*v),
-            Self::Declared(_) => None,
-        }
-    }
-}
-
 impl std::fmt::Display for Nodata {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -69,55 +61,24 @@ pub struct Grid {
     pub coarsest_level: u32,
 }
 
-#[derive(Debug, Deserialize)]
-struct Defaults {
-    resampling: String,
-    finest_level: u32,
-    nodata: Nodata,
-    footprint: FootprintMode,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawSource {
-    id: String,
-    api_name: String,
-    path: String,
-    priority: i64,
-    native_res: f64,
-    crs: String,
-    bbox: [f64; 4],
-    nodata: Option<Nodata>,
-    finest_level: Option<u32>,
-    resampling: Option<String>,
-    footprint: Option<FootprintMode>,
-    fill_nodata_md: Option<u32>,
-    rebuild_vrt: Option<bool>,
-    #[allow(dead_code)]
-    note: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
+/// One dataset the pyramid builds, as `refresh` measured it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Source {
     pub id: String,
+    /// The directory in the elevation source list it came from, so a complaint
+    /// about a value can be traced to something a person can edit.
+    pub dir: String,
     pub api_name: String,
     pub path: String,
     pub priority: i64,
     pub native_res: f64,
-    pub crs: String,
     pub bbox: [f64; 4],
     pub nodata: Nodata,
     pub finest_level: u32,
     pub resampling: String,
     pub footprint: FootprintMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fill_nodata_md: Option<u32>,
-    pub rebuild_vrt: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawDoc {
-    grid: Grid,
-    defaults: Defaults,
-    sources: Vec<RawSource>,
 }
 
 #[derive(Debug, Serialize)]
@@ -126,77 +87,73 @@ pub struct Doc {
     pub sources: Vec<Source>,
 }
 
-pub fn load(path: &Path) -> Result<Doc> {
-    let text =
-        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-    let raw: RawDoc = serde_yaml_ng::from_str(&text)?;
-
-    let mut sources = Vec::with_capacity(raw.sources.len());
+/// Hold the cache to what the build assumes of it.
+///
+/// Measured values can still be wrong together -- two datasets at one
+/// priority, a box with no area -- and every one of these would surface as
+/// something far stranger during a build than a refusal here.
+pub fn validate(sources: &[Source]) -> Result<()> {
     let mut by_id: HashMap<&str, ()> = HashMap::new();
-    let mut by_priority: HashMap<i64, String> = HashMap::new();
+    let mut by_priority: HashMap<i64, &str> = HashMap::new();
 
-    for r in &raw.sources {
-        if by_id.insert(&r.id, ()).is_some() {
-            bail!("duplicate source id: {}", r.id);
+    for s in sources {
+        if by_id.insert(&s.id, ()).is_some() {
+            bail!("duplicate source id: {}", s.id);
         }
-        if let Some(other) = by_priority.insert(r.priority, r.id.clone()) {
+        if let Some(other) = by_priority.insert(s.priority, &s.id) {
             bail!(
                 "duplicate priority {}: {other} and {} -- mosaic order would be \
                  non-deterministic",
-                r.priority,
-                r.id
+                s.priority,
+                s.id
             );
         }
 
-        let [lo_lon, lo_lat, hi_lon, hi_lat] = r.bbox;
+        let [lo_lon, lo_lat, hi_lon, hi_lat] = s.bbox;
         if lo_lon >= hi_lon || lo_lat >= hi_lat {
-            bail!("{}: degenerate bbox {:?}", r.id, r.bbox);
+            bail!("{}: degenerate bbox {:?}", s.id, s.bbox);
         }
-
-        let finest = r.finest_level.unwrap_or(raw.defaults.finest_level);
 
         // A source is never upsampled into a level finer than its own data --
         // that is what keeps z14/z13 sparse and stops GEDTM30 from being blown
         // up 25x into the finest level.
-        let gr = ground_res(finest, 49.0);
-        if gr < r.native_res * 0.75 {
+        let gr = ground_res(s.finest_level, 49.0);
+        if gr < s.native_res * 0.75 {
             bail!(
-                "{}: finest_level {finest} is {gr:.2} m ground at 49N but the \
-                 source is {} m -- that upsamples; raise finest_level",
-                r.id,
-                r.native_res
+                "{}: finest_level {} is {gr:.2} m ground at 49N but the source \
+                 is {} m -- that upsamples",
+                s.id,
+                s.finest_level,
+                s.native_res
             );
         }
-
-        sources.push(Source {
-            id: r.id.clone(),
-            api_name: r.api_name.clone(),
-            path: r.path.clone(),
-            priority: r.priority,
-            native_res: r.native_res,
-            crs: r.crs.clone(),
-            bbox: r.bbox,
-            nodata: r
-                .nodata
-                .clone()
-                .unwrap_or_else(|| raw.defaults.nodata.clone()),
-            finest_level: finest,
-            resampling: r
-                .resampling
-                .clone()
-                .unwrap_or_else(|| raw.defaults.resampling.clone()),
-            footprint: r.footprint.unwrap_or(raw.defaults.footprint),
-            fill_nodata_md: r.fill_nodata_md,
-            rebuild_vrt: r.rebuild_vrt.unwrap_or(false),
-        });
     }
 
+    Ok(())
+}
+
+/// Read what `refresh` measured, newest wins over nothing: a missing cache is
+/// an error naming the command that writes it, because every other failure it
+/// would cause is harder to read than this one.
+pub fn load(path: &Path, grid: Grid) -> Result<Doc> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        anyhow::anyhow!(
+            "{}: {e}\nRun `dem-tool refresh` on the data host to measure the \
+             sources and write it.",
+            path.display()
+        )
+    })?;
+
+    let mut sources: Vec<Source> =
+        serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+
+    // Priority order, so the first box holding a point is the one the mosaic
+    // would take it from.
     sources.sort_by_key(|s| -s.priority);
 
-    Ok(Doc {
-        grid: raw.grid,
-        sources,
-    })
+    validate(&sources)?;
+
+    Ok(Doc { grid, sources })
 }
 
 /// Spherical area of a lon/lat box, km².

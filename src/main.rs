@@ -28,9 +28,29 @@ mod viewshed;
 #[derive(Parser)]
 #[command(about, version)]
 struct Cli {
-    /// Path to sources.yaml (defaults to the one next to the binary's repo).
+    /// Where `refresh` cached what it measured. Defaults to
+    /// `<root>/state/sources.json`.
     #[arg(long, global = true)]
     sources: Option<PathBuf>,
+
+    /// Projection of the pyramid grid.
+    #[arg(long, global = true, default_value = "EPSG:3857")]
+    grid_crs: String,
+
+    /// Tile width at the finest level, pixels. 2^15 spans 313 km at z14, so
+    /// the in-file overview chain reaches z8.
+    #[arg(long, global = true, default_value_t = 32768)]
+    tile_px: u32,
+
+    /// COG block size, pixels.
+    #[arg(long, global = true, default_value_t = 512)]
+    block_px: u32,
+
+    /// Finest and coarsest pyramid levels.
+    #[arg(long, global = true, default_value_t = 14)]
+    finest_level: u32,
+    #[arg(long, global = true, default_value_t = 8)]
+    coarsest_level: u32,
 
     /// Data root on the build host.
     #[arg(
@@ -51,22 +71,19 @@ enum Command {
     List,
     /// Machine-readable dump with defaults resolved.
     Json,
-    /// Measure every source in the elevation list and cache what the build
-    /// needs, then report how it differs from sources.yaml.
+    /// Measure every source the elevation list marks for the pyramid, and
+    /// cache what the build needs.
     Refresh {
         #[arg(long, env = "ELEVATION_SOURCES_DIR", default_value = credit::DEFAULT_DIR)]
         elevation_sources: PathBuf,
     },
-    /// Re-measure every source, and compare sources.yaml with the elevation
-    /// API's source list. Fails on any drift.
+    /// Re-measure every source and fail if the cache has fallen behind.
     Check {
-        /// The elevation API's source list, which sources.yaml is compared
-        /// against. A checkout of FreemapSlovakia/elevation-sources.
+        /// The elevation API's source list: a checkout of
+        /// FreemapSlovakia/elevation-sources.
         #[arg(long, env = "ELEVATION_SOURCES_DIR", default_value = credit::DEFAULT_DIR)]
         elevation_sources: PathBuf,
     },
-    /// Regenerate the ELEVATION_SOURCES value for freemap.conf.
-    ElevationSources,
     /// Build a coverage footprint per source.
     Footprints {
         /// Comma-separated source ids; default is all.
@@ -268,22 +285,31 @@ fn find<'a>(doc: &'a config::Doc, id: &str) -> anyhow::Result<&'a config::Source
         .ok_or_else(|| anyhow::anyhow!("unknown source id: {id}"))
 }
 
-fn default_sources() -> PathBuf {
-    // Alongside the executable's repo root when run from the build dir, else
-    // the current directory.
-    let cwd = std::env::current_dir()
-        .unwrap_or_default()
-        .join("sources.yaml");
-    if cwd.exists() {
-        return cwd;
-    }
-    PathBuf::from("sources.yaml")
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let path = cli.sources.unwrap_or_else(default_sources);
-    let doc = config::load(&path)?;
+
+    let grid = config::Grid {
+        crs: cli.grid_crs.clone(),
+        tile_px: cli.tile_px,
+        block_px: cli.block_px,
+        finest_level: cli.finest_level,
+        coarsest_level: cli.coarsest_level,
+    };
+
+    let cache = cli
+        .sources
+        .clone()
+        .unwrap_or_else(|| refresh::cache_path(&cli.root));
+
+    // `refresh` writes the cache, so it cannot require one.
+    let doc = if matches!(cli.command, Command::Refresh { .. }) {
+        config::Doc {
+            grid,
+            sources: Vec::new(),
+        }
+    } else {
+        config::load(&cache, grid)?
+    };
 
     match cli.command {
         Command::List => {
@@ -317,33 +343,42 @@ fn main() -> Result<()> {
             let (derived, failed) =
                 refresh::derive_all(&entries, doc.grid.coarsest_level, doc.grid.finest_level);
 
+            config::validate(&derived)?;
+            credit::check_attributions(
+                &config::Doc {
+                    grid: config::Grid {
+                        crs: cli.grid_crs.clone(),
+                        tile_px: cli.tile_px,
+                        block_px: cli.block_px,
+                        finest_level: cli.finest_level,
+                        coarsest_level: cli.coarsest_level,
+                    },
+                    sources: derived.clone(),
+                },
+                &entries,
+            )?;
+
             refresh::write(&cli.root, &derived)?;
 
+            for s in &derived {
+                println!(
+                    "ok   {:14} {:>8.2} m  z{:<3} {:9} {}",
+                    s.id, s.native_res, s.finest_level, s.resampling, s.path
+                );
+            }
+
             println!(
-                "measured {} of {} datasets -> {}\n",
+                "\n{} of {} datasets measured into {}",
                 derived.len(),
                 entries.len(),
                 refresh::cache_path(&cli.root).display()
             );
 
-            let differences = refresh::compare(&doc, &derived);
-
-            println!("\n{failed} unreadable, {differences} difference(s) from sources.yaml");
+            if failed > 0 {
+                anyhow::bail!("{failed} dataset(s) could not be read");
+            }
         }
         Command::Check { elevation_sources } => check::run(&doc, &elevation_sources)?,
-        Command::ElevationSources => {
-            // freemap-v3-api is FIRST wins, so walk priority descending -- the
-            // opposite of gdalbuildvrt's LAST wins.
-            let lines: Vec<String> = doc
-                .sources
-                .iter()
-                .map(|s| {
-                    let [a, b, c, d] = s.bbox;
-                    format!("{}:{}:{a},{b},{c},{d}", s.api_name, s.path)
-                })
-                .collect();
-            println!("ELEVATION_SOURCES=\"{}\"", lines.join(";\n"));
-        }
         Command::Footprints { only } => {
             footprints::run(&doc, &cli.root, only.as_deref())?;
         }

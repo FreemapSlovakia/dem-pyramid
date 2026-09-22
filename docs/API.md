@@ -559,8 +559,8 @@ GEDTM30 answers much of the area the national boxes overstate. Sources are
 compared by their declared lon/lat box, which bounds where one *could*
 contribute, so the list errs towards naming a model that contributed nothing.
 
-The credit lines are not `sources.yaml`'s. They are read at startup from the
-elevation API's own source tree (`--elevation-sources`, default
+The credit lines are not this service's. They are read at startup from the
+elevation API's own source list (`--elevation-sources`, default
 `/fm/storage1/backend.freemap.sk-data/elevation-sources`), whose `source.json`
 `name` is the `api_name` here — one model, one credit, written once, and a
 dataset gained there is credited here without a release. Several datasets share

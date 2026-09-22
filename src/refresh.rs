@@ -11,10 +11,9 @@
 //! than edited, and `check` fails when it no longer matches the data.
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::config::{FootprintMode, Nodata, ground_res};
+use crate::config::{FootprintMode, Nodata, Source, ground_res};
 use crate::credit::Entry;
 use crate::gdal_cli;
 
@@ -31,29 +30,6 @@ const UPSAMPLE_SLACK: f64 = 0.75;
 /// Far enough to bridge single pixels lost to a sentinel that collides with
 /// real terrain, short enough to leave genuine coverage gaps alone.
 pub const FILL_NODATA_MD: u32 = 5;
-
-/// Everything the build needs about one source, all of it derived.
-///
-/// No CRS: a VRT carries its own, `parse_vrt` already reads it, and a
-/// single-file source takes the `bbox` footprint, which needs none. Declaring
-/// one only created something to disagree with the file about.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Derived {
-    pub id: String,
-    /// The directory it came from, so a disagreement can be traced back.
-    pub dir: String,
-    pub api_name: String,
-    pub path: String,
-    pub priority: i64,
-    pub native_res: f64,
-    pub nodata: Nodata,
-    pub bbox: [f64; 4],
-    pub finest_level: u32,
-    pub resampling: String,
-    pub footprint: FootprintMode,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fill_nodata_md: Option<u32>,
-}
 
 /// `010-sk` -> `sk`, `090-es-29` -> `es_29`.
 ///
@@ -153,7 +129,7 @@ fn native_res_of(info: &serde_json::Value, path: &str) -> Result<f64> {
 }
 
 /// Measure one source.
-pub fn derive(entry: &Entry, coarsest: u32, finest: u32) -> Result<Derived> {
+pub fn derive(entry: &Entry, coarsest: u32, finest: u32) -> Result<Source> {
     let info = gdal_cli::info_json(&entry.file)
         .with_context(|| format!("{}: reading {}", entry.dir, entry.file))?;
 
@@ -161,7 +137,7 @@ pub fn derive(entry: &Entry, coarsest: u32, finest: u32) -> Result<Derived> {
     let finest_level = finest_level_of(native_res, coarsest, finest);
     let declared = info["bands"][0]["noDataValue"].as_f64();
 
-    Ok(Derived {
+    Ok(Source {
         id: id_of(&entry.dir),
         dir: entry.dir.clone(),
         api_name: entry.name.clone(),
@@ -188,11 +164,11 @@ pub fn cache_path(root: &Path) -> std::path::PathBuf {
 
 /// Measure every dataset in the source list, reporting failures rather than
 /// stopping at the first.
-pub fn derive_all(entries: &[Entry], coarsest: u32, finest: u32) -> (Vec<Derived>, usize) {
+pub fn derive_all(entries: &[Entry], coarsest: u32, finest: u32) -> (Vec<Source>, usize) {
     let mut out = Vec::new();
     let mut failed = 0usize;
 
-    for entry in entries {
+    for entry in entries.iter().filter(|e| e.pyramid) {
         match derive(entry, coarsest, finest) {
             Ok(d) => out.push(d),
             Err(e) => {
@@ -207,7 +183,7 @@ pub fn derive_all(entries: &[Entry], coarsest: u32, finest: u32) -> (Vec<Derived
     (out, failed)
 }
 
-pub fn write(root: &Path, derived: &[Derived]) -> Result<()> {
+pub fn write(root: &Path, derived: &[Source]) -> Result<()> {
     let path = cache_path(root);
 
     std::fs::create_dir_all(path.parent().context("no parent")?)?;
@@ -218,111 +194,6 @@ pub fn write(root: &Path, derived: &[Derived]) -> Result<()> {
     std::fs::rename(&tmp, &path)?;
 
     Ok(())
-}
-
-/// Hold the derived values against what sources.yaml declares today.
-///
-/// This is the proof that the derivation is right before anything starts
-/// depending on it: every difference is either a bug here or a value that was
-/// wrong there, and each one has to be accounted for by hand.
-pub fn compare(doc: &crate::config::Doc, derived: &[Derived]) -> usize {
-    let mut differences = 0usize;
-
-    for source in &doc.sources {
-        let Some(d) = derived.iter().find(|d| d.path == source.path) else {
-            println!(
-                "MISS {}: no dataset in the source list reads {}",
-                source.id, source.path
-            );
-            differences += 1;
-            continue;
-        };
-
-        let mut note = |what: &str, was: String, now: String| {
-            println!(
-                "diff {:14} {what:12} declared {was:28} derived {now}",
-                source.id
-            );
-            differences += 1;
-        };
-
-        if d.id != source.id {
-            note("id", source.id.clone(), d.id.clone());
-        }
-        if (d.native_res - source.native_res).abs() > 0.05 * source.native_res {
-            note(
-                "native_res",
-                format!("{:.3}", source.native_res),
-                format!("{:.3}", d.native_res),
-            );
-        }
-        if d.finest_level != source.finest_level {
-            note(
-                "finest_level",
-                source.finest_level.to_string(),
-                d.finest_level.to_string(),
-            );
-        }
-        if d.resampling != source.resampling {
-            note(
-                "resampling",
-                source.resampling.clone(),
-                d.resampling.clone(),
-            );
-        }
-        if d.footprint != source.footprint {
-            note(
-                "footprint",
-                format!("{:?}", source.footprint),
-                format!("{:?}", d.footprint),
-            );
-        }
-        if d.fill_nodata_md != source.fill_nodata_md {
-            note(
-                "fill_nodata",
-                format!("{:?}", source.fill_nodata_md),
-                format!("{:?}", d.fill_nodata_md),
-            );
-        }
-
-        // Only a box that is TIGHTER than the data matters: it excludes ground
-        // the source covers. Looser is the direction everything here errs in.
-        let [w, s, e, n] = source.bbox;
-        let [dw, ds, de, dn] = d.bbox;
-        let km = 111.32 * ((s + n) / 2.0).to_radians().cos();
-        let clipped = [
-            (w - dw) * km,
-            (s - ds) * 111.32,
-            (de - e) * km,
-            (dn - n) * 111.32,
-        ];
-
-        if clipped.iter().any(|&k| k > 1.0) {
-            let [cw, cs, ce, cn] = clipped;
-            println!(
-                "CLIP {:14} declared box excludes data: W{cw:+.0} S{cs:+.0} E{ce:+.0} N{cn:+.0} km",
-                source.id
-            );
-            differences += 1;
-        }
-    }
-
-    // The orders have to agree, whatever the numbers are.
-    let mut by_declared: Vec<&str> = doc.sources.iter().map(|s| s.path.as_str()).collect();
-    let mut by_derived: Vec<&str> = derived
-        .iter()
-        .filter(|d| doc.sources.iter().any(|s| s.path == d.path))
-        .map(|d| d.path.as_str())
-        .collect();
-    by_derived.dedup();
-    by_declared.dedup();
-
-    if by_declared != by_derived {
-        println!("diff precedence order disagrees with the source list");
-        differences += 1;
-    }
-
-    differences
 }
 
 #[cfg(test)]
