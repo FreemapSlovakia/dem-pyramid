@@ -11,6 +11,7 @@ use std::path::PathBuf;
 mod avif;
 mod check;
 mod config;
+mod credit;
 mod footprints;
 mod gdal_cli;
 mod gradient;
@@ -91,6 +92,14 @@ enum Command {
         /// GeoPackage of candidate peaks.
         #[arg(long)]
         peaks: Option<PathBuf>,
+        /// The elevation API's source tree, which is where every model's
+        /// credit line lives. Serving refuses to start if a source has none.
+        #[arg(
+            long,
+            env = "ELEVATION_SOURCES_DIR",
+            default_value = "/fm/storage1/backend.freemap.sk-data/elevation-sources"
+        )]
+        elevation_sources: PathBuf,
     },
     /// Render a panorama from a viewpoint.
     Panorama {
@@ -596,9 +605,16 @@ fn main() -> Result<()> {
         Command::Serve {
             listen,
             peaks: peaks_file,
+            elevation_sources,
         } => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(server::serve(cli.root.clone(), doc, peaks_file, &listen))?;
+            rt.block_on(server::serve(
+                cli.root.clone(),
+                doc,
+                &elevation_sources,
+                peaks_file,
+                &listen,
+            ))?;
         }
         Command::IndexPlan { level } => {
             let root = cli.root.to_str().context("non-utf8 root")?;

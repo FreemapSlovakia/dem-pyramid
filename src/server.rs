@@ -29,7 +29,7 @@ use crate::config::Doc;
 use crate::panorama::Cancel;
 use crate::progress::{Job, Jobs, Phase, Registration};
 use crate::queue::{Queue, Rejected};
-use crate::{avif, panorama, peaks, viewshed};
+use crate::{avif, credit, panorama, peaks, viewshed};
 
 /// Caps on what a single request may cost. Not entitlement -- that belongs to
 /// the caller -- just a bound on how much work one request can demand.
@@ -294,6 +294,9 @@ fn d_dither() -> f64 {
 pub struct Ctx {
     root: PathBuf,
     doc: Arc<Doc>,
+    /// Read once at startup from the elevation API's source tree, not from
+    /// `sources.yaml`; `serve` refuses to start if a source has none.
+    credits: Arc<credit::Credits>,
     peaks_file: Option<PathBuf>,
     /// One render at a time: a single render already saturates nine cores, so
     /// overlapping them trades latency for nothing. Priority-ordered, so a
@@ -320,12 +323,18 @@ fn job_for(jobs: &Jobs, headers: &header::HeaderMap) -> (Option<Arc<Job>>, Optio
 pub async fn serve(
     root: PathBuf,
     doc: Doc,
+    elevation_sources: &std::path::Path,
     peaks_file: Option<PathBuf>,
     listen: &str,
 ) -> Result<()> {
+    let credits = credit::load_credits(elevation_sources)?;
+
+    credit::check_credits(&doc, &credits)?;
+
     let ctx = Ctx {
         root,
         doc: Arc::new(doc),
+        credits: Arc::new(credits),
         peaks_file,
         queue: Queue::new(),
         jobs: Jobs::new(),
@@ -685,6 +694,7 @@ async fn panorama_route(
     let peaks_file = ctx.peaks_file.clone();
     let root = ctx.root.clone();
     let doc = ctx.doc.clone();
+    let credits = ctx.credits.clone();
     // Compiled here, before a render slot is taken, so a bad formula costs the
     // caller a 400 rather than costing everyone twenty seconds of queue.
     let rank = match &req.peak_rank {
@@ -736,6 +746,16 @@ async fn panorama_route(
             },
         );
 
+        let seen = credit::sources_seen(
+            &doc,
+            &credits,
+            p.lon,
+            p.lat,
+            p.max_range,
+            p.az_start,
+            p.az_span,
+        );
+
         let meta = serde_json::json!({
             "width": stats.width,
             "height": stats.height,
@@ -756,6 +776,9 @@ async fn panorama_route(
             // one palette across a pan pins the number it gets here.
             "far_distance": stats.far_distance,
             "samples": stats.samples,
+            // The terrain models behind this view, each with its own credit, so
+            // a client names what answered rather than the whole catalogue.
+            "sources": seen,
             "depth": req.depth.then(|| serde_json::json!({
                 "encoding": "u16-le log, row delta-coded, gzip",
                 "near_m": panorama::DEPTH_NEAR,
@@ -926,6 +949,7 @@ async fn viewshed_route(
     };
 
     let (root, doc) = (ctx.root.clone(), ctx.doc.clone());
+    let credits = ctx.credits.clone();
     let work = cancel.clone();
     let built = tokio::task::spawn_blocking(move || -> Result<Vec<Part>> {
         let _permit = permit;
@@ -937,6 +961,8 @@ async fn viewshed_route(
         if let Some(job) = &job {
             job.set_phase(Phase::Encoding);
         }
+
+        let seen = credit::sources_seen(&doc, &credits, p.lon, p.lat, p.radius, 0.0, 360.0);
 
         let meta = serde_json::json!({
             "width": out.image.width(),
@@ -950,6 +976,7 @@ async fn viewshed_route(
             "target_height": p.target_height,
             "rays": out.rays,
             "samples": out.samples,
+            "sources": seen,
         });
 
         let mut png = std::io::Cursor::new(Vec::new());

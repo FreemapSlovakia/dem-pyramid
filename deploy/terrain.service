@@ -10,14 +10,23 @@
 Description=Freemap terrain service (panorama, later viewshed and shadows)
 After=network.target
 
+# Startup reads the elevation API's source tree for the credit lines and
+# refuses to serve without them, so a boot that wins the race against either
+# mount would crash-loop under Restart=on-failure until someone noticed.
+RequiresMountsFor=/fm/storage2 /fm/storage1
+
 [Service]
 Type=simple
 User=martin
 WorkingDirectory=/fm/storage2/dem/build
+# --elevation-sources is the compiled default, spelled out because it is the
+# one path here that lives outside this service's own tree: it belongs to the
+# elevation API, and a rename there stops this service starting.
 ExecStart=/fm/storage2/dem/build/target/release/dem-tool serve \
     --root /fm/storage2/dem \
     --listen 127.0.0.1:3100 \
-    --peaks /fm/storage2/dem/peaks.gpkg
+    --peaks /fm/storage2/dem/peaks.gpkg \
+    --elevation-sources /fm/storage1/backend.freemap.sk-data/elevation-sources
 
 # Loopback only; nginx is the only thing that should reach it.
 Environment=GDAL_CACHEMAX=1024
