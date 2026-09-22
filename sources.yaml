@@ -246,7 +246,7 @@ sources:
   - id: be
     api_name: be
     path: /fm/storage1/dtm/be/be.vrt
-    priority: 168
+    priority: 165
     native_res: 1.0
     crs: EPSG:3812 # Belgian Lambert 2008 -- WKT carries no authority code
     nodata: declared # -9999
@@ -260,7 +260,7 @@ sources:
 
   - id: lu
     api_name: lu
-    path: /fm/storage1/dtm/lu/lu.vrt
+    path: /fm/storage1/dtm/lu/luxembourg_dem_1m.tif
     priority: 167
     native_res: 1.0
     crs: EPSG:2169 # LUREF / Luxembourg TM -- northing-first, no authority code
@@ -275,7 +275,7 @@ sources:
   - id: it
     api_name: it
     path: /fm/storage1/dtm/it/it.tif
-    priority: 165
+    priority: 168
     native_res: 5.0
     crs: EPSG:6875
     nodata: declared # -9999
@@ -285,7 +285,7 @@ sources:
   - id: en
     api_name: en
     path: /fm/storage2/dtm/en/en.vrt
-    priority: 160
+    priority: 166
     native_res: 1.0
     crs: EPSG:27700 # OSGB36 -- datum shift matters, keep the authority code
     nodata: declared # -9999
