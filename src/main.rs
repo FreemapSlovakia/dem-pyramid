@@ -21,6 +21,7 @@ mod peaks;
 mod progress;
 mod queue;
 mod rank;
+mod refresh;
 mod server;
 mod viewshed;
 
@@ -50,6 +51,12 @@ enum Command {
     List,
     /// Machine-readable dump with defaults resolved.
     Json,
+    /// Measure every source in the elevation list and cache what the build
+    /// needs, then report how it differs from sources.yaml.
+    Refresh {
+        #[arg(long, env = "ELEVATION_SOURCES_DIR", default_value = credit::DEFAULT_DIR)]
+        elevation_sources: PathBuf,
+    },
     /// Re-measure every source, and compare sources.yaml with the elevation
     /// API's source list. Fails on any drift.
     Check {
@@ -304,6 +311,24 @@ fn main() -> Result<()> {
         Command::Json => {
             serde_json::to_writer_pretty(std::io::stdout(), &doc)?;
             println!();
+        }
+        Command::Refresh { elevation_sources } => {
+            let entries = credit::load_entries(&elevation_sources)?;
+            let (derived, failed) =
+                refresh::derive_all(&entries, doc.grid.coarsest_level, doc.grid.finest_level);
+
+            refresh::write(&cli.root, &derived)?;
+
+            println!(
+                "measured {} of {} datasets -> {}\n",
+                derived.len(),
+                entries.len(),
+                refresh::cache_path(&cli.root).display()
+            );
+
+            let differences = refresh::compare(&doc, &derived);
+
+            println!("\n{failed} unreadable, {differences} difference(s) from sources.yaml");
         }
         Command::Check { elevation_sources } => check::run(&doc, &elevation_sources)?,
         Command::ElevationSources => {
