@@ -295,7 +295,8 @@ pub struct Ctx {
     root: PathBuf,
     doc: Arc<Doc>,
     /// Read once at startup from the elevation API's source tree, not from
-    /// `sources.yaml`; `serve` refuses to start if a source has none.
+    /// `sources.yaml`; `serve` refuses to start unless every source it
+    /// serves is named there, with a credit.
     credits: Arc<credit::Credits>,
     peaks_file: Option<PathBuf>,
     /// One render at a time: a single render already saturates nine cores, so
@@ -327,9 +328,11 @@ pub async fn serve(
     peaks_file: Option<PathBuf>,
     listen: &str,
 ) -> Result<()> {
-    let credits = credit::load_credits(elevation_sources)?;
+    let entries = credit::load_entries(elevation_sources)?;
 
-    credit::check_credits(&doc, &credits)?;
+    credit::check_attributions(&doc, &entries)?;
+
+    let credits = credit::credits_of(&entries);
 
     let ctx = Ctx {
         root,

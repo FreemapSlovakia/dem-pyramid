@@ -50,8 +50,14 @@ enum Command {
     List,
     /// Machine-readable dump with defaults resolved.
     Json,
-    /// Re-measure every source with GDAL and fail on drift.
-    Check,
+    /// Re-measure every source, and compare sources.yaml with the elevation
+    /// API's source list. Fails on any drift.
+    Check {
+        /// The elevation API's source list, which sources.yaml is compared
+        /// against. A checkout of FreemapSlovakia/elevation-sources.
+        #[arg(long, env = "ELEVATION_SOURCES_DIR", default_value = credit::DEFAULT_DIR)]
+        elevation_sources: PathBuf,
+    },
     /// Regenerate the ELEVATION_SOURCES value for freemap.conf.
     ElevationSources,
     /// Build a coverage footprint per source.
@@ -93,12 +99,9 @@ enum Command {
         #[arg(long)]
         peaks: Option<PathBuf>,
         /// The elevation API's source tree, which is where every model's
-        /// credit line lives. Serving refuses to start if a source has none.
-        #[arg(
-            long,
-            env = "ELEVATION_SOURCES_DIR",
-            default_value = "/fm/storage1/backend.freemap.sk-data/elevation-sources"
-        )]
+        /// credit line lives. Serving refuses to start unless every source
+        /// it serves is named there, with a credit.
+        #[arg(long, env = "ELEVATION_SOURCES_DIR", default_value = credit::DEFAULT_DIR)]
         elevation_sources: PathBuf,
     },
     /// Render a panorama from a viewpoint.
@@ -302,7 +305,7 @@ fn main() -> Result<()> {
             serde_json::to_writer_pretty(std::io::stdout(), &doc)?;
             println!();
         }
-        Command::Check => check::run(&doc)?,
+        Command::Check { elevation_sources } => check::run(&doc, &elevation_sources)?,
         Command::ElevationSources => {
             // freemap-v3-api is FIRST wins, so walk priority descending -- the
             // opposite of gdalbuildvrt's LAST wins.

@@ -62,60 +62,125 @@ pub struct Attribution {
 /// Credit lines by `api_name`.
 pub type Credits = HashMap<String, Vec<Attribution>>;
 
-/// Only the two fields this reads; the rest of `source.json` is the elevation
+/// Where the elevation API keeps its source list. Both `serve` and `check`
+/// default to it, so they cannot end up reading different trees.
+pub const DEFAULT_DIR: &str = "/fm/storage1/backend.freemap.sk-data/elevation-sources";
+
+/// The fields this reads; anything else in `source.json` is the elevation
 /// API's business.
 #[derive(Deserialize)]
 struct SourceJson {
     name: String,
+    /// Absent only in a malformed entry; `check` reports it rather than
+    /// refusing to serve over it.
+    #[serde(default)]
+    file: String,
     #[serde(default)]
     attributions: Vec<Attribution>,
 }
 
+/// One dataset in the elevation API's list.
+pub struct Entry {
+    /// The directory, `NNN-slug`. The numeric prefix is the precedence: the
+    /// first entry covering a point answers for it, so sorting by this sorts
+    /// most authoritative first.
+    pub dir: String,
+    /// The model this dataset belongs to; several entries share one.
+    pub name: String,
+    /// The raster, absolute, as GDAL opens it.
+    pub file: String,
+    pub attributions: Vec<Attribution>,
+}
+
 /// Reads the elevation API's source tree: one subdirectory per dataset, each
-/// with a `source.json`. Several datasets share a `name` -- Spain is four, and
-/// France seven -- so their credits are merged under it, deduped.
+/// with a `source.json`. Sorted by directory, which is precedence order.
 ///
 /// Anything without a `source.json` is skipped, the same way the elevation API
-/// skips it; a malformed one is an error, because a silently uncredited model
-/// is a licence breach.
-pub fn load_credits(dir: &Path) -> Result<Credits> {
-    let mut credits: Credits = HashMap::new();
+/// skips it -- which is what keeps `.git` and `README.md` out of the way now
+/// that the tree is a checkout. A malformed one is an error, because a
+/// silently uncredited model is a licence breach.
+pub fn load_entries(dir: &Path) -> Result<Vec<Entry>> {
+    let mut entries = Vec::new();
 
     for entry in
         std::fs::read_dir(dir).with_context(|| format!("elevation sources: {}", dir.display()))?
     {
-        let path = entry?.path().join("source.json");
+        let subdir = entry?.path();
+        let path = subdir.join("source.json");
 
         if !path.exists() {
             continue;
         }
 
-        let text = std::fs::read_to_string(&path)?;
+        let text = std::fs::read_to_string(&path).with_context(|| format!("{}", path.display()))?;
 
         let parsed: SourceJson = serde_json::from_str(&text)
             .with_context(|| format!("{}: not a source.json", path.display()))?;
 
-        let into = credits.entry(parsed.name).or_default();
+        entries.push(Entry {
+            dir: subdir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            name: parsed.name,
+            file: parsed.file,
+            attributions: parsed.attributions,
+        });
+    }
 
-        for attr in parsed.attributions {
-            if !into.contains(&attr) {
-                into.push(attr);
+    entries.sort_by(|a, b| a.dir.cmp(&b.dir));
+
+    Ok(entries)
+}
+
+/// Credit lines by `api_name`. Several datasets share a name -- Spain is four,
+/// France seven and Sonny fourteen -- so their credits merge under it, deduped.
+pub fn credits_of(entries: &[Entry]) -> Credits {
+    let mut credits: Credits = HashMap::new();
+
+    for entry in entries {
+        let into = credits.entry(entry.name.clone()).or_default();
+
+        for attr in &entry.attributions {
+            if !into.contains(attr) {
+                into.push(attr.clone());
             }
         }
     }
 
-    Ok(credits)
+    credits
 }
 
-/// Fails unless every source the pyramid serves has a credit to show for it.
-pub fn check_credits(doc: &Doc, credits: &Credits) -> Result<()> {
+/// Fails unless every source the pyramid serves is named in the elevation
+/// API's list, under the model it is reported as, with a credit to show.
+///
+/// Keyed on the file rather than the `api_name`, because a name is a model and
+/// several datasets share one: a new DTM added under a name that is already
+/// credited would otherwise inherit another dataset's licence line and be
+/// served confidently miscredited, which is worse than being uncredited.
+pub fn check_attributions(doc: &Doc, entries: &[Entry]) -> Result<()> {
     for source in &doc.sources {
-        if credits.get(&source.api_name).is_none_or(Vec::is_empty) {
+        let Some(entry) = entries.iter().find(|e| e.file == source.path) else {
             bail!(
-                "{}: no credit for api_name {} in the elevation sources",
+                "{}: {} is in no source.json, so nothing says how to credit it",
                 source.id,
-                source.api_name
+                source.path
             );
+        };
+
+        if entry.name != source.api_name {
+            bail!(
+                "{}: reported as {} here but named {} in {}",
+                source.id,
+                source.api_name,
+                entry.name,
+                entry.dir
+            );
+        }
+
+        if entry.attributions.is_empty() {
+            bail!("{}: {} carries no attribution", source.id, entry.dir);
         }
     }
 
@@ -481,23 +546,47 @@ mod tests {
         assert!(sources_seen(&empty, &credits, 18.0, 48.0, 300_000.0, 0.0, 360.0).is_empty());
     }
 
+    fn entry(dir: &str, name: &str, file: &str, credited: bool) -> Entry {
+        Entry {
+            dir: dir.into(),
+            name: name.into(),
+            file: file.into(),
+            attributions: if credited {
+                vec![Attribution {
+                    name: "DMR 5.0: ÚGKK SR".into(),
+                    url: None,
+                }]
+            } else {
+                vec![]
+            },
+        }
+    }
+
+    /// A model with nothing to credit it with must not be served.
     #[test]
     fn a_source_with_no_credit_refuses_to_serve() {
         let doc = doc(vec![source("sk", "sk", 230, [16.8, 47.7, 22.6, 49.7])]);
 
-        assert!(check_credits(&doc, &Credits::new()).is_err());
+        assert!(check_attributions(&doc, &[]).is_err());
+        assert!(check_attributions(&doc, &[entry("010-sk", "sk", "", false)]).is_err());
+        assert!(check_attributions(&doc, &[entry("010-sk", "sk", "", true)]).is_ok());
+    }
 
-        let mut credits = Credits::new();
-        credits.insert("sk".into(), vec![]);
-        assert!(check_credits(&doc, &credits).is_err());
+    /// A new dataset under a name that is already credited must not inherit
+    /// the other dataset's licence line. Keyed on the file, so it does not.
+    #[test]
+    fn a_dataset_missing_from_the_list_is_refused_even_under_a_credited_name() {
+        let mut de_by = source("de_by", "de", 100, [9.0, 47.0, 14.0, 51.0]);
+        de_by.path = "/dtm/de_by/all.vrt".into();
 
-        credits.insert(
-            "sk".into(),
-            vec![Attribution {
-                name: "DMR 5.0: ÚGKK SR".into(),
-                url: None,
-            }],
-        );
-        assert!(check_credits(&doc, &credits).is_ok());
+        let mut de_nw = source("de_nw", "de", 99, [5.8, 50.3, 9.5, 52.6]);
+        de_nw.path = "/dtm/de_nw/all.vrt".into();
+
+        let list = [entry("245-de_by", "de", "/dtm/de_by/all.vrt", true)];
+
+        assert!(check_attributions(&doc(vec![de_by.clone()]), &list).is_ok());
+
+        // de_nw is not in the list, though "de" is credited because of de_by.
+        assert!(check_attributions(&doc(vec![de_by, de_nw]), &list).is_err());
     }
 }

@@ -1,16 +1,23 @@
-# Single source of truth for every DTM source feeding the elevation pyramid.
+# How the elevation pyramid is built from every DTM source feeding it.
 #
-# Adding a source = one entry here + `bin/sources.py check` + a Layer A build
-# for that id alone. Nothing else is rebuilt.
+# Not the only place these sources are described. Which file each one reads, the
+# model it is reported under, and the order they are tried in belong to the
+# elevation API's own list -- github.com/FreemapSlovakia/elevation-sources,
+# checked out on the serving host -- and are repeated here only so the build can
+# run without it. `dem-tool check` compares the two and fails on any
+# disagreement, so change the list first and follow it here. Everything else
+# below is the pyramid's own business and lives nowhere else.
 #
-# Derived from /etc/freemap.conf ELEVATION_SOURCES on fm6 (2026-08-20), with
-# every value re-measured with gdalinfo rather than copied. `bin/sources.py
-# check` re-verifies against the files and fails on drift.
+# Adding a source = an entry in that list + one entry here + `dem-tool check` +
+# a Layer A build for that id alone. Nothing else is rebuilt.
+#
+# Every value here is measured with gdalinfo rather than copied; `dem-tool
+# check` re-measures and fails on drift.
 #
 # priority: higher wins in the mosaic. NOTE the two opposite conventions:
 #   - freemap-v3-api ELEVATION_SOURCES is FIRST wins  -> emit in priority DESC
 #   - gdalbuildvrt is LAST wins                       -> emit in priority ASC
-#   `bin/sources.py elevation-sources` handles the reversal; do not hand-edit.
+#   `dem-tool elevation-sources` handles the reversal; do not hand-edit.
 #
 # native_res: metres, from the source geotransform (informational; drives
 #   finest_level). Web-Mercator ground resolution at 49N is 102700 / 2^z, so

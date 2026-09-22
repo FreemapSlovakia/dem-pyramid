@@ -69,6 +69,10 @@ CARGO="${CARGO:-$HOME/.cargo/bin/cargo}"
 # reset and clean cannot take it.
 LAST_GOOD="${LAST_GOOD:-/fm/storage2/dem/state/last-good-deploy}"
 
+# Read by `dem-tool check` and by the service; a checkout of
+# github.com/FreemapSlovakia/elevation-sources.
+ELEVATION_SOURCES="${ELEVATION_SOURCES:-/fm/storage1/backend.freemap.sk-data/elevation-sources}"
+
 # Under `command=` the argument arrives here instead of in "$@".
 sha="${1:-${SSH_ORIGINAL_COMMAND:-}}"
 
@@ -112,6 +116,39 @@ nice -n 19 "$CARGO" build --release --quiet
 # running -- with the checkout already moved, which `git rev-parse HEAD` will
 # then disagree with the running binary about until the next deploy.
 nice -n 19 "$CARGO" test --release --quiet
+
+# sources.yaml and the elevation API's own source list hold the same facts about
+# the same datasets -- which file each reads, under which name, in which order --
+# and they had drifted apart for a month before anyone looked. `check` compares
+# them and fails, so a deploy cannot carry the disagreement into production.
+#
+# Fetched first, and the working tree required clean: the list is authoritative
+# from its repository, so comparing against a copy someone edited here would
+# check sources.yaml against a local opinion rather than against the published
+# list. `--elevation-sources` is left at its default, which is this path.
+if [ -d "$ELEVATION_SOURCES/.git" ]; then
+	git -C "$ELEVATION_SOURCES" fetch --quiet origin || {
+		echo "ci-deploy: could not fetch the elevation source list" >&2
+		exit 1
+	}
+	if [ -n "$(git -C "$ELEVATION_SOURCES" status --porcelain)" ]; then
+		echo "ci-deploy: $ELEVATION_SOURCES has uncommitted changes -- commit and" >&2
+		echo "           push them, or check them out again; it is a deployed" >&2
+		echo "           artifact, not a scratch directory" >&2
+		exit 1
+	fi
+	if [ "$(git -C "$ELEVATION_SOURCES" rev-parse HEAD)" \
+	     != "$(git -C "$ELEVATION_SOURCES" rev-parse origin/main)" ]; then
+		echo "ci-deploy: $ELEVATION_SOURCES is not at origin/main" >&2
+		exit 1
+	fi
+else
+	echo "ci-deploy: $ELEVATION_SOURCES is not a checkout -- clone" >&2
+	echo "           https://github.com/FreemapSlovakia/elevation-sources there" >&2
+	exit 1
+fi
+
+./target/release/dem-tool check
 
 # Every step that must not be skipped says `|| return 1` rather than leaning on
 # `set -e`: bash suppresses errexit inside a function called from an `&&` chain,

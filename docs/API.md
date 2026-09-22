@@ -565,7 +565,10 @@ elevation API's own source tree (`--elevation-sources`, default
 `name` is the `api_name` here — one model, one credit, written once, and a
 dataset gained there is credited here without a release. Several datasets share
 a name (Spain is four, France seven) and their credits merge under it. Serving
-refuses to start if any source has no credit.
+refuses to start unless every source it serves is named in that list, under
+the model it is reported as, with a credit. Matched on the file rather than the
+name, so a dataset added under a name that is already credited cannot inherit
+another dataset's licence line.
 
 ### Peaks
 
