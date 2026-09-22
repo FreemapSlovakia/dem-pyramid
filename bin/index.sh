@@ -16,7 +16,7 @@
 set -euo pipefail
 
 DEM_ROOT="${DEM_ROOT:-/fm/storage2/dem}"
-TOOL="$DEM_ROOT/build/target/release/dem-tool"
+TOOL="${TOOL:-$DEM_ROOT/build/target/release/dem-tool}"
 
 levels=("$@")
 if [ ${#levels[@]} -eq 0 ]; then

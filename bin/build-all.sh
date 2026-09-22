@@ -19,8 +19,13 @@
 set -euo pipefail
 
 DEM_ROOT="${DEM_ROOT:-/fm/storage2/dem}"
-TOOL="$DEM_ROOT/build/target/release/dem-tool"
-cd "$DEM_ROOT/build"
+TOOL="${TOOL:-$DEM_ROOT/build/target/release/dem-tool}"
+# Overridable so a build can be driven from a checkout other than the deployed
+# one -- bringing a new source in without waiting for a deploy, say. The
+# scripts below are taken from here too, so the binary and the scripts that
+# call it stay from the same tree.
+cd "${BUILD_DIR:-$DEM_ROOT/build}"
+export TOOL
 
 # Central Europe, then the Alps and the west, then Iberia and Britain, then the
 # Nordic bulk, then the overseas departments.

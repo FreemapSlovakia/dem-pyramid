@@ -14,7 +14,7 @@
 set -euo pipefail
 
 DEM_ROOT="${DEM_ROOT:-/fm/storage2/dem}"
-TOOL="$DEM_ROOT/build/target/release/dem-tool"
+TOOL="${TOOL:-$DEM_ROOT/build/target/release/dem-tool}"
 THREADS="${GDAL_NUM_THREADS:-4}"
 
 id="${1:?usage: layer-a.sh <source-id> <tx> <ty>}"
