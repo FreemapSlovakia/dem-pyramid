@@ -184,17 +184,34 @@ fn bbox_of(info: &serde_json::Value, path: &str) -> Result<[f64; 4]> {
 
     // A partial failure -- PROJ refusing points outside the projection's area
     // of use -- clips the box inwards, which is the direction that loses data,
-    // and the margin is nowhere near a dropped grid row.
+    // by more than the margin covers. Refused rather than warned about: the
+    // cache would otherwise hold a short box that `check` re-measures to the
+    // same short box and calls agreement, and the source builds permanently
+    // shy of its own edge with nothing ever saying so.
     if held < xs.len() {
-        eprintln!(
-            "  warning: {path}: {} of {} extent samples did not transform",
+        bail!(
+            "{path}: {} of {} extent samples did not transform, so its box \
+             would be clipped",
             xs.len() - held,
-            xs.len()
+            held + (xs.len() - held)
         );
     }
 
     if w >= e || s >= n_ {
         bail!("{path}: degenerate extent");
+    }
+
+    // A raster crossing the antimeridian samples near both -180 and +180 and
+    // yields a box the long way round the globe -- which reads here as the
+    // global fallback and is skipped by the build with a reassuring message.
+    // One lon/lat box has no way to say "wraps", so say so instead.
+    let mut lons: Vec<f64> = xs.iter().copied().filter(|v| v.is_finite()).collect();
+    lons.sort_by(f64::total_cmp);
+
+    let widest_gap = lons.windows(2).map(|p| p[1] - p[0]).fold(0.0_f64, f64::max);
+
+    if widest_gap > 180.0 {
+        bail!("{path}: crosses the antimeridian, which one lon/lat box cannot express");
     }
 
     Ok([
@@ -357,51 +374,70 @@ mod tests {
         })
     }
 
-    /// The corners of a projected rectangle do not bound it: its edges bow
-    /// outwards between them, and at high latitude by kilometres. Sampling the
-    /// interior has to find more than the corners do.
-    #[test]
-    fn the_extent_is_wider_than_its_corners() {
-        // UTM 33N, 400 km wide and 1000 km tall, reaching towards the pole.
-        let info = utm_info(32633, (300_000.0, 7_800_000.0), 1000.0, (400, 1000));
-        let [w, s, e, n] = bbox_of(&info, "synthetic").unwrap();
-
-        // The four corners alone, for comparison.
-        let mut src = SpatialRef::from_epsg(32633).unwrap();
+    /// Lon/lat extent of a raster's four corners alone, for comparison.
+    fn corner_hull(epsg: u32, origin: (f64, f64), res: f64, size: (u32, u32)) -> [f64; 4] {
+        let mut src = SpatialRef::from_epsg(epsg).unwrap();
         let mut dst = SpatialRef::from_epsg(4326).unwrap();
         src.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
         dst.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
         let ct = CoordTransform::new(&src, &dst).unwrap();
 
-        let mut xs = vec![300_000.0, 700_000.0, 300_000.0, 700_000.0];
-        let mut ys = vec![7_800_000.0, 7_800_000.0, 6_800_000.0, 6_800_000.0];
+        let (w, h) = (f64::from(size.0) * res, f64::from(size.1) * res);
+        let mut xs = vec![origin.0, origin.0 + w, origin.0, origin.0 + w];
+        let mut ys = vec![origin.1, origin.1, origin.1 - h, origin.1 - h];
         ct.transform_coords(&mut xs, &mut ys, &mut []).unwrap();
 
-        let hull_n = ys.iter().copied().fold(f64::MIN, f64::max);
-        let hull_s = ys.iter().copied().fold(f64::MAX, f64::min);
-
-        assert!(
-            n > hull_n,
-            "north edge {n} did not beat the corners {hull_n}"
-        );
-        assert!(
-            s < hull_s,
-            "south edge {s} did not beat the corners {hull_s}"
-        );
-        assert!(w < e && s < n, "degenerate box");
+        [
+            xs.iter().copied().fold(f64::MAX, f64::min),
+            ys.iter().copied().fold(f64::MAX, f64::min),
+            xs.iter().copied().fold(f64::MIN, f64::max),
+            ys.iter().copied().fold(f64::MIN, f64::max),
+        ]
     }
 
-    /// Erring wide costs a nodata read; erring narrow loses data.
+    /// The corners of a projected rectangle do not bound it: its edges bow
+    /// outwards between them, and at high latitude by kilometres.
+    ///
+    /// Held against the corner hull *plus the margin*, because the corners are
+    /// themselves grid points -- comparing against the bare hull would pass on
+    /// the margin alone, and corner-only sampling would satisfy it.
+    #[test]
+    fn the_extent_is_wider_than_its_corners() {
+        // UTM 33N, 400 km wide and 1000 km tall, reaching towards the pole,
+        // where the meridian convergence is sharpest.
+        let (epsg, origin, res, size) = (32633, (300_000.0, 7_800_000.0), 1000.0, (400, 1000));
+
+        let [_, _, _, n] = bbox_of(&utm_info(epsg, origin, res, size), "synthetic").unwrap();
+        let [_, _, _, hull_n] = corner_hull(epsg, origin, res, size);
+
+        // The northern edge bows ~0.078 deg past its corners, well clear of
+        // the 0.01 deg margin, so this fails if the interior is not sampled.
+        assert!(
+            n > hull_n + EXTENT_MARGIN_DEG,
+            "north edge {n} is within the margin of the corner hull {hull_n}"
+        );
+    }
+
+    /// Erring wide costs a nodata read; erring narrow loses data. Held against
+    /// the same box derived without the margin, so it fails if the margin
+    /// stops being applied.
     #[test]
     fn the_extent_is_padded_outwards() {
         let info = utm_info(32633, (300_000.0, 6_000_000.0), 100.0, (1000, 1000));
         let [w, s, e, n] = bbox_of(&info, "synthetic").unwrap();
+        let [hw, hs, he, hn] = corner_hull(32633, (300_000.0, 6_000_000.0), 100.0, (1000, 1000));
 
-        assert!(e - w > 0.0 && n - s > 0.0);
-        // The margin is on every side, so the box grows by twice it.
+        // A 100 km square this far from the pole barely bows, so the corner
+        // hull is within a hair of the unpadded sample extent and the margin
+        // is what separates the two.
         assert!(
-            (e - w) > 2.0 * EXTENT_MARGIN_DEG,
-            "box narrower than its own margin"
+            w < hw && s < hs && e > he && n > hn,
+            "box not padded outwards"
+        );
+        assert!(
+            (hw - w) > EXTENT_MARGIN_DEG / 2.0,
+            "west padding {} is not the margin",
+            hw - w
         );
     }
 

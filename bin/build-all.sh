@@ -43,15 +43,21 @@ PREFERRED=(
 )
 
 sources=("$@")
+named=1
 if [ ${#sources[@]} -eq 0 ]; then
+  named=0
   # Captured rather than piped from a process substitution, whose failure
   # `set -e` does not see: an empty list would otherwise read as "no sources"
   # when what happened is that the cache could not be loaded.
-  listing=$("$TOOL" list) || {
+  # Captured rather than piped from a process substitution, whose failure
+  # `set -e` does not see. From `json` rather than `list`, which is a
+  # fixed-width table for people and would hand back its own rule line as an
+  # id the day a header is added.
+  listing=$("$TOOL" json) || {
     echo "build-all: could not read the sources -- run dem-tool refresh" >&2
     exit 1
   }
-  mapfile -t all < <(printf '%s\n' "$listing" | tail -n +3 | awk '{print $1}')
+  mapfile -t all < <(printf '%s\n' "$listing" | jq -r '.sources[].id')
   [ ${#all[@]} -gt 0 ] || { echo "build-all: the cache holds no sources" >&2; exit 1; }
 
   sources=()
@@ -79,14 +85,19 @@ for id in "${sources[@]}"; do
   rc=$?
   set -e
 
-  # 3 means the source spans the globe and wants a region named; bin/fallback.sh
-  # owns those. Anything else is a mistake worth stopping for.
-  if [ $rc -eq 3 ]; then
+  # 3 means the source spans the globe and wants a region named. Passing over
+  # it is right for a list this script derived, and wrong for one the caller
+  # typed -- there the id is the instruction, and skipping it silently would
+  # exit 0 having built nothing that was asked for.
+  if [ $rc -eq 3 ] && [ $named -eq 0 ]; then
     echo "=== $id: skipped -- built over a region by bin/fallback.sh"
     continue
   fi
+
+  # dem-tool has already said what went wrong, on stderr; repeating a guess
+  # here only sends the reader after the wrong thing.
   [ $rc -eq 0 ] || {
-    echo "build-all: $id: no such source" >&2
+    echo "build-all: $id: dem-tool cover exited $rc" >&2
     exit 1
   }
   mapfile -t tiles < <(printf '%s\n' "$cover" | tail -n +2)

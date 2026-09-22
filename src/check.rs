@@ -84,10 +84,6 @@ fn differences(was: &Source, now: &Source) -> Vec<String> {
 pub fn run(doc: &Doc, elevation_sources: &Path) -> Result<()> {
     let entries = credit::load_entries(elevation_sources)?;
 
-    // The licence rule first: it costs nothing and is the one failure here
-    // that is not merely a stale number.
-    credit::check_attributions(&doc.sources, &entries)?;
-
     let (measured, unreadable) =
         refresh::derive_all(&entries, doc.grid.coarsest_level, doc.grid.finest_level);
 
@@ -127,6 +123,11 @@ pub fn run(doc: &Doc, elevation_sources: &Path) -> Result<()> {
             problems += 1;
         }
     }
+
+    // After the report, not before it: a dataset unmarked upstream fails the
+    // licence rule too, and stopping on that first would answer a stale cache
+    // with a complaint about credits and hide every other drift behind it.
+    credit::check_attributions(&doc.sources, &entries)?;
 
     if problems > 0 {
         bail!(
