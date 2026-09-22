@@ -344,19 +344,7 @@ fn main() -> Result<()> {
                 refresh::derive_all(&entries, doc.grid.coarsest_level, doc.grid.finest_level);
 
             config::validate(&derived)?;
-            credit::check_attributions(
-                &config::Doc {
-                    grid: config::Grid {
-                        crs: cli.grid_crs.clone(),
-                        tile_px: cli.tile_px,
-                        block_px: cli.block_px,
-                        finest_level: cli.finest_level,
-                        coarsest_level: cli.coarsest_level,
-                    },
-                    sources: derived.clone(),
-                },
-                &entries,
-            )?;
+            credit::check_attributions(&derived, &entries)?;
 
             // Written only once every dataset has been read. A cache silently
             // missing a source that was merely unreadable for a moment builds a

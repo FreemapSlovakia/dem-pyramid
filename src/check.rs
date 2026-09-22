@@ -86,7 +86,7 @@ pub fn run(doc: &Doc, elevation_sources: &Path) -> Result<()> {
 
     // The licence rule first: it costs nothing and is the one failure here
     // that is not merely a stale number.
-    credit::check_attributions(doc, &entries)?;
+    credit::check_attributions(&doc.sources, &entries)?;
 
     let (measured, unreadable) =
         refresh::derive_all(&entries, doc.grid.coarsest_level, doc.grid.finest_level);

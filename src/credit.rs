@@ -172,8 +172,8 @@ pub fn credits_of(entries: &[Entry]) -> Credits {
 /// several datasets share one: a new DTM added under a name that is already
 /// credited would otherwise inherit another dataset's licence line and be
 /// served confidently miscredited, which is worse than being uncredited.
-pub fn check_attributions(doc: &Doc, entries: &[Entry]) -> Result<()> {
-    for source in &doc.sources {
+pub fn check_attributions(sources: &[Source], entries: &[Entry]) -> Result<()> {
+    for source in sources {
         let Some(entry) = entries.iter().find(|e| e.file == source.path) else {
             bail!(
                 "{}: {} is in no source.json, so nothing says how to credit it",
@@ -580,9 +580,9 @@ mod tests {
     fn a_source_with_no_credit_refuses_to_serve() {
         let doc = doc(vec![source("sk", "sk", 230, [16.8, 47.7, 22.6, 49.7])]);
 
-        assert!(check_attributions(&doc, &[]).is_err());
-        assert!(check_attributions(&doc, &[entry("010-sk", "sk", "", false)]).is_err());
-        assert!(check_attributions(&doc, &[entry("010-sk", "sk", "", true)]).is_ok());
+        assert!(check_attributions(&doc.sources, &[]).is_err());
+        assert!(check_attributions(&doc.sources, &[entry("010-sk", "sk", "", false)]).is_err());
+        assert!(check_attributions(&doc.sources, &[entry("010-sk", "sk", "", true)]).is_ok());
     }
 
     /// A new dataset under a name that is already credited must not inherit
@@ -597,9 +597,9 @@ mod tests {
 
         let list = [entry("245-de_by", "de", "/dtm/de_by/all.vrt", true)];
 
-        assert!(check_attributions(&doc(vec![de_by.clone()]), &list).is_ok());
+        assert!(check_attributions(&doc(vec![de_by.clone()]).sources, &list).is_ok());
 
         // de_nw is not in the list, though "de" is credited because of de_by.
-        assert!(check_attributions(&doc(vec![de_by, de_nw]), &list).is_err());
+        assert!(check_attributions(&doc(vec![de_by, de_nw]).sources, &list).is_err());
     }
 }

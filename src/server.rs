@@ -330,7 +330,7 @@ pub async fn serve(
 ) -> Result<()> {
     let entries = credit::load_entries(elevation_sources)?;
 
-    credit::check_attributions(&doc, &entries)?;
+    credit::check_attributions(&doc.sources, &entries)?;
 
     let credits = credit::credits_of(&entries);
 
