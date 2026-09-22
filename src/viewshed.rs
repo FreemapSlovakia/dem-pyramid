@@ -159,7 +159,8 @@ pub fn render(
     // overlap heavily near the centre, so they must not race.
     let alpha: Vec<AtomicU8> = (0..px * px).map(|_| AtomicU8::new(0)).collect();
 
-    let chunk = rays.div_ceil(std::thread::available_parallelism().map_or(4, std::num::NonZero::get));
+    let chunk =
+        rays.div_ceil(std::thread::available_parallelism().map_or(4, std::num::NonZero::get));
     let samples: usize = (0..rays)
         .step_by(chunk.max(1))
         .collect::<Vec<_>>()
@@ -173,7 +174,18 @@ pub fn render(
                     job.tick();
                 }
                 let az = 360.0 * i as f64 / rays as f64;
-                n += cast(&mut pyr, p, &alpha, px, (x0, y0), proj, eye, az, coarsest, finest);
+                n += cast(
+                    &mut pyr,
+                    p,
+                    &alpha,
+                    px,
+                    (x0, y0),
+                    proj,
+                    eye,
+                    az,
+                    coarsest,
+                    finest,
+                );
             }
             Ok(n)
         })
@@ -306,7 +318,9 @@ fn opacity(ray_t: f64, prev: Option<(f64, f64)>, d: f64, h: f64) -> u8 {
     // Angle of the line of sight, and of the ground along it.
     let sight = ray_t.atan();
     let slope = ((h - ph) / run).atan();
-    let incidence = (slope - sight).abs().min(std::f64::consts::PI - (slope - sight).abs());
+    let incidence = (slope - sight)
+        .abs()
+        .min(std::f64::consts::PI - (slope - sight).abs());
     let v = incidence.sin().clamp(0.0, 1.0);
     // Never fully transparent where something is genuinely visible: a grazing
     // surface is faint, not absent, and absent is what "not visible" means.
@@ -393,38 +407,38 @@ mod tests {
             (20.133_f64, 49.164_f64, 20_000.0_f64, 50.0_f64),
             (20.0, 69.0, 200_000.0, 100.0),
         ] {
-        let px = extent(radius, scale);
-        let (cx, cy) = lonlat_to_merc(lon, lat);
-        let half = [0.0, 90.0, 180.0, 270.0]
-            .into_iter()
-            .map(|az| {
-                let (plon, plat) = panorama::destination(lon, lat, az, radius);
-                let (x, y) = lonlat_to_merc(plon, plat);
-                (x - cx).abs().max((y - cy).abs())
-            })
-            .fold(0.0f64, f64::max);
-        let proj = half * 2.0 / px as f64;
-        let (x0, y0) = (cx - half, cy + half);
-        let centre = px as f64 / 2.0;
+            let px = extent(radius, scale);
+            let (cx, cy) = lonlat_to_merc(lon, lat);
+            let half = [0.0, 90.0, 180.0, 270.0]
+                .into_iter()
+                .map(|az| {
+                    let (plon, plat) = panorama::destination(lon, lat, az, radius);
+                    let (x, y) = lonlat_to_merc(plon, plat);
+                    (x - cx).abs().max((y - cy).abs())
+                })
+                .fold(0.0f64, f64::max);
+            let proj = half * 2.0 / px as f64;
+            let (x0, y0) = (cx - half, cy + half);
+            let centre = px as f64 / 2.0;
 
-        for (az, name) in [(0.0, "N"), (90.0, "E"), (180.0, "S"), (270.0, "W")] {
-            for d in [scale * 4.0, radius * 0.5, radius] {
-                let (plon, plat) = panorama::destination(lon, lat, az, d);
-                let (sx, sy) = lonlat_to_merc(plon, plat);
-                let ix = (sx - x0) / proj;
-                let iy = (y0 - sy) / proj;
-                assert!(
-                    ix >= 0.0 && iy >= 0.0 && ix < px as f64 && iy < px as f64,
-                    "{name} at {d} m fell outside the raster: {ix},{iy} of {px}"
-                );
-                match name {
-                    "N" => assert!(iy < centre, "{name} at {d} m mapped south"),
-                    "S" => assert!(iy > centre, "{name} at {d} m mapped north"),
-                    "E" => assert!(ix > centre, "{name} at {d} m mapped west"),
-                    _ => assert!(ix < centre, "{name} at {d} m mapped east"),
+            for (az, name) in [(0.0, "N"), (90.0, "E"), (180.0, "S"), (270.0, "W")] {
+                for d in [scale * 4.0, radius * 0.5, radius] {
+                    let (plon, plat) = panorama::destination(lon, lat, az, d);
+                    let (sx, sy) = lonlat_to_merc(plon, plat);
+                    let ix = (sx - x0) / proj;
+                    let iy = (y0 - sy) / proj;
+                    assert!(
+                        ix >= 0.0 && iy >= 0.0 && ix < px as f64 && iy < px as f64,
+                        "{name} at {d} m fell outside the raster: {ix},{iy} of {px}"
+                    );
+                    match name {
+                        "N" => assert!(iy < centre, "{name} at {d} m mapped south"),
+                        "S" => assert!(iy > centre, "{name} at {d} m mapped north"),
+                        "E" => assert!(ix > centre, "{name} at {d} m mapped west"),
+                        _ => assert!(ix < centre, "{name} at {d} m mapped east"),
+                    }
                 }
             }
-        }
         }
     }
 }

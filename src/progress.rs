@@ -183,7 +183,10 @@ impl Drop for Registration {
         // duplicates, so it should always be -- and removing by name alone
         // would be the one way a later request could lose its entry to an
         // earlier one's guard.
-        if map.get(&self.token).is_some_and(|j| Arc::ptr_eq(j, &self.job)) {
+        if map
+            .get(&self.token)
+            .is_some_and(|j| Arc::ptr_eq(j, &self.job))
+        {
             map.remove(&self.token);
         }
     }

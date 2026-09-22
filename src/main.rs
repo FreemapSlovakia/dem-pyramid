@@ -31,7 +31,12 @@ struct Cli {
     sources: Option<PathBuf>,
 
     /// Data root on the build host.
-    #[arg(long, global = true, env = "DEM_ROOT", default_value = "/fm/storage2/dem")]
+    #[arg(
+        long,
+        global = true,
+        env = "DEM_ROOT",
+        default_value = "/fm/storage2/dem"
+    )]
     root: PathBuf,
 
     #[command(subcommand)]
@@ -74,19 +79,11 @@ enum Command {
         bbox: Option<String>,
     },
     /// Shell-sourceable build variables for one (source, tile).
-    WarpEnv {
-        id: String,
-        tx: u32,
-        ty: u32,
-    },
+    WarpEnv { id: String, tx: u32, ty: u32 },
     /// Leaf files referenced by a source's VRT, one per line.
-    VrtSources {
-        id: String,
-    },
+    VrtSources { id: String },
     /// What contributes to one pyramid level, for the index builder.
-    IndexPlan {
-        level: u32,
-    },
+    IndexPlan { level: u32 },
     /// Serve panoramas over HTTP.
     Serve {
         #[arg(long, default_value = "127.0.0.1:3100")]
@@ -255,7 +252,9 @@ fn find<'a>(doc: &'a config::Doc, id: &str) -> anyhow::Result<&'a config::Source
 fn default_sources() -> PathBuf {
     // Alongside the executable's repo root when run from the build dir, else
     // the current directory.
-    let cwd = std::env::current_dir().unwrap_or_default().join("sources.yaml");
+    let cwd = std::env::current_dir()
+        .unwrap_or_default()
+        .join("sources.yaml");
     if cwd.exists() {
         return cwd;
     }
@@ -454,8 +453,8 @@ fn main() -> Result<()> {
             // Same reason: a bad stop list should cost a message, not a march.
             let gradient = match &ground_gradient {
                 Some(src) => {
-                    let json: serde_json::Value = serde_json::from_str(src)
-                        .context("--ground-gradient is not valid JSON")?;
+                    let json: serde_json::Value =
+                        serde_json::from_str(src).context("--ground-gradient is not valid JSON")?;
                     let g = gradient::Gradient::parse(&json)?;
                     gradient::validate(&g, range)?;
                     Some(g)
@@ -556,7 +555,8 @@ fn main() -> Result<()> {
             if let Some(rpath) = depth_raw {
                 let step = depth_step.max(1);
                 std::fs::write(&rpath, panorama::depth_bytes(&stats.depth, step)?)?;
-                let rel = f64::from(step) * 100.0
+                let rel = f64::from(step)
+                    * 100.0
                     * (panorama::DEPTH_FAR.ln() - panorama::DEPTH_NEAR.ln())
                     / 65534.0;
                 println!(

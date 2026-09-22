@@ -188,7 +188,9 @@ pub struct Request {
     peak_filter: Option<serde_json::Value>,
 }
 
-fn d_gamma() -> f64 { 1.0 }
+fn d_gamma() -> f64 {
+    1.0
+}
 
 #[derive(Deserialize, Clone, Copy, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -235,24 +237,58 @@ pub struct ViewshedRequest {
     quality: u8,
 }
 
-fn d_vs_radius() -> f64 { 30_000.0 }
-fn d_vs_scale() -> f64 { 20.0 }
+fn d_vs_radius() -> f64 {
+    30_000.0
+}
+fn d_vs_scale() -> f64 {
+    20.0
+}
 
-fn d_az() -> f64 { 0.0 }
-fn d_fov() -> f64 { 360.0 }
-fn d_alt_min() -> f64 { -18.0 }
-fn d_alt_max() -> f64 { 12.0 }
-fn d_step() -> f64 { 0.05 }
-fn d_eye() -> f64 { 1.7 }
-fn d_eye_radius() -> f64 { 10.0 }
-fn d_range() -> f64 { 300_000.0 }
-fn d_ss() -> u32 { 9 }
-fn d_depth_step() -> u16 { 4 }
-fn d_peaks() -> bool { true }
-fn d_ridge_strength() -> f64 { 1.0 }
-fn d_ridge_width() -> f64 { 1.0 }
-fn d_quality() -> u8 { avif::QUALITY }
-fn d_dither() -> f64 { panorama::DEFAULT_DITHER }
+fn d_az() -> f64 {
+    0.0
+}
+fn d_fov() -> f64 {
+    360.0
+}
+fn d_alt_min() -> f64 {
+    -18.0
+}
+fn d_alt_max() -> f64 {
+    12.0
+}
+fn d_step() -> f64 {
+    0.05
+}
+fn d_eye() -> f64 {
+    1.7
+}
+fn d_eye_radius() -> f64 {
+    10.0
+}
+fn d_range() -> f64 {
+    300_000.0
+}
+fn d_ss() -> u32 {
+    9
+}
+fn d_depth_step() -> u16 {
+    4
+}
+fn d_peaks() -> bool {
+    true
+}
+fn d_ridge_strength() -> f64 {
+    1.0
+}
+fn d_ridge_width() -> f64 {
+    1.0
+}
+fn d_quality() -> u8 {
+    avif::QUALITY
+}
+fn d_dither() -> f64 {
+    panorama::DEFAULT_DITHER
+}
 
 #[derive(Clone)]
 pub struct Ctx {
@@ -413,7 +449,9 @@ async fn progress_route(
         },
     );
 
-    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// Cancellation has to be cooperative: a blocking task cannot be killed, and
@@ -933,8 +971,7 @@ async fn viewshed_route(
             ("image".into(), Some(name.into()), bytes),
         ])
     })
-    .await
-    ;
+    .await;
 
     let parts = match built {
         Ok(Ok(p)) => p,

@@ -71,7 +71,10 @@ pub fn parse_vrt(path: &str) -> Result<Vrt> {
     let mut in_gt = false;
     let mut in_filename = false;
     let mut filename_relative = true;
-    let base = Path::new(path).parent().map(Path::to_path_buf).unwrap_or_default();
+    let base = Path::new(path)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
 
     loop {
         match reader.read_event_into(&mut buf)? {

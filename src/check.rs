@@ -38,10 +38,7 @@ pub fn run(doc: &Doc) -> Result<()> {
                 res.abs()
             };
             if (res_m - s.native_res).abs() > 0.05 * s.native_res {
-                notes.push(format!(
-                    "res {res_m:.4} m != yaml {}",
-                    s.native_res
-                ));
+                notes.push(format!("res {res_m:.4} m != yaml {}", s.native_res));
             }
         } else {
             notes.push("no geotransform".into());
@@ -58,9 +55,9 @@ pub fn run(doc: &Doc) -> Result<()> {
 
         let declared = info["bands"][0]["noDataValue"].as_f64();
         match (s.nodata.is_declared(), declared) {
-            (true, None) => notes.push(
-                "yaml says nodata is declared but the dataset declares none".into(),
-            ),
+            (true, None) => {
+                notes.push("yaml says nodata is declared but the dataset declares none".into())
+            }
             (false, Some(d)) => {
                 let want = s.nodata.value().unwrap_or(f64::NAN);
                 if (d - want).abs() > 1e-6 {
@@ -104,6 +101,9 @@ pub fn run(doc: &Doc) -> Result<()> {
     if problems > 0 {
         bail!("\n{problems} source(s) disagree with sources.yaml");
     }
-    println!("\nall {} sources agree with sources.yaml", doc.sources.len());
+    println!(
+        "\nall {} sources agree with sources.yaml",
+        doc.sources.len()
+    );
     Ok(())
 }

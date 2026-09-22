@@ -252,8 +252,8 @@ impl Program {
                     st.truncate(at);
                     st.push(picked);
                 }
-                Op::Add(n) => fold(st,n, 0.0, |a, b| a + b),
-                Op::Mul(n) => fold(st,n, 1.0, |a, b| a * b),
+                Op::Add(n) => fold(st, n, 0.0, |a, b| a + b),
+                Op::Mul(n) => fold(st, n, 1.0, |a, b| a * b),
                 // Not `f64::min`/`f64::max`: those are IEEE minNum/maxNum and
                 // discard a NaN operand, so `["max", ["/",0,0], 5]` would
                 // score 5 and rank normally, and a peak the formula could not
@@ -264,14 +264,26 @@ impl Program {
                 // not null -- so a `case` on a NaN takes its else branch
                 // rather than yielding null. That is the one family this rule
                 // does not cover, and it is the family filters are built from.
-                Op::Min(n) => fold1(st, n, |a, b| if a.is_nan() || b.is_nan() { f64::NAN } else { a.min(b) }),
-                Op::Max(n) => fold1(st, n, |a, b| if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) }),
-                Op::Sub => binary(st,|a, b| a - b),
-                Op::Div => binary(st,|a, b| a / b),
-                Op::Pow => binary(st,f64::powf),
-                Op::Neg => unary(st,|a| -a),
-                Op::Abs => unary(st,f64::abs),
-                Op::Sign => unary(st,|a| {
+                Op::Min(n) => fold1(st, n, |a, b| {
+                    if a.is_nan() || b.is_nan() {
+                        f64::NAN
+                    } else {
+                        a.min(b)
+                    }
+                }),
+                Op::Max(n) => fold1(st, n, |a, b| {
+                    if a.is_nan() || b.is_nan() {
+                        f64::NAN
+                    } else {
+                        a.max(b)
+                    }
+                }),
+                Op::Sub => binary(st, |a, b| a - b),
+                Op::Div => binary(st, |a, b| a / b),
+                Op::Pow => binary(st, f64::powf),
+                Op::Neg => unary(st, |a| -a),
+                Op::Abs => unary(st, f64::abs),
+                Op::Sign => unary(st, |a| {
                     // 0 for zero, so a peak sitting exactly on the boundary
                     // between dominant and subordinate is not thrown to one
                     // side. `f64::signum` returns 1.0 for +0.0, which would
@@ -284,11 +296,11 @@ impl Program {
                         0.0
                     }
                 }),
-                Op::Sqrt => unary(st,f64::sqrt),
-                Op::Ln => unary(st,f64::ln),
-                Op::Log2 => unary(st,f64::log2),
-                Op::Log10 => unary(st,f64::log10),
-                Op::Exp => unary(st,f64::exp),
+                Op::Sqrt => unary(st, f64::sqrt),
+                Op::Ln => unary(st, f64::ln),
+                Op::Log2 => unary(st, f64::log2),
+                Op::Log10 => unary(st, f64::log10),
+                Op::Exp => unary(st, f64::exp),
                 // Handled by the caller, which owns the program counter.
                 Op::Jump(_)
                 | Op::JumpIfFalsy(_)
@@ -409,173 +421,179 @@ fn unary(st: &mut Vec<Option<f64>>, f: impl Fn(f64) -> f64) {
 }
 
 impl Compiler {
-fn walk(&mut self, json: &Json, path: &str, depth: usize) -> Result<(), Error> {
-    let ops = &mut self.ops;
-    if depth > MAX_DEPTH {
-        return Err(err(path, format!("nested deeper than {MAX_DEPTH}")));
-    }
-    if ops.len() > MAX_OPS {
-        return Err(err(path, format!("expression exceeds {MAX_OPS} operations")));
-    }
-
-    if let Some(n) = json.as_f64() {
-        self.push(Op::Num(n), 0);
-        return Ok(());
-    }
-
-    let Some(arr) = json.as_array() else {
-        return Err(err(
-            path,
-            "expected a number or an operator array like [\"+\", 1, 2]",
-        ));
-    };
-    let Some(Json::String(name)) = arr.first() else {
-        return Err(err(path, "operator array must start with an operator name"));
-    };
-    let args = &arr[1..];
-    let argpath = |i: usize| format!("{path}[{}]", i + 1);
-
-    // `get` is the one operator whose argument is a name rather than a value,
-    // so it never recurses.
-    if name == "get" {
-        let [Json::String(var)] = args else {
-            return Err(err(path, "get takes exactly one property name"));
-        };
-        let Some(v) = Var::from_name(var) else {
-            return Err(err(
-                &argpath(0),
-                format!("unknown property `{var}`; expected one of {}", Var::NAMES),
-            ));
-        };
-        self.push(Op::Var(v), 0);
-        return Ok(());
-    }
-
-    // `case` compiles to jumps rather than to a value-consuming operator,
-    // because a choice has to *not evaluate* the branch it did not take.
-    // Multiplying by a 0/1 indicator cannot express that: null times zero is
-    // null, so a branch reading an absent prominence poisons the answer even
-    // where it was never wanted.
-    if name == "case" {
-        if args.len() < 3 || args.len() % 2 == 0 {
+    fn walk(&mut self, json: &Json, path: &str, depth: usize) -> Result<(), Error> {
+        let ops = &mut self.ops;
+        if depth > MAX_DEPTH {
+            return Err(err(path, format!("nested deeper than {MAX_DEPTH}")));
+        }
+        if ops.len() > MAX_OPS {
             return Err(err(
                 path,
-                "case takes a condition, a value, optionally more pairs, \
+                format!("expression exceeds {MAX_OPS} operations"),
+            ));
+        }
+
+        if let Some(n) = json.as_f64() {
+            self.push(Op::Num(n), 0);
+            return Ok(());
+        }
+
+        let Some(arr) = json.as_array() else {
+            return Err(err(
+                path,
+                "expected a number or an operator array like [\"+\", 1, 2]",
+            ));
+        };
+        let Some(Json::String(name)) = arr.first() else {
+            return Err(err(path, "operator array must start with an operator name"));
+        };
+        let args = &arr[1..];
+        let argpath = |i: usize| format!("{path}[{}]", i + 1);
+
+        // `get` is the one operator whose argument is a name rather than a value,
+        // so it never recurses.
+        if name == "get" {
+            let [Json::String(var)] = args else {
+                return Err(err(path, "get takes exactly one property name"));
+            };
+            let Some(v) = Var::from_name(var) else {
+                return Err(err(
+                    &argpath(0),
+                    format!("unknown property `{var}`; expected one of {}", Var::NAMES),
+                ));
+            };
+            self.push(Op::Var(v), 0);
+            return Ok(());
+        }
+
+        // `case` compiles to jumps rather than to a value-consuming operator,
+        // because a choice has to *not evaluate* the branch it did not take.
+        // Multiplying by a 0/1 indicator cannot express that: null times zero is
+        // null, so a branch reading an absent prominence poisons the answer even
+        // where it was never wanted.
+        if name == "case" {
+            if args.len() < 3 || args.len() % 2 == 0 {
+                return Err(err(
+                    path,
+                    "case takes a condition, a value, optionally more pairs, \
                  and a final fallback -- an odd number, at least three",
-            ));
-        }
-        let base = self.depth;
-        let mut max = base;
-        let mut ends: Vec<usize> = Vec::new();
-        let mut i = 0;
-        while i + 1 < args.len() {
+                ));
+            }
+            let base = self.depth;
+            let mut max = base;
+            let mut ends: Vec<usize> = Vec::new();
+            let mut i = 0;
+            while i + 1 < args.len() {
+                self.depth = base;
+                self.walk(&args[i], &argpath(i), depth + 1)?;
+                let jf = self.ops.len();
+                self.ops.push(Op::JumpIfFalsy(usize::MAX));
+                self.depth -= 1; // the condition is consumed by the jump
+                self.walk(&args[i + 1], &argpath(i + 1), depth + 1)?;
+                max = max.max(self.depth);
+                ends.push(self.ops.len());
+                self.ops.push(Op::Jump(usize::MAX));
+                let here = self.ops.len();
+                self.ops[jf] = Op::JumpIfFalsy(here);
+                i += 2;
+            }
+            // The fallback. Every path arrives here having pushed nothing, and
+            // leaves having pushed exactly one value -- which is what makes the
+            // whole construct behave like any other expression node.
             self.depth = base;
-            self.walk(&args[i], &argpath(i), depth + 1)?;
-            let jf = self.ops.len();
-            self.ops.push(Op::JumpIfFalsy(usize::MAX));
-            self.depth -= 1; // the condition is consumed by the jump
-            self.walk(&args[i + 1], &argpath(i + 1), depth + 1)?;
+            self.walk(&args[args.len() - 1], &argpath(args.len() - 1), depth + 1)?;
             max = max.max(self.depth);
-            ends.push(self.ops.len());
-            self.ops.push(Op::Jump(usize::MAX));
-            let here = self.ops.len();
-            self.ops[jf] = Op::JumpIfFalsy(here);
-            i += 2;
+            let end = self.ops.len();
+            for e in ends {
+                self.ops[e] = Op::Jump(end);
+            }
+            self.depth = base + 1;
+            self.max = self.max.max(max);
+            return Ok(());
         }
-        // The fallback. Every path arrives here having pushed nothing, and
-        // leaves having pushed exactly one value -- which is what makes the
-        // whole construct behave like any other expression node.
-        self.depth = base;
-        self.walk(&args[args.len() - 1], &argpath(args.len() - 1), depth + 1)?;
-        max = max.max(self.depth);
-        let end = self.ops.len();
-        for e in ends {
-            self.ops[e] = Op::Jump(end);
-        }
-        self.depth = base + 1;
-        self.max = self.max.max(max);
-        return Ok(());
-    }
 
-    for (i, a) in args.iter().enumerate() {
-        self.walk(a, &argpath(i), depth + 1)?;
-    }
-
-    let n = args.len();
-    let ops = &mut self.ops;
-    let at_least = |k: usize, ops: &mut Vec<Op>, op: Op| -> Result<(), Error> {
-        if n < k {
-            return Err(err(path, format!("{name} needs at least {k} arguments")));
+        for (i, a) in args.iter().enumerate() {
+            self.walk(a, &argpath(i), depth + 1)?;
         }
-        ops.push(op);
-        Ok(())
-    };
-    let exactly = |k: usize, ops: &mut Vec<Op>, op: Op| -> Result<(), Error> {
-        if n != k {
-            return Err(err(
-                path,
-                format!("{name} takes exactly {k} argument{}", if k == 1 { "" } else { "s" }),
-            ));
-        }
-        ops.push(op);
-        Ok(())
-    };
 
-    match name.as_str() {
-        "coalesce" => at_least(1, ops, Op::Coalesce(n))?,
-        "+" => at_least(1, ops, Op::Add(n))?,
-        "*" => at_least(1, ops, Op::Mul(n))?,
-        "min" => at_least(1, ops, Op::Min(n))?,
-        "max" => at_least(1, ops, Op::Max(n))?,
-        "==" => exactly(2, ops, Op::Eq)?,
-        "!=" => exactly(2, ops, Op::Ne)?,
-        "<" => exactly(2, ops, Op::Lt)?,
-        "<=" => exactly(2, ops, Op::Le)?,
-        ">" => exactly(2, ops, Op::Gt)?,
-        ">=" => exactly(2, ops, Op::Ge)?,
-        // The one operator whose meaning depends on how many arguments it
-        // has. Unambiguous in prefix form, where infix would have to guess.
-        "-" => match n {
-            1 => ops.push(Op::Neg),
-            2 => ops.push(Op::Sub),
-            _ => return Err(err(path, "- takes one argument (negate) or two (subtract)")),
-        },
-        "/" => exactly(2, ops, Op::Div)?,
-        "^" => exactly(2, ops, Op::Pow)?,
-        "abs" => exactly(1, ops, Op::Abs)?,
-        "sign" => exactly(1, ops, Op::Sign)?,
-        "sqrt" => exactly(1, ops, Op::Sqrt)?,
-        "ln" => exactly(1, ops, Op::Ln)?,
-        "log2" => exactly(1, ops, Op::Log2)?,
-        "log10" => exactly(1, ops, Op::Log10)?,
-        "exp" => exactly(1, ops, Op::Exp)?,
-        other => {
-            return Err(err(
-                path,
-                format!(
-                    "unknown operator `{other}`; expected one of get, coalesce, case, \
+        let n = args.len();
+        let ops = &mut self.ops;
+        let at_least = |k: usize, ops: &mut Vec<Op>, op: Op| -> Result<(), Error> {
+            if n < k {
+                return Err(err(path, format!("{name} needs at least {k} arguments")));
+            }
+            ops.push(op);
+            Ok(())
+        };
+        let exactly = |k: usize, ops: &mut Vec<Op>, op: Op| -> Result<(), Error> {
+            if n != k {
+                return Err(err(
+                    path,
+                    format!(
+                        "{name} takes exactly {k} argument{}",
+                        if k == 1 { "" } else { "s" }
+                    ),
+                ));
+            }
+            ops.push(op);
+            Ok(())
+        };
+
+        match name.as_str() {
+            "coalesce" => at_least(1, ops, Op::Coalesce(n))?,
+            "+" => at_least(1, ops, Op::Add(n))?,
+            "*" => at_least(1, ops, Op::Mul(n))?,
+            "min" => at_least(1, ops, Op::Min(n))?,
+            "max" => at_least(1, ops, Op::Max(n))?,
+            "==" => exactly(2, ops, Op::Eq)?,
+            "!=" => exactly(2, ops, Op::Ne)?,
+            "<" => exactly(2, ops, Op::Lt)?,
+            "<=" => exactly(2, ops, Op::Le)?,
+            ">" => exactly(2, ops, Op::Gt)?,
+            ">=" => exactly(2, ops, Op::Ge)?,
+            // The one operator whose meaning depends on how many arguments it
+            // has. Unambiguous in prefix form, where infix would have to guess.
+            "-" => match n {
+                1 => ops.push(Op::Neg),
+                2 => ops.push(Op::Sub),
+                _ => return Err(err(path, "- takes one argument (negate) or two (subtract)")),
+            },
+            "/" => exactly(2, ops, Op::Div)?,
+            "^" => exactly(2, ops, Op::Pow)?,
+            "abs" => exactly(1, ops, Op::Abs)?,
+            "sign" => exactly(1, ops, Op::Sign)?,
+            "sqrt" => exactly(1, ops, Op::Sqrt)?,
+            "ln" => exactly(1, ops, Op::Ln)?,
+            "log2" => exactly(1, ops, Op::Log2)?,
+            "log10" => exactly(1, ops, Op::Log10)?,
+            "exp" => exactly(1, ops, Op::Exp)?,
+            other => {
+                return Err(err(
+                    path,
+                    format!(
+                        "unknown operator `{other}`; expected one of get, coalesce, case, \
                      +, -, *, /, ^, ==, !=, <, <=, >, >=, min, max, abs, sign, sqrt, \
                      ln, log2, log10, exp"
-                ),
-            ))
+                    ),
+                ));
+            }
         }
+        // Every operator above pops its arguments and pushes one result. `case`
+        // returned earlier, having done its own accounting.
+        //
+        // This is the subtraction that could actually underflow -- every non-case
+        // operator goes through it, where `Compiler::push` is only ever called
+        // with zero. It holds because each of the `n` arguments was walked and
+        // each walk leaves exactly one value, and because no zero-arity operator
+        // reaches here: `get` returns early, and every other arity check rejects
+        // n = 0 first. That is the invariant worth asserting, and a future
+        // operator taking a name argument the way `get` does is what would break
+        // it.
+        debug_assert!(self.depth >= n, "{name} popped more than it pushed");
+        self.depth = self.depth.saturating_sub(n) + 1;
+        self.max = self.max.max(self.depth);
+        Ok(())
     }
-    // Every operator above pops its arguments and pushes one result. `case`
-    // returned earlier, having done its own accounting.
-    //
-    // This is the subtraction that could actually underflow -- every non-case
-    // operator goes through it, where `Compiler::push` is only ever called
-    // with zero. It holds because each of the `n` arguments was walked and
-    // each walk leaves exactly one value, and because no zero-arity operator
-    // reaches here: `get` returns early, and every other arity check rejects
-    // n = 0 first. That is the invariant worth asserting, and a future
-    // operator taking a name argument the way `get` does is what would break
-    // it.
-    debug_assert!(self.depth >= n, "{name} popped more than it pushed");
-    self.depth = self.depth.saturating_sub(n) + 1;
-    self.max = self.max.max(self.depth);
-    Ok(())
-}
 }
 
 #[cfg(test)]
@@ -665,12 +683,12 @@ mod tests {
     fn unusable_results_rank_worst() {
         let v = peak(100.0, 1000.0);
         for f in [
-            json!(["get", "prominence"]),      // null
-            json!(["ln", 0]),                  // -inf
-            json!(["/", 1, 0]),                // +inf
-            json!(["/", 0, 0]),                // NaN
-            json!(["sqrt", -1]),               // NaN
-            json!(["^", -8, 0.5]),             // NaN: negative base, fractional power
+            json!(["get", "prominence"]), // null
+            json!(["ln", 0]),             // -inf
+            json!(["/", 1, 0]),           // +inf
+            json!(["/", 0, 0]),           // NaN
+            json!(["sqrt", -1]),          // NaN
+            json!(["^", -8, 0.5]),        // NaN: negative base, fractional power
         ] {
             let r = Program::compile(&f).unwrap().rank(&v);
             assert_eq!(r, f64::NEG_INFINITY, "{f} ranked {r}");
@@ -758,7 +776,10 @@ mod tests {
         assert_eq!(eval(&json!(["<", 1, 2]), &v), Some(1.0));
         assert_eq!(eval(&json!([">", 1, 2]), &v), Some(0.0));
         assert_eq!(eval(&json!([">=", 2, 2]), &v), Some(1.0));
-        assert_eq!(eval(&json!(["==", ["get", "dominance"], 100]), &v), Some(1.0));
+        assert_eq!(
+            eval(&json!(["==", ["get", "dominance"], 100]), &v),
+            Some(1.0)
+        );
         // An unknown compares to nothing.
         assert_eq!(eval(&json!(["<", ["get", "prominence"], 100]), &v), None);
     }
@@ -780,8 +801,10 @@ mod tests {
         let v = peak(100.0, 1000.0);
         let f = json!([
             "case",
-            [">", ["get", "dominance"], 1000], 1,
-            [">", ["get", "dominance"], 50], 2,
+            [">", ["get", "dominance"], 1000],
+            1,
+            [">", ["get", "dominance"], 50],
+            2,
             3
         ]);
         assert_eq!(eval(&f, &v), Some(2.0));
@@ -789,11 +812,7 @@ mod tests {
         // Every branch is compiled, including ones this peak will never
         // reach, so a malformed branch is a 400 at request time rather than a
         // surprise for whichever viewpoint first takes that path.
-        let unreachable_but_broken = json!([
-            "case",
-            [">", ["get", "dominance"], 1000], "big",
-            2
-        ]);
+        let unreachable_but_broken = json!(["case", [">", ["get", "dominance"], 1000], "big", 2]);
         assert!(Program::compile(&unreachable_but_broken).is_err());
 
         // An even argument count means a missing fallback.
@@ -809,9 +828,12 @@ mod tests {
         let v = peak(-40.0, 8000.0);
         let f = json!([
             "+",
-            ["case", [">", ["get", "dominance"], 0],
-                     ["case", [">", ["get", "distance"], 5000], 1, 2],
-                     ["case", [">", ["get", "distance"], 5000], 3, 4]],
+            [
+                "case",
+                [">", ["get", "dominance"], 0],
+                ["case", [">", ["get", "distance"], 5000], 1, 2],
+                ["case", [">", ["get", "distance"], 5000], 3, 4]
+            ],
             10
         ]);
         assert_eq!(eval(&f, &v), Some(13.0));
@@ -858,9 +880,15 @@ mod tests {
     fn a_compiled_program_always_balances() {
         let f = json!([
             "+",
-            ["/", ["get", "dominance"],
-                  ["^", ["max", ["get", "distance"], 1],
-                        ["*", 0.5, ["sign", ["get", "dominance"]]]]],
+            [
+                "/",
+                ["get", "dominance"],
+                [
+                    "^",
+                    ["max", ["get", "distance"], 1],
+                    ["*", 0.5, ["sign", ["get", "dominance"]]]
+                ]
+            ],
             ["*", 0.3, ["coalesce", ["get", "prominence"], 0]]
         ]);
         let p = Program::compile(&f).unwrap();

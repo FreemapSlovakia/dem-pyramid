@@ -66,10 +66,7 @@ fn scratch_dir() -> Result<&'static Path> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos());
-    let path = std::env::temp_dir().join(format!(
-        "dem-panorama-{}-{nanos:09}",
-        std::process::id()
-    ));
+    let path = std::env::temp_dir().join(format!("dem-panorama-{}-{nanos:09}", std::process::id()));
     std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
         .create(&path)
         .with_context(|| format!("creating {}", path.display()))?;

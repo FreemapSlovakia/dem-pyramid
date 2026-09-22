@@ -134,10 +134,7 @@ pub fn warp_env(g: &Grid, s: &Source, tx: u32, ty: u32, root: &str) -> Result<St
     // Stop the overview chain exactly at the pyramid's coarsest level. Left to
     // itself the COG driver keeps halving past the block size, adding levels
     // below z8 that nothing reads.
-    out.push_str(&format!(
-        "OVERVIEW_COUNT={}\n",
-        level - g.coarsest_level
-    ));
+    out.push_str(&format!("OVERVIEW_COUNT={}\n", level - g.coarsest_level));
     out.push_str(&format!("TE=\"{x0:.6} {y0:.6} {x1:.6} {y1:.6}\"\n"));
     out.push_str(&format!("RESAMPLING={}\n", s.resampling));
     out.push_str(&format!("SRCNODATA={srcnodata}\n"));
@@ -152,7 +149,10 @@ pub fn warp_env(g: &Grid, s: &Source, tx: u32, ty: u32, root: &str) -> Result<St
         shell_quote(root),
         s.id
     ));
-    out.push_str(&format!("DST={}/norm/{}/{level}/{tx}_{ty}.tif\n", root, s.id));
+    out.push_str(&format!(
+        "DST={}/norm/{}/{level}/{tx}_{ty}.tif\n",
+        root, s.id
+    ));
     Ok(out)
 }
 

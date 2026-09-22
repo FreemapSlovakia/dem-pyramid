@@ -127,8 +127,8 @@ pub struct Doc {
 }
 
 pub fn load(path: &Path) -> Result<Doc> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
     let raw: RawDoc = serde_yaml_ng::from_str(&text)?;
 
     let mut sources = Vec::with_capacity(raw.sources.len());
@@ -176,7 +176,10 @@ pub fn load(path: &Path) -> Result<Doc> {
             native_res: r.native_res,
             crs: r.crs.clone(),
             bbox: r.bbox,
-            nodata: r.nodata.clone().unwrap_or_else(|| raw.defaults.nodata.clone()),
+            nodata: r
+                .nodata
+                .clone()
+                .unwrap_or_else(|| raw.defaults.nodata.clone()),
             finest_level: finest,
             resampling: r
                 .resampling

@@ -335,8 +335,11 @@ pub fn default_rank() -> &'static crate::rank::Program {
         crate::rank::Program::compile(&serde_json::json!([
             "/",
             ["get", "dominance"],
-            ["^", ["max", ["get", "distance"], 1],
-                  ["*", 0.5, ["sign", ["get", "dominance"]]]]
+            [
+                "^",
+                ["max", ["get", "distance"], 1],
+                ["*", 0.5, ["sign", ["get", "dominance"]]]
+            ]
         ]))
         .expect("the built-in ranking formula must compile")
     })
@@ -385,7 +388,6 @@ fn vars(k: &Peak) -> crate::rank::Vars {
         prom_dist: k.prom_dist_m,
     }
 }
-
 
 /// Which summits earn a label, most label-worthy first.
 ///
@@ -492,12 +494,12 @@ mod tests {
     #[test]
     fn select_keeps_only_summits_worth_a_label() {
         let mut peaks = vec![
-            peak(1, 100.0, true, Some(0), 10.0),   // kept
-            peak(2, 100.0, false, Some(0), 10.0),  // hidden
-            peak(3, 100.0, true, None, 10.0),      // no ray answered it
-            peak(4, 10.0, true, Some(0), 10.0),    // filtered out
-            peak(5, 100.0, true, Some(0), -1.0),   // above the frame
-            peak(6, 100.0, true, Some(0), 601.0),  // below the frame
+            peak(1, 100.0, true, Some(0), 10.0),  // kept
+            peak(2, 100.0, false, Some(0), 10.0), // hidden
+            peak(3, 100.0, true, None, 10.0),     // no ray answered it
+            peak(4, 10.0, true, Some(0), 10.0),   // filtered out
+            peak(5, 100.0, true, Some(0), -1.0),  // above the frame
+            peak(6, 100.0, true, Some(0), 601.0), // below the frame
         ];
         select(
             &mut peaks,
@@ -539,7 +541,9 @@ mod tests {
 
     #[test]
     fn zero_means_no_cap() {
-        let mut peaks = (0..5).map(|i| peak(i, 100.0, true, Some(0), 10.0)).collect();
+        let mut peaks = (0..5)
+            .map(|i| peak(i, 100.0, true, Some(0), 10.0))
+            .collect();
         select(&mut peaks, &sel(0));
         assert_eq!(peaks.len(), 5);
     }
@@ -600,7 +604,8 @@ mod tests {
                 0,
                 json!([
                     "case",
-                    [">", ["coalesce", ["get", "prominence"], 0], 300], 1,
+                    [">", ["coalesce", ["get", "prominence"], 0], 300],
+                    1,
                     [">", ["get", "dominance"], 100]
                 ]),
             ),

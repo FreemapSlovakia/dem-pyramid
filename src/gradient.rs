@@ -373,7 +373,10 @@ mod tests {
         // s = 0.5 lands at far/3.
         let (rgb, w) = lut.at(1_000.0 / 3.0);
         assert!((w - 0.5).abs() < 0.01, "sky weight {w}");
-        assert!(rgb.0 < 0.01, "black contributes nothing but stays premultiplied");
+        assert!(
+            rgb.0 < 0.01,
+            "black contributes nothing but stays premultiplied"
+        );
 
         let g = grad(json!({"far_distance": 1_000, "stops": [[0, "#ffffff"], [1, "sky"]]}));
         let lut = g.bake(1_000.0);
@@ -386,7 +389,8 @@ mod tests {
 
     #[test]
     fn ends_clamp_rather_than_extrapolate() {
-        let g = grad(json!({"far_distance": 1_000, "stops": [[0.25, "#000000"], [0.75, "#ffffff"]]}));
+        let g =
+            grad(json!({"far_distance": 1_000, "stops": [[0.25, "#000000"], [0.75, "#ffffff"]]}));
         let lut = g.bake(1_000.0);
         assert_eq!(lut.at(0.0).0.0, 0.0);
         assert_eq!(lut.at(1e9).0.0, 255.0);

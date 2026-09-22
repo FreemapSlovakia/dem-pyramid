@@ -311,8 +311,7 @@ impl Level {
         if !path.exists() {
             return Ok(None);
         }
-        let ds = Dataset::open(&path)
-            .with_context(|| format!("opening {}", path.display()))?;
+        let ds = Dataset::open(&path).with_context(|| format!("opening {}", path.display()))?;
         let gt = ds.geo_transform()?;
         let (w, h) = ds.raster_size();
         Ok(Some(Self {
@@ -424,8 +423,7 @@ impl Level {
         // the ragged edge is left as nodata.
         let mut out = vec![0u16; BLOCK * BLOCK];
         for row in 0..h {
-            out[row * BLOCK..row * BLOCK + w]
-                .copy_from_slice(&data[row * w..row * w + w]);
+            out[row * BLOCK..row * BLOCK + w].copy_from_slice(&data[row * w..row * w + w]);
         }
         Some(out)
     }
@@ -444,18 +442,18 @@ impl Pyramid {
                 levels.push(l);
             }
         }
-        anyhow::ensure!(!levels.is_empty(), "no pyramid indexes found under {}", root.display());
+        anyhow::ensure!(
+            !levels.is_empty(),
+            "no pyramid indexes found under {}",
+            root.display()
+        );
         Ok(Self { levels })
     }
 
     /// Sample at the requested level, falling back to coarser levels where the
     /// finer ones are sparse (national data absent, GEDTM30 present).
     pub(crate) fn sample(&mut self, want_z: u32, x: f64, y: f64) -> Option<f64> {
-        let mut idx = self
-            .levels
-            .iter()
-            .rposition(|l| l.z <= want_z)
-            .unwrap_or(0);
+        let mut idx = self.levels.iter().rposition(|l| l.z <= want_z).unwrap_or(0);
         loop {
             if let Some(v) = self.levels[idx].sample(x, y) {
                 return Some(v);
@@ -524,8 +522,7 @@ pub(crate) fn destination(lon: f64, lat: f64, az_deg: f64, d: f64) -> (f64, f64)
     let (sin_lat1, cos_lat1) = lat1.sin_cos();
     let (sin_d, cos_d) = delta.sin_cos();
     let lat2 = (sin_lat1 * cos_d + cos_lat1 * sin_d * theta.cos()).asin();
-    let lon2 = lon1
-        + (theta.sin() * sin_d * cos_lat1).atan2(cos_d - sin_lat1 * lat2.sin());
+    let lon2 = lon1 + (theta.sin() * sin_d * cos_lat1).atan2(cos_d - sin_lat1 * lat2.sin());
     (lon2.to_degrees(), lat2.to_degrees())
 }
 
@@ -858,7 +855,8 @@ fn shade_column(
     // local gradient rather than a constant separates a step from a
     // steep-but-smooth surface, and works at any range.
     let spike = p.edge_ratio.max(1.001).ln();
-    let log_d = |row: usize| -> Option<f64> { col.dist[row].is_finite().then(|| col.dist[row].ln()) };
+    let log_d =
+        |row: usize| -> Option<f64> { col.dist[row].is_finite().then(|| col.dist[row].ln()) };
 
     // Continuous strength rather than a binary test. A hard threshold makes
     // edges dash in and out wherever the measure hovers around it, and forces a
@@ -1043,7 +1041,10 @@ fn measure_depth(
     // Chunked rather than one task per column: each task opens its own
     // `Pyramid`, and that is worth amortising over a run of neighbouring
     // bearings which share blocks anyway.
-    let chunk = cols.len().div_ceil(rayon::current_num_threads().max(1)).max(1);
+    let chunk = cols
+        .len()
+        .div_ceil(rayon::current_num_threads().max(1))
+        .max(1);
 
     let parts = cols
         .par_chunks(chunk)
@@ -1121,7 +1122,6 @@ fn viewpoint_elevation(pyr: &mut Pyramid, p: &Params) -> Result<f64> {
     }
     Ok(best)
 }
-
 
 /// Render the panorama, streaming one output column at a time.
 ///
@@ -1574,8 +1574,19 @@ pub fn render(
                         .flatten()
                         .map(|c| (&mut profile, c - profile_from));
                     samples += march_ray(
-                        &mut pyr, p, eye, az, alt_step, sub_h, coarsest, finest, &mut column,
-                        stop_at, &probe_d, &mut probe_h, records,
+                        &mut pyr,
+                        p,
+                        eye,
+                        az,
+                        alt_step,
+                        sub_h,
+                        coarsest,
+                        finest,
+                        &mut column,
+                        stop_at,
+                        &probe_d,
+                        &mut probe_h,
+                        records,
                     );
                     sky += column.dist.iter().filter(|d| d.is_infinite()).count();
 
@@ -1680,11 +1691,7 @@ pub fn render(
             for local in 0..cols {
                 let x = (start + local) as u32;
                 img.put_pixel(x, orow as u32, image::Rgb(pixels[orow * cols + local]));
-                depth_img.put_pixel(
-                    x,
-                    orow as u32,
-                    image::Luma([depth[orow * cols + local]]),
-                );
+                depth_img.put_pixel(x, orow as u32, image::Luma([depth[orow * cols + local]]));
             }
         }
     }
@@ -1913,10 +1920,7 @@ pub fn validate_style(
     ] {
         anyhow::ensure!(v.is_finite(), "{name} must be a finite number");
     }
-    anyhow::ensure!(
-        ridge_strength >= 0.0,
-        "ridge_strength must not be negative"
-    );
+    anyhow::ensure!(ridge_strength >= 0.0, "ridge_strength must not be negative");
     anyhow::ensure!(
         (0.0..=MAX_RIDGE_WIDTH).contains(&ridge_width),
         "ridge_width must lie within 0..{MAX_RIDGE_WIDTH}"
@@ -2247,7 +2251,10 @@ mod tests {
         // half of the range holds well over half the samples.
         let near = vals.iter().filter(|d| d.abs() < 0.5).count();
         let frac = near as f64 / vals.len() as f64;
-        assert!((0.7..0.8).contains(&frac), "not triangular: {frac} within +-0.5");
+        assert!(
+            (0.7..0.8).contains(&frac),
+            "not triangular: {frac} within +-0.5"
+        );
     }
 
     /// Deterministic: the same pixel must dither the same way every render,
@@ -2278,7 +2285,10 @@ mod tests {
             .map(<[u8]>::len)
             .max()
             .unwrap();
-        assert!(longest <= 6, "a flat run of {longest} rows is a visible band");
+        assert!(
+            longest <= 6,
+            "a flat run of {longest} rows is a visible band"
+        );
         // And it still tracks the underlying ramp.
         let mean = column.iter().map(|&v| f64::from(v)).sum::<f64>() / 64.0;
         let want = (0..64).map(value).sum::<f64>() / 64.0;
@@ -2490,7 +2500,8 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(c, b)| {
-                    let b = b.unwrap_or_else(|| panic!("column {c} had no ray at {step_deg}/{ssx}"));
+                    let b =
+                        b.unwrap_or_else(|| panic!("column {c} had no ray at {step_deg}/{ssx}"));
                     let centre = (c as f64 + 0.5) * grid.step;
                     assert!(
                         (b - centre).abs() <= az_step / 2.0 + 1e-9,
