@@ -174,9 +174,13 @@ pub fn credits_of(entries: &[Entry]) -> Credits {
 /// served confidently miscredited, which is worse than being uncredited.
 pub fn check_attributions(sources: &[Source], entries: &[Entry]) -> Result<()> {
     for source in sources {
-        let Some(entry) = entries.iter().find(|e| e.file == source.path) else {
+        // `pyramid` too: `credits_of` folds only what the pyramid builds, so a
+        // dataset since unmarked upstream would pass here and then be served
+        // with an empty attribution list.
+        let Some(entry) = entries.iter().find(|e| e.pyramid && e.file == source.path) else {
             bail!(
-                "{}: {} is in no source.json, so nothing says how to credit it",
+                "{}: {} is in no source.json the pyramid builds, so nothing \
+                 says how to credit it",
                 source.id,
                 source.path
             );

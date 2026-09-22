@@ -285,6 +285,10 @@ fn find<'a>(doc: &'a config::Doc, id: &str) -> anyhow::Result<&'a config::Source
         .ok_or_else(|| anyhow::anyhow!("unknown source id: {id}"))
 }
 
+/// Longitude span at which a source stops being regional and starts being the
+/// global fallback.
+const GLOBAL_SPAN_DEG: f64 = 180.0;
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -413,7 +417,21 @@ fn main() -> Result<()> {
                     anyhow::ensure!(v.len() == 4, "--bbox wants four numbers");
                     [v[0], v[1], v[2], v[3]]
                 }
-                None => s.bbox,
+                None => {
+                    // A source spanning the globe is the fallback, and
+                    // materialising it over its own box is 11 000 tiles rather
+                    // than the 675 a region needs. Exit 3 rather than 1, so a
+                    // caller iterating sources can tell "this one wants a
+                    // region" from "this one is broken".
+                    if s.bbox[2] - s.bbox[0] >= GLOBAL_SPAN_DEG {
+                        eprintln!(
+                            "{id} spans the globe; give --bbox a region, as bin/fallback.sh does"
+                        );
+                        std::process::exit(3);
+                    }
+
+                    s.bbox
+                }
             };
             let tiles = grid::cover(&doc.grid, area);
             println!("{} tiles for {id}", tiles.len());

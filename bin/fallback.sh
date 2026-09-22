@@ -18,8 +18,12 @@
 set -euo pipefail
 
 DEM_ROOT="${DEM_ROOT:-/fm/storage2/dem}"
-TOOL="${TOOL:-$DEM_ROOT/build/target/release/dem-tool}"
-cd "$DEM_ROOT/build"
+BUILD_DIR="${BUILD_DIR:-$DEM_ROOT/build}"
+TOOL="${TOOL:-$BUILD_DIR/target/release/dem-tool}"
+# bin/layer-a.sh is called from here, so the binary and the scripts calling it
+# come from the same tree.
+cd "$BUILD_DIR"
+export TOOL
 
 BBOX="${1:--25,30,45,72}"
 

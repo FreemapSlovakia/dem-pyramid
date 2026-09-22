@@ -3,8 +3,9 @@
 # does not actually touch.
 #
 # Ordered by usefulness rather than alphabetically: central Europe first, so
-# the pyramid is usable within a day, and the Nordics last -- se+fi+no are 59%
-# of the tiles and roughly 3 TB of the 6.7 TB to read.
+# the pyramid is usable within a day, then the Nordics -- se+fi+no are 59% of
+# the tiles and roughly 3 TB of the 6.7 TB to read -- and last whatever the
+# sources have gained since, which nobody has put in an order yet.
 #
 # Tile lists come from each source's bbox, then get filtered against its
 # footprint. That matters: Norway's bbox spans 169 tiles while the country is a
@@ -19,12 +20,13 @@
 set -euo pipefail
 
 DEM_ROOT="${DEM_ROOT:-/fm/storage2/dem}"
-TOOL="${TOOL:-$DEM_ROOT/build/target/release/dem-tool}"
+BUILD_DIR="${BUILD_DIR:-$DEM_ROOT/build}"
+TOOL="${TOOL:-$BUILD_DIR/target/release/dem-tool}"
 # Overridable so a build can be driven from a checkout other than the deployed
 # one -- bringing a new source in without waiting for a deploy, say. The
 # scripts below are taken from here too, so the binary and the scripts that
 # call it stay from the same tree.
-cd "${BUILD_DIR:-$DEM_ROOT/build}"
+cd "$BUILD_DIR"
 export TOOL
 
 # Preferred order, not the list: central Europe first so the pyramid is usable
@@ -42,8 +44,15 @@ PREFERRED=(
 
 sources=("$@")
 if [ ${#sources[@]} -eq 0 ]; then
-  mapfile -t all < <("$TOOL" json | python3 -c 'import json,sys; [print(s["id"]) for s in json.load(sys.stdin)["sources"]]')
-  [ ${#all[@]} -gt 0 ] || { echo "build-all: no sources -- run dem-tool refresh" >&2; exit 1; }
+  # Captured rather than piped from a process substitution, whose failure
+  # `set -e` does not see: an empty list would otherwise read as "no sources"
+  # when what happened is that the cache could not be loaded.
+  listing=$("$TOOL" list) || {
+    echo "build-all: could not read the sources -- run dem-tool refresh" >&2
+    exit 1
+  }
+  mapfile -t all < <(printf '%s\n' "$listing" | tail -n +3 | awk '{print $1}')
+  [ ${#all[@]} -gt 0 ] || { echo "build-all: the cache holds no sources" >&2; exit 1; }
 
   sources=()
   for id in "${PREFERRED[@]}"; do
@@ -65,7 +74,18 @@ for id in "${sources[@]}"; do
   # Not in a process substitution: `set -e` does not see a failure there, and
   # an unknown id would read as a source with nothing to build rather than as
   # the mistake it is.
-  cover=$("$TOOL" cover "$id") || {
+  set +e
+  cover=$("$TOOL" cover "$id")
+  rc=$?
+  set -e
+
+  # 3 means the source spans the globe and wants a region named; bin/fallback.sh
+  # owns those. Anything else is a mistake worth stopping for.
+  if [ $rc -eq 3 ]; then
+    echo "=== $id: skipped -- built over a region by bin/fallback.sh"
+    continue
+  fi
+  [ $rc -eq 0 ] || {
     echo "build-all: $id: no such source" >&2
     exit 1
   }

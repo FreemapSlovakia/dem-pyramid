@@ -124,10 +124,14 @@ fn bbox_of(info: &serde_json::Value, path: &str) -> Result<[f64; 4]> {
         bail!("{path}: unusable geotransform");
     }
 
-    let (width, height) = (
-        info["size"][0].as_f64().unwrap_or(0.0),
-        info["size"][1].as_f64().unwrap_or(0.0),
-    );
+    let size = |i: usize| -> Result<f64> {
+        info["size"][i]
+            .as_f64()
+            .filter(|v| *v > 0.0)
+            .with_context(|| format!("{path}: no raster size"))
+    };
+
+    let (width, height) = (size(0)?, size(1)?);
 
     let wkt = info["coordinateSystem"]["wkt"]
         .as_str()
@@ -176,6 +180,17 @@ fn bbox_of(info: &serde_json::Value, path: &str) -> Result<[f64; 4]> {
 
     if held == 0 {
         bail!("{path}: no sampled point has a lon/lat");
+    }
+
+    // A partial failure -- PROJ refusing points outside the projection's area
+    // of use -- clips the box inwards, which is the direction that loses data,
+    // and the margin is nowhere near a dropped grid row.
+    if held < xs.len() {
+        eprintln!(
+            "  warning: {path}: {} of {} extent samples did not transform",
+            xs.len() - held,
+            xs.len()
+        );
     }
 
     if w >= e || s >= n_ {
@@ -328,6 +343,75 @@ mod tests {
         assert_eq!(fill_nodata_of(Some(-9999.0)), None);
         assert_eq!(fill_nodata_of(Some(3.4e38)), None);
         assert_eq!(fill_nodata_of(None), None);
+    }
+
+    /// A gdalinfo-shaped value for a raster in one UTM zone, high enough for
+    /// the meridian convergence to matter.
+    fn utm_info(epsg: u32, origin: (f64, f64), res: f64, size: (u32, u32)) -> serde_json::Value {
+        let srs = SpatialRef::from_epsg(epsg).unwrap();
+
+        serde_json::json!({
+            "geoTransform": [origin.0, res, 0.0, origin.1, 0.0, -res],
+            "size": [size.0, size.1],
+            "coordinateSystem": { "wkt": srs.to_wkt().unwrap() },
+        })
+    }
+
+    /// The corners of a projected rectangle do not bound it: its edges bow
+    /// outwards between them, and at high latitude by kilometres. Sampling the
+    /// interior has to find more than the corners do.
+    #[test]
+    fn the_extent_is_wider_than_its_corners() {
+        // UTM 33N, 400 km wide and 1000 km tall, reaching towards the pole.
+        let info = utm_info(32633, (300_000.0, 7_800_000.0), 1000.0, (400, 1000));
+        let [w, s, e, n] = bbox_of(&info, "synthetic").unwrap();
+
+        // The four corners alone, for comparison.
+        let mut src = SpatialRef::from_epsg(32633).unwrap();
+        let mut dst = SpatialRef::from_epsg(4326).unwrap();
+        src.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+        dst.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+        let ct = CoordTransform::new(&src, &dst).unwrap();
+
+        let mut xs = vec![300_000.0, 700_000.0, 300_000.0, 700_000.0];
+        let mut ys = vec![7_800_000.0, 7_800_000.0, 6_800_000.0, 6_800_000.0];
+        ct.transform_coords(&mut xs, &mut ys, &mut []).unwrap();
+
+        let hull_n = ys.iter().copied().fold(f64::MIN, f64::max);
+        let hull_s = ys.iter().copied().fold(f64::MAX, f64::min);
+
+        assert!(
+            n > hull_n,
+            "north edge {n} did not beat the corners {hull_n}"
+        );
+        assert!(
+            s < hull_s,
+            "south edge {s} did not beat the corners {hull_s}"
+        );
+        assert!(w < e && s < n, "degenerate box");
+    }
+
+    /// Erring wide costs a nodata read; erring narrow loses data.
+    #[test]
+    fn the_extent_is_padded_outwards() {
+        let info = utm_info(32633, (300_000.0, 6_000_000.0), 100.0, (1000, 1000));
+        let [w, s, e, n] = bbox_of(&info, "synthetic").unwrap();
+
+        assert!(e - w > 0.0 && n - s > 0.0);
+        // The margin is on every side, so the box grows by twice it.
+        assert!(
+            (e - w) > 2.0 * EXTENT_MARGIN_DEG,
+            "box narrower than its own margin"
+        );
+    }
+
+    #[test]
+    fn a_raster_with_no_size_says_so() {
+        let mut info = utm_info(32633, (300_000.0, 6_000_000.0), 100.0, (1000, 1000));
+        info["size"] = serde_json::json!([0, 0]);
+
+        let err = bbox_of(&info, "synthetic").unwrap_err().to_string();
+        assert!(err.contains("no raster size"), "{err}");
     }
 
     #[test]
