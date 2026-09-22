@@ -272,6 +272,7 @@ sources:
     native_res: 1.0
     crs: EPSG:2169 # LUREF / Luxembourg TM -- northing-first, no authority code
     nodata: declared # -9999
+    footprint: bbox # one file, correct nodata -- `tiles` has no VRT to read
     bbox: [5.732435, 49.446686, 6.534803, 50.182726]
     note: >-
       Overlaps the `be` bbox, since the Belgian province of Luxembourg sits
