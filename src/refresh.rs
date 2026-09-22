@@ -16,6 +16,7 @@ use std::path::Path;
 use crate::config::{FootprintMode, Nodata, Source, ground_res};
 use crate::credit::Entry;
 use crate::gdal_cli;
+use gdal::spatial_ref::{AxisMappingStrategy, CoordTransform, SpatialRef};
 
 /// Latitude the level/resolution table is quoted at. Central Europe, where
 /// most of the data is.
@@ -91,49 +92,102 @@ fn fill_nodata_of(nodata: Option<f64>) -> Option<u32> {
     (nodata == Some(0.0)).then_some(FILL_NODATA_MD)
 }
 
+/// How finely the raster is sampled when working out its lon/lat extent.
+/// 65x65 points, computed once per source, is not worth economising on.
+const EXTENT_STEPS: usize = 64;
+
+/// Degrees added to every side of the derived extent, to absorb what the
+/// sampling still misses between points.
+///
+/// Erring wide costs a read that finds nodata and falls through; erring narrow
+/// loses data silently. The bias is deliberate, and matches what the elevation
+/// API allows itself for the same derivation.
+const EXTENT_MARGIN_DEG: f64 = 0.01;
+
 /// The source's extent in lon/lat.
 ///
-/// Not `gdalinfo`'s `wgs84Extent`: that is the four corners transformed, and a
-/// projected edge bows away from the straight line between them -- a fifth of
-/// a degree for a UTM-width extent at high latitude, always outwards, so the
-/// corner hull clips it. `gdalwarp` walks the edges to size its output, so a
-/// VRT costs no pixels and answers with the extent the build itself would use.
-fn bbox_of(path: &str) -> Result<[f64; 4]> {
-    let tmp = std::env::temp_dir().join(format!(
-        "dem-extent-{}-{}.vrt",
-        std::process::id(),
-        path.bytes().map(u64::from).sum::<u64>()
-    ));
+/// Not the four corners transformed: a projected edge bows away from the
+/// straight line between them -- a fifth of a degree for a UTM-width extent at
+/// high latitude, always outwards, so a corner hull clips it. An interior grid
+/// catches that, and also the case an edge walk would miss: a polar
+/// stereographic sheet containing the pole reaches 90 degrees at an interior
+/// pixel, on no edge at all.
+fn bbox_of(info: &serde_json::Value, path: &str) -> Result<[f64; 4]> {
+    let gt: Vec<f64> = info["geoTransform"]
+        .as_array()
+        .with_context(|| format!("{path}: no geotransform"))?
+        .iter()
+        .map(|v| v.as_f64().unwrap_or(f64::NAN))
+        .collect();
 
-    let out = tmp.to_string_lossy().into_owned();
+    if gt.len() != 6 || gt.iter().any(|v| !v.is_finite()) {
+        bail!("{path}: unusable geotransform");
+    }
 
-    gdal_cli::run(
-        "gdalwarp",
-        &["-q", "-of", "VRT", "-t_srs", "EPSG:4326", path, &out],
-    )
-    .with_context(|| format!("{path}: could not compute the reprojected extent"))?;
+    let (width, height) = (
+        info["size"][0].as_f64().unwrap_or(0.0),
+        info["size"][1].as_f64().unwrap_or(0.0),
+    );
 
-    let info = gdal_cli::info_json(&out);
+    let wkt = info["coordinateSystem"]["wkt"]
+        .as_str()
+        .with_context(|| format!("{path}: no coordinate system"))?;
 
-    std::fs::remove_file(tmp).ok();
+    let mut src = SpatialRef::from_wkt(wkt).with_context(|| format!("{path}: unreadable CRS"))?;
+    let mut dst = SpatialRef::from_epsg(4326)?;
 
-    let info = info?;
-    let c = &info["cornerCoordinates"];
+    // Both, or EPSG:4326 hands back lat/lon and every box comes out transposed.
+    src.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+    dst.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
 
-    let at = |corner: &str, i: usize| -> Result<f64> {
-        c[corner][i]
-            .as_f64()
-            .with_context(|| format!("{path}: no {corner} corner"))
-    };
+    let ct = CoordTransform::new(&src, &dst)?;
 
-    let (w, n) = (at("upperLeft", 0)?, at("upperLeft", 1)?);
-    let (e, s) = (at("lowerRight", 0)?, at("lowerRight", 1)?);
+    let n = EXTENT_STEPS + 1;
+    let mut xs = Vec::with_capacity(n * n);
+    let mut ys = Vec::with_capacity(n * n);
 
-    if w >= e || s >= n {
+    for i in 0..n {
+        for j in 0..n {
+            let px = width * (i as f64) / (EXTENT_STEPS as f64);
+            let py = height * (j as f64) / (EXTENT_STEPS as f64);
+
+            xs.push(gt[0] + px * gt[1] + py * gt[2]);
+            ys.push(gt[3] + px * gt[4] + py * gt[5]);
+        }
+    }
+
+    // A point outside the projection's valid domain comes back non-finite and
+    // makes the whole call fail; it bounds nothing, so the survivors are what
+    // matter rather than the return.
+    drop(ct.transform_coords(&mut xs, &mut ys, &mut []));
+
+    let (mut w, mut s, mut e, mut n_) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    let mut held = 0usize;
+
+    for (lon, lat) in xs.iter().zip(&ys) {
+        if lon.is_finite() && lat.is_finite() && lat.abs() <= 90.0 {
+            w = w.min(*lon);
+            s = s.min(*lat);
+            e = e.max(*lon);
+            n_ = n_.max(*lat);
+            held += 1;
+        }
+    }
+
+    if held == 0 {
+        bail!("{path}: no sampled point has a lon/lat");
+    }
+
+    if w >= e || s >= n_ {
         bail!("{path}: degenerate extent");
     }
 
-    Ok([w, s, e, n])
+    Ok([
+        (w - EXTENT_MARGIN_DEG).max(-180.0),
+        (s - EXTENT_MARGIN_DEG).max(-90.0),
+        (e + EXTENT_MARGIN_DEG).min(180.0),
+        (n_ + EXTENT_MARGIN_DEG).min(90.0),
+    ])
 }
 
 /// Metres per pixel, whatever the CRS measures in.
@@ -168,7 +222,7 @@ pub fn derive(entry: &Entry, coarsest: u32, finest: u32) -> Result<Source> {
             Some(_) => Nodata::Declared("declared".to_owned()),
             None => bail!("{}: declares no nodata", entry.dir),
         },
-        bbox: bbox_of(&entry.file)?,
+        bbox: bbox_of(&info, &entry.file)?,
         finest_level,
         resampling: resampling_of(native_res, finest_level),
         footprint: footprint_of(&entry.file),
