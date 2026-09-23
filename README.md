@@ -3,8 +3,9 @@
 Build scripts for Freemap's elevation pyramid — the shared substrate for
 panorama, viewshed and (later) cast shadows.
 
-Scripts are authored here and rsynced to fm6; fm6 holds only a copy. All data
-lives on fm6 under `/fm/storage2/dem`.
+Authored here and deployed to fm6 by pushing to `main`, where the build
+directory is a checkout of this repository. All data lives on fm6 under
+`/fm/storage2/dem`.
 
 ## Layout
 
@@ -16,8 +17,9 @@ bin/sync.sh             push to fm6 and build there
 
 Orchestration is bash calling the GDAL command line tools; `dem-tool` holds the
 parts that are actual logic. It shells out to `gdalinfo -json`, `gdalsrsinfo`
-and `ogr2ogr` rather than linking libgdal, so it needs no C++ build and is not
-tied to the host's GDAL version.
+and `ogr2ogr` for most of that, and links libgdal where a subprocess per call
+would not do: the ray marcher reading the index, and the coordinate transforms
+that size each source's extent.
 
 The binary is built **on fm6** — its glibc (2.41) is older than the
 workstation's (2.42), so a locally built binary would not run there.
@@ -27,6 +29,7 @@ On fm6:
 ```
 /fm/storage2/dem/
   build/                this repo
+  state/sources.json    what `refresh` measured: every source the build reads
   footprints/           <id>.gpkg + summary.json
   norm/<id>/            Layer A: per-source zoom-aligned COGs + overviews
   index/z{14..8}.gti.gpkg   Layer B: composite, index only
@@ -58,20 +61,43 @@ rebuilds possible.
 
 ## Usage
 
-```sh
-bin/sync.sh                                    # local -> fm6, then cargo build
+Everything below runs on fm6 in `/fm/storage2/dem/build`. A push to `main`
+deploys the binary and the unit; `bin/sync.sh` pushes work in progress without
+one. Long steps go in tmux and log to `$DEM_ROOT/logs/<step>.log`, so nothing
+depends on staying attached.
 
-# on fm6, in /fm/storage2/dem/build:
-./target/release/dem-tool refresh              # measure the sources, cache it
-./target/release/dem-tool list
-./target/release/dem-tool check                # re-measure, fail if it drifted
+**Start with `check`.** It re-measures every source and names whatever no longer
+matches the cache, ending with the command that fixes it. That is how a dataset
+added to the source list upstream gets noticed rather than missed.
 
-bin/run.sh layer-a bash bin/build-all.sh       # footprints, then every tile
-tail -f /fm/storage2/dem/logs/layer-a.log
-```
+| to | run |
+| --- | --- |
+| see what the pyramid is built from | `./target/release/dem-tool list` |
+| find out whether the cache is current | `./target/release/dem-tool check` |
+| bring the cache up to date | `./target/release/dem-tool refresh` |
+| build tiles for whatever is new | `bin/run.sh layer-a bash bin/build-all.sh` |
+| make built tiles visible to renders | `bin/run.sh index bash bin/index.sh` |
+| materialise the global fallback | `bin/run.sh fallback bash bin/fallback.sh` |
 
-Long steps go in tmux and log to `$DEM_ROOT/logs/<step>.log`; nothing depends on
-staying attached.
+Each takes ids, levels or a bbox to narrow it; `--help` or the header comment
+says which.
+
+`refresh` is wanted when the source list gains or loses a dataset, when a raster
+is regenerated underneath, or when a deployed change alters how a value is
+derived. `check` says so; there is no reason to run it on a schedule, and none
+to fold it into a build, because it rewrites what `serve` reads for crediting
+and takes effect at the next restart.
+
+A change in coverage needs all three, in order: `refresh`, then `build-all`,
+then `index.sh`. `build-all` rebuilds the footprints it filters against, so that
+is two commands rather than three, and both are resumable — finished tiles are
+skipped, so killing and restarting costs nothing.
+
+The sources themselves are not configured here. They come from
+[`elevation-sources`](https://github.com/FreemapSlovakia/elevation-sources),
+checked out on fm6, which names each dataset's raster, its credit, and whether
+the pyramid builds it. Everything else about a source is measured from the
+raster.
 
 ## Pilot results (tile 70_44, 2026-08-20)
 
@@ -197,6 +223,9 @@ decoding it.
 
 ### Serving
 
+Runs as the `terrain` unit, installed from `deploy/terrain.service` by the
+deploy. By hand:
+
 ```sh
 ./target/release/dem-tool serve --listen 127.0.0.1:3100 \
     --peaks /fm/storage2/dem/peaks.gpkg
@@ -205,7 +234,11 @@ decoding it.
 One `POST /panorama` returning image, depth and peaks in a single
 multipart/form-data body. See [docs/API.md](docs/API.md).
 
-Not yet done: sun path, caching/precomputation, a systemd unit.
+It reads `state/sources.json` and the source list at startup and refuses to
+start if a source it would serve has no credit, so a render can always say
+whose data answered it.
+
+Not yet done: sun path, caching/precomputation.
 
 ## Known source hazards
 
