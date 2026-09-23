@@ -71,6 +71,18 @@ if [ ${#sources[@]} -eq 0 ]; then
   done
 fi
 
+# Footprints are what the tile filter below consults, they are derived from the
+# same cache this script reads, and rebuilding all of them takes about ten
+# seconds against the hours of warping that follow. Doing it here rather than
+# leaving it to whoever types the commands: a footprint left over from an older
+# cache silently filters out tiles the source now covers, and the build reports
+# success having skipped them.
+echo "=== footprints for ${#sources[@]} source(s)  ($(date -Is))"
+"$TOOL" footprints --only "$(IFS=,; echo "${sources[*]}")" || {
+  echo "build-all: could not rebuild footprints" >&2
+  exit 1
+}
+
 started=$(date +%s)
 done_tiles=0
 skipped=0

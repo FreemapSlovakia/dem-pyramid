@@ -62,12 +62,12 @@ rebuilds possible.
 bin/sync.sh                                    # local -> fm6, then cargo build
 
 # on fm6, in /fm/storage2/dem/build:
+./target/release/dem-tool refresh              # measure the sources, cache it
 ./target/release/dem-tool list
-./target/release/dem-tool check                # re-measure, fail on drift
-./target/release/dem-tool elevation-sources    # regenerate for freemap.conf
+./target/release/dem-tool check                # re-measure, fail if it drifted
 
-bin/run.sh footprints ./target/release/dem-tool footprints
-tail -f /fm/storage2/dem/logs/footprints.log
+bin/run.sh layer-a bash bin/build-all.sh       # footprints, then every tile
+tail -f /fm/storage2/dem/logs/layer-a.log
 ```
 
 Long steps go in tmux and log to `$DEM_ROOT/logs/<step>.log`; nothing depends on
@@ -223,6 +223,7 @@ Re-measured 2026-08-20, all 23 sources.
   Offsets are decimetre-scale — invisible to the ray marcher, visible in a
   hillshade seam check. Don't chase them.
 
-Priority runs **higher wins**, but note the two opposite conventions
-downstream: `freemap-v3-api` is first-wins, `gdalbuildvrt` is last-wins.
-`dem-tool elevation-sources` handles the reversal.
+Priority runs **higher wins**, and comes from the numeric prefix on the source
+list's directories, which ascend: `010-sk` outranks `999-gedtm30`. Note the two
+opposite conventions it sits between -- `freemap-v3-api` is first-wins,
+`gdalbuildvrt` is last-wins -- so the sign is flipped once, in `refresh`.

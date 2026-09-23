@@ -12,7 +12,7 @@
 # Status: $DEM_ROOT/state/<step-name>.status (exit code, written at the end)
 #
 # Detach with tmux so it survives ssh disconnect:
-#   tmux new-session -d -s dem 'bin/run.sh footprints ./target/release/dem-tool footprints'
+#   tmux new-session -d -s dem 'bin/run.sh layer-a bash bin/build-all.sh'
 # Then just tail the log -- nothing depends on attaching to the session.
 
 set -euo pipefail
