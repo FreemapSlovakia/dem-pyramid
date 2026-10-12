@@ -12,6 +12,7 @@ directory is a checkout of this repository. All data lives on fm6 under
 ```
 src/                    dem-tool: source measurement, staleness check, index plan, renders
 bin/index.sh            write the per-level indexes
+bin/peaks.sh            fetch the OSM peaks from fm5
 bin/run.sh              deprioritised, logged step runner
 bin/sync.sh             push to fm6 and build there
 ```
@@ -28,6 +29,8 @@ On fm6:
 /fm/storage2/dem/
   build/                this repo
   index/z{14..8}.gti.gpkg   one GTI per level: a row per dataset, its id and priority
+  peaks.gpkg            the peaks `serve` labels
+  peaks-osm.gpkg        the OSM peaks `bin/peaks.sh` fetched, which nothing serves yet
   logs/ state/ tmp/      step logs, step exit codes and the deploy marker, scratch
 ```
 
@@ -68,6 +71,7 @@ when the index lags the source list.
 | see what the pyramid serves | `./target/release/dem-tool list` |
 | find out whether anything is wrong | `./target/release/dem-tool check` |
 | index what the source list holds now | `bin/run.sh index bash bin/index.sh` |
+| fetch the current OSM peaks into `peaks-osm.gpkg` | `bin/run.sh peaks bash bin/peaks.sh` |
 
 `index.sh` takes levels to narrow it. Each level is written to a temporary file and moved into place,
 so killing it leaves the previous index; a full run takes minutes.

@@ -323,7 +323,7 @@ fn job_for(jobs: &Jobs, headers: &header::HeaderMap) -> (Option<Arc<Job>>, Optio
 
 pub async fn serve(
     root: PathBuf,
-    doc: Doc,
+    mut doc: Doc,
     elevation_sources: &std::path::Path,
     peaks_file: Option<PathBuf>,
     listen: &str,
@@ -333,6 +333,8 @@ pub async fn serve(
     credit::check_attributions(doc.sources.iter().map(|s| s.id.as_str()), &entries)?;
 
     let credits = credit::credits_of(&doc.sources, &entries);
+
+    crate::coverage::attach(&mut doc);
 
     let ctx = Ctx {
         root,

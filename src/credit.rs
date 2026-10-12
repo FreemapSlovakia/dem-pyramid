@@ -3,17 +3,13 @@
 //! The pyramid is a mosaic: by the time the marcher reads it, a sample carries
 //! no record of the source it came from. So this asks the question the other
 //! way round -- of the *view* rather than of the pixels -- by sweeping the
-//! ground the render can see and naming every source whose box covers it.
+//! ground within the render's range.
 //!
-//! *Every* box, not the highest priority one, because priority does not decide
-//! alone: nodata falls through at read time, so ground inside a national box is
-//! routinely served by whatever lies beneath. Naming only the top box would
-//! leave GEDTM30 credited nowhere -- it sits under all of them and answers most
-//! of the area their boxes overstate.
-//!
-//! Sources are compared by their measured lon/lat box, which bounds where one
-//! *could* contribute rather than where it has data, so the answer errs towards
-//! naming a model that contributed nothing.
+//! At each sample it names the source the mosaic takes that ground from: the
+//! highest priority one with data there, by its coverage. Not every source
+//! whose raster spans the point -- terrain-tiles' rasters are tile-aligned
+//! rectangles reaching far past their countries -- and not one buried under
+//! another, as GEDTM30 is wherever national data exists.
 //!
 //! Each dataset is reported as a model named after its directory without the
 //! number (`es-29`), carrying its own credit lines, so a client displays what
@@ -23,6 +19,7 @@
 //! tree -- and a dataset gained there is credited here without a release.
 
 use crate::config::{Doc, Source};
+use crate::grid::lonlat_to_merc;
 use crate::measure::{id_of, model_of};
 use crate::panorama::destination;
 use anyhow::{Context, Result, bail};
@@ -30,22 +27,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Floor on the sweep's cell. A model whose declared box is finer than this is
-/// a tile rather than a terrain model, and chasing it would cost more than the
-/// render being credited.
-const MIN_CELL_M: f64 = 1_000.0;
+/// The sweep's spacing: about a coverage cell, so a strip of data or a gap
+/// between two datasets the width of one is not stepped over.
+const CELL_M: f64 = 1_000.0;
 
-/// Backstops on the sweep, so a stray box cannot turn crediting into the
-/// expensive part of a render. Neither can bind at the ranges the routes
-/// allow -- at the `MIN_CELL_M` floor a 400 km sweep wants 566 rings and 2513
-/// bearings -- which is the point: binding would silently cost the coverage
-/// the sizing exists to guarantee rather than merely cap the cost.
+/// Backstops on the sweep. Neither binds at the ranges the routes allow -- a
+/// 400 km sweep wants 400 rings and 2513 bearings -- which is the point:
+/// binding would silently cost coverage rather than merely cap the cost.
 const MAX_RINGS: usize = 1024;
 const MAX_BEARINGS: usize = 4096;
-
-/// Metres per degree of latitude. Only ever used to size the sweep, where a
-/// sphere is close enough.
-const DEG_M: f64 = 111_320.0;
 
 /// How a model wants to be credited.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -202,10 +192,16 @@ pub struct Seen {
     pub attributions: Vec<Attribution>,
 }
 
-fn holds(source: &Source, lon: f64, lat: f64) -> bool {
+/// Whether a source has data at a point, given in lon/lat and projected:
+/// inside its box, and where coverage is attached, on a cell that holds data.
+fn holds(source: &Source, (lon, lat): (f64, f64), (x, y): (f64, f64)) -> bool {
     let [w, s, e, n] = source.bbox;
 
-    lon >= w && lon <= e && lat >= s && lat <= n
+    lon >= w
+        && lon <= e
+        && lat >= s
+        && lat <= n
+        && source.coverage.as_ref().is_none_or(|c| c.has(x, y))
 }
 
 /// `destination` adds a signed delta to the longitude without wrapping it, so
@@ -213,18 +209,6 @@ fn holds(source: &Source, lon: f64, lat: f64) -> bool {
 /// holds it, not even the global one, and the render is credited to nothing.
 fn wrap_lon(lon: f64) -> f64 {
     (lon + 180.0).rem_euclid(360.0) - 180.0
-}
-
-/// The shorter side of a source's declared box, metres.
-///
-/// Longitude is measured at the pole-most edge, where a degree is shortest, so
-/// the answer is the box at its narrowest rather than at its widest.
-fn box_extent_m(source: &Source) -> f64 {
-    let [w, s, e, n] = source.bbox;
-    let lat_m = (n - s) * DEG_M;
-    let lon_m = (e - w) * DEG_M * s.abs().max(n.abs()).to_radians().cos();
-
-    lat_m.min(lon_m)
 }
 
 /// What a render is answered from: the models behind a sector of ground, most
@@ -250,32 +234,29 @@ pub fn sources_seen(
         return Vec::new();
     }
 
-    // Sized from the smallest box in the catalogue rather than fixed, so
-    // adding a city-scale model tightens the sweep instead of silently going
-    // uncredited.
-    //
-    // Divided by sqrt(2) because the sweep is a lattice and the boxes are
-    // axis-aligned lon/lat: samples a box's own width apart leave a diagonal
-    // gap of that width times sqrt(2), and a box the size of the one that set
-    // the spacing drops into it. The half-diagonal is what has to fit.
-    let cell = doc
-        .sources
-        .iter()
-        .map(box_extent_m)
-        .fold(f64::INFINITY, f64::min)
-        .max(MIN_CELL_M)
-        / std::f64::consts::SQRT_2;
+    let cell = CELL_M;
 
     let mut hit = vec![false; doc.sources.len()];
     let mut left = doc.sources.len();
 
-    // Not `position`: nodata falls through, so every box over a sample is a
-    // source that could have answered it, not just the first.
+    // The first in priority order with data, as the mosaic picks. Projected
+    // once per sample rather than once per source asked.
+    //
+    // One without coverage is known only by its raster's box, which reaches
+    // far past its data, so it is credited throughout the box without hiding
+    // what lies beneath.
     let mark = |plon: f64, plat: f64, hit: &mut Vec<bool>, left: &mut usize| {
-        for (i, source) in doc.sources.iter().enumerate() {
-            if !hit[i] && holds(source, plon, plat) {
+        let merc = lonlat_to_merc(plon, plat);
+        for (i, s) in doc.sources.iter().enumerate() {
+            if !holds(s, (plon, plat), merc) {
+                continue;
+            }
+            if !hit[i] {
                 hit[i] = true;
                 *left -= 1;
+            }
+            if s.coverage.is_some() {
+                break;
             }
         }
     };
@@ -284,21 +265,17 @@ pub fn sources_seen(
 
     let rings = ((range_m / cell).ceil() as usize).clamp(1, MAX_RINGS);
 
-    // Held so the arc between neighbouring bearings stays within a cell at the
-    // far edge, where they are furthest apart.
-    let step_deg = if range_m > 0.0 {
-        (cell / range_m).to_degrees()
-    } else {
-        fov_deg.max(1.0)
-    };
+    'sweep: for r in 1..=rings {
+        let dist = range_m * (r as f64) / (rings as f64);
 
-    let steps = ((fov_deg / step_deg).ceil() as usize).clamp(1, MAX_BEARINGS);
+        // As many bearings as keep neighbours within a cell on this ring, so
+        // the near rings are not sampled as densely as the far edge needs.
+        let arc = dist * fov_deg.to_radians();
+        let steps = ((arc / cell).ceil() as usize).clamp(1, MAX_BEARINGS);
 
-    'sweep: for b in 0..=steps {
-        let az = az_start + fov_deg * (b as f64) / (steps as f64);
-
-        for r in 1..=rings {
-            let (plon, plat) = destination(lon, lat, az, range_m * (r as f64) / (rings as f64));
+        for b in 0..=steps {
+            let az = az_start + fov_deg * (b as f64) / (steps as f64);
+            let (plon, plat) = destination(lon, lat, az, dist);
 
             mark(wrap_lon(plon), plat, &mut hit, &mut left);
 
@@ -325,6 +302,9 @@ pub fn sources_seen(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Metres per degree of latitude, on a sphere.
+    const DEG_M: f64 = 111_320.0;
     use crate::config::Grid;
 
     fn source(model: &str, priority: i64, bbox: [f64; 4]) -> Source {
@@ -332,6 +312,8 @@ mod tests {
             id: model.replace('-', "_"),
             priority,
             bbox,
+            location: String::new(),
+            coverage: None,
         }
     }
 
@@ -356,20 +338,77 @@ mod tests {
         seen.iter().map(|s| s.source.as_str()).collect()
     }
 
-    /// The whole point of the feature: the fallback under a national box is
-    /// what actually answers the ground that box overstates, so it has to be
-    /// credited alongside it rather than hidden by it.
+    /// A source whose data fills its box, as a coverage mask.
+    fn full(s: Source) -> Source {
+        masked(s, "##")
+    }
+
+    /// A source whose data covers the box only on its western half: the shape
+    /// of a country inside its tile-aligned raster.
+    fn west_half(s: Source) -> Source {
+        masked(s, "#.")
+    }
+
+    fn masked(mut s: Source, row: &str) -> Source {
+        let [w, south, e, n] = s.bbox;
+        let (x0, y0) = crate::grid::lonlat_to_merc(w, n);
+        let (x1, y1) = crate::grid::lonlat_to_merc(e, south);
+        let cell = (x1 - x0) / 2.0;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rows = vec![row; ((y0 - y1) / cell).ceil() as usize];
+        s.coverage = Some(std::sync::Arc::new(crate::coverage::from_cells(
+            x0, y0, cell, &rows,
+        )));
+        s
+    }
+
+    const WORLD: [f64; 4] = [-180.0, -65.0, 180.0, 85.0];
+
+    /// The mosaic takes the ground from the highest priority source with data,
+    /// so the fallback beneath it answers none of it and is not credited.
     #[test]
-    fn a_source_is_credited_through_the_box_above_it() {
+    fn a_buried_fallback_is_not_credited() {
         let doc = doc(vec![
-            source("fr", 175, [-5.539817, 41.269923, 10.708437, 51.094491]),
-            source("gedtm30", 0, [-180.00125, -65.00125, 180.00125, 85.00125]),
+            full(source(
+                "fr",
+                175,
+                [-5.539817, 41.269923, 10.708437, 51.094491],
+            )),
+            source("gedtm30", 0, WORLD),
         ]);
 
-        // Deep inside France, so every sample lands in `fr`'s box too.
         let seen = sources_seen(&doc, &Credits::new(), 2.5, 46.5, 100_000.0, 0.0, 360.0);
 
+        assert_eq!(names(&seen), ["fr"]);
+    }
+
+    /// Where the national raster has no data, the fallback answers, and is.
+    #[test]
+    fn the_fallback_is_credited_where_nothing_above_has_data() {
+        let doc = doc(vec![
+            west_half(source("fr", 175, [0.0, 44.0, 4.0, 48.0])),
+            source("gedtm30", 0, WORLD),
+        ]);
+
+        // In the western half, seeing into the eastern one.
+        let seen = sources_seen(&doc, &Credits::new(), 1.0, 46.0, 150_000.0, 0.0, 360.0);
+
         assert_eq!(names(&seen), ["fr", "gedtm30"]);
+    }
+
+    /// A raster whose rectangle reaches the viewpoint but whose data does not
+    /// is not credited: the case of every tile-aligned national raster.
+    #[test]
+    fn a_raster_is_credited_only_where_it_has_data() {
+        let doc = doc(vec![
+            west_half(source("nl", 247, [0.0, 44.0, 8.0, 48.0])),
+            source("gedtm30", 0, WORLD),
+        ]);
+
+        // 100 km inside the empty eastern half, seeing 50 km.
+        let seen = sources_seen(&doc, &Credits::new(), 6.5, 46.0, 50_000.0, 0.0, 360.0);
+
+        assert_eq!(names(&seen), ["gedtm30"]);
     }
 
     /// Most authoritative first, one entry per dataset, named after its
@@ -377,8 +416,16 @@ mod tests {
     #[test]
     fn each_dataset_is_its_own_model_in_priority_order() {
         let doc = doc(vec![
-            source("es-29", 190, [-9.380774, 36.058592, -5.458629, 43.863392]),
-            source("es-30", 189, [-6.926858, 35.180057, 0.24331, 43.736066]),
+            full(source(
+                "es-29",
+                190,
+                [-9.380774, 36.058592, -5.458629, 43.863392],
+            )),
+            full(source(
+                "es-30",
+                189,
+                [-6.926858, 35.180057, 0.24331, 43.736066],
+            )),
             source("gedtm30", 0, [-180.00125, -65.00125, 180.00125, 85.00125]),
         ]);
 
@@ -388,9 +435,11 @@ mod tests {
             entry("999-gedtm30", true),
         ];
         let credits = credits_of(&doc.sources, &list);
-        let seen = sources_seen(&doc, &credits, -6.0, 40.0, 50_000.0, 0.0, 360.0);
+        // In es-30's own ground, seeing west into es-29's.
+        let seen = sources_seen(&doc, &credits, -5.0, 40.0, 200_000.0, 0.0, 360.0);
 
-        assert_eq!(names(&seen), ["es-29", "es-30", "gedtm30"]);
+        // gedtm30 lies under both, answering none of it.
+        assert_eq!(names(&seen), ["es-29", "es-30"]);
     }
 
     /// The sweep is sized from the smallest box in the catalogue, so a source

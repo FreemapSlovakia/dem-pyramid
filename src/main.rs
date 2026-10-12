@@ -11,6 +11,7 @@ use std::path::PathBuf;
 mod avif;
 mod check;
 mod config;
+mod coverage;
 mod credit;
 mod gdal_cli;
 mod gradient;

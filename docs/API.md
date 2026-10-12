@@ -551,14 +551,13 @@ several surveys, each with its own licence. **Credit these rather than the
 whole catalogue**, and render what you are given rather than keeping a copy of
 the licence text.
 
-They are derived from the *view*, not from the pixels: the mosaic keeps no
-record of where a sample came from, so the sector is swept and every model whose
-box covers a sample is named. Every one, not just the highest priority: nodata
-falls through, so ground inside a national box is routinely served by whatever
-lies beneath it -- GEDTM30 answers much of the area the national boxes
-overstate. Sources are compared by their measured lon/lat box, which bounds
-where one *could* contribute, so the list errs towards naming a model that
-contributed nothing.
+They are derived from the ground within range, not from the pixels: the
+mosaic keeps no record of where a sample came from, so the sector is swept
+and, at each sample, the dataset the mosaic takes that ground from is named —
+the highest priority one with data there. A dataset lying under another, as
+GEDTM30 does wherever national data exists, is named only where it answers.
+Coverage is known to about a kilometre, and every dataset with data anywhere
+in the swept sector is named, hidden from the viewpoint or not.
 
 The credit lines are not this service's. They are read at startup from the
 elevation API's own source list (`--elevation-sources`, default

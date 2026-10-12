@@ -12,7 +12,9 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::coverage::Coverage;
 use crate::grid::merc_to_lonlat;
+use std::sync::Arc;
 
 /// Web Mercator, full extent, in projected metres.
 pub const EARTH_CIRCUMFERENCE: f64 = 2.0 * std::f64::consts::PI * 6378137.0;
@@ -42,7 +44,15 @@ pub struct Source {
     pub id: String,
     /// The directory's number, negated: higher wins.
     pub priority: i64,
+    /// The raster's extent, or where it has data once `coverage` is attached.
     pub bbox: [f64; 4],
+    /// Its row on the coarsest level that holds it.
+    #[serde(skip)]
+    pub location: String,
+    /// Where it has data; `serve` attaches it, so crediting can tell a
+    /// country from the tile-aligned rectangle its raster fills.
+    #[serde(skip)]
+    pub coverage: Option<Arc<Coverage>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -173,6 +183,8 @@ pub fn from_levels(levels: &Levels, grid: Grid) -> Result<Doc> {
                     id: r.dataset.clone(),
                     priority: r.priority,
                     bbox: r.bbox,
+                    location: r.location.clone(),
+                    coverage: None,
                 });
             }
         }
