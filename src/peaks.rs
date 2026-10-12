@@ -266,8 +266,8 @@ pub fn load(path: &Path, lon: f64, lat: f64, range: f64) -> Result<Vec<Peak>> {
             revealed: false,
             dominance: 0.0,
             // Absent rather than zero where the column does not exist: a
-            // peaks file predating `bin/prominence-join.sh` has six fields,
-            // not eight, and "no prominence known" is not "prominence 0".
+            // peaks file without prominence has six fields, not eight, and
+            // "no prominence known" is not "prominence 0".
             prominence: f.get(6).and_then(|s| s.parse().ok()),
             prom_dist_m: f.get(7).and_then(|s| s.parse().ok()),
             rank: None,
