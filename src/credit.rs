@@ -327,6 +327,7 @@ mod tests {
                 coarsest_level: 5,
             },
             sources,
+            blocks: std::sync::Arc::new(crate::blocks::BlockCache::new(0)),
         }
     }
 

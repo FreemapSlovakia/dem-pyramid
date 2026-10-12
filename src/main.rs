@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod avif;
+mod blocks;
 mod check;
 mod config;
 mod coverage;
@@ -33,6 +34,10 @@ struct Cli {
     finest_level: u32,
     #[arg(long, global = true, default_value_t = 8)]
     coarsest_level: u32,
+
+    /// Memory for pyramid blocks shared by every render, megabytes.
+    #[arg(long, global = true, default_value_t = 1536)]
+    block_cache_mb: u64,
 
     /// Data root on the build host.
     #[arg(
@@ -242,7 +247,7 @@ fn main() -> Result<()> {
 
     let (coarsest, finest) = (grid.coarsest_level, grid.finest_level);
     let index_dir = config::index_dir(&cli.root);
-    let index = |grid| config::load(&index_dir, grid);
+    let index = |grid| config::load(&index_dir, grid, cli.block_cache_mb);
 
     match cli.command {
         Command::List => {
@@ -412,7 +417,7 @@ fn main() -> Result<()> {
                 supersample_y
             );
             println!(
-                "marched    {} samples, {} blocks cached, {:.2} s",
+                "marched    {} samples, {} blocks read, {:.2} s",
                 stats.samples,
                 stats.blocks,
                 elapsed.as_secs_f64()

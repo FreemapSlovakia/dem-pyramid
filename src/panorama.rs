@@ -22,8 +22,10 @@ use gdal::Dataset;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::blocks::{self, BLOCK, Block, BlockCache};
 use crate::config::{Doc, ground_res};
 use crate::grid::lonlat_to_merc;
 use crate::peaks::Peak;
@@ -38,7 +40,6 @@ const CELL_PER_METRE: f64 = 0.00087;
 /// Ground radius a summit must stand clear of to count as dominant, metres.
 /// One decision, so it sets both the depth band and the angular window.
 const DOMINANCE_RADIUS: f64 = 3000.0;
-const BLOCK: usize = 512;
 
 pub struct Params {
     pub lon: f64,
@@ -284,73 +285,63 @@ fn clears(alt: f64, h0: f64, h1: f64, t: f64) -> bool {
     }
 }
 
-/// One pyramid level, with a block cache over its GTI index.
+/// One pyramid level: this thread's handle on its GTI index, over the blocks
+/// every thread shares.
 struct Level {
     z: u32,
-    ds: Dataset,
+    ds: Rc<Dataset>,
+    generation: u128,
     gt: [f64; 6],
     w: usize,
     h: usize,
-    /// Blocks in arrival order; `None` where the index has no tile.
-    blocks: Vec<Option<Vec<u16>>>,
-    /// Where each block landed, so a repeat visit finds it.
-    index: HashMap<(i64, i64), usize>,
+    cache: Arc<BlockCache>,
     /// The block the last lookup wanted.
     ///
     /// A ray walks continuously and bilinear reads four neighbouring corners,
     /// so successive lookups nearly always want the block the previous one
-    /// did. Without this every corner of every sample hashes its key -- and
-    /// the default hasher is SipHash, which is cryptographic. It measured 45%
-    /// of an entire render, against 1% for all the trigonometry.
-    last: Option<((i64, i64), usize)>,
+    /// did. Without this every corner of every sample would take a lock and
+    /// hash its key.
+    last: Option<((i64, i64), Block)>,
+    /// Blocks this level read rather than found cached.
+    reads: usize,
 }
 
 impl Level {
-    fn open(root: &Path, z: u32) -> Result<Option<Self>> {
+    fn open(root: &Path, z: u32, cache: &Arc<BlockCache>) -> Result<Option<Self>> {
         let path = crate::config::level_path(&crate::config::index_dir(root), z);
         if !path.exists() {
             return Ok(None);
         }
-        let ds = Dataset::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        let generation = blocks::generation(&path);
+        let ds = blocks::dataset(&path, generation)
+            .with_context(|| format!("opening {}", path.display()))?;
         let gt = ds.geo_transform()?;
         let (w, h) = ds.raster_size();
         Ok(Some(Self {
             z,
             ds,
+            generation,
             gt,
             w,
             h,
-            blocks: Vec::new(),
-            index: HashMap::new(),
+            cache: cache.clone(),
             last: None,
+            reads: 0,
         }))
     }
 
-    /// Elevation at integer pixel coordinates, or None for nodata / off-grid.
-    /// The block covering `key`, reading it in on first use.
-    ///
-    /// One hash at most, and usually none: the previous key is checked first,
-    /// and the old code hashed twice per corner -- `contains_key` then `get` --
-    /// so eight times per bilinear sample.
+    /// The block covering `key`, from the shared cache or read into it.
     fn block_at(&mut self, key: (i64, i64)) -> Option<&[u16]> {
-        let slot = match self.last {
-            Some((k, i)) if k == key => i,
-            _ => {
-                let i = match self.index.get(&key) {
-                    Some(&i) => i,
-                    None => {
-                        let block = self.read_block(key);
-                        self.blocks.push(block);
-                        let i = self.blocks.len() - 1;
-                        self.index.insert(key, i);
-                        i
-                    }
-                };
-                self.last = Some((key, i));
-                i
-            }
-        };
-        self.blocks[slot].as_deref()
+        if self.last.as_ref().is_none_or(|(k, _)| *k != key) {
+            let (block, read) = self
+                .cache
+                .get_or_read((self.generation, self.z, key.0, key.1), || {
+                    self.read_block(key)
+                });
+            self.reads += usize::from(read);
+            self.last = Some((key, block));
+        }
+        self.last.as_ref().and_then(|(_, b)| b.as_deref())
     }
 
     fn value_at(&mut self, px: usize, py: usize) -> Option<f64> {
@@ -404,28 +395,34 @@ impl Level {
         }
     }
 
-    fn read_block(&self, (bx, by): (i64, i64)) -> Option<Vec<u16>> {
+    /// A full BLOCK x BLOCK tile, so indexing stays uniform, with the ragged
+    /// edge left as nodata -- or `None` for one with no data at all.
+    fn read_block(&self, (bx, by): (i64, i64)) -> gdal::errors::Result<Block> {
         let x0 = bx as usize * BLOCK;
         let y0 = by as usize * BLOCK;
         let w = BLOCK.min(self.w.saturating_sub(x0));
         let h = BLOCK.min(self.h.saturating_sub(y0));
         if w == 0 || h == 0 {
-            return None;
+            return Ok(None);
         }
 
-        let band = self.ds.rasterband(1).ok()?;
-        let buf = band
-            .read_as::<u16>((x0 as isize, y0 as isize), (w, h), (w, h), None)
-            .ok()?;
+        let buf = self.ds.rasterband(1)?.read_as::<u16>(
+            (x0 as isize, y0 as isize),
+            (w, h),
+            (w, h),
+            None,
+        )?;
         let data = buf.data();
 
-        // Always store a full BLOCK x BLOCK tile so indexing stays uniform;
-        // the ragged edge is left as nodata.
+        if data.iter().all(|&v| v == 0) {
+            return Ok(None);
+        }
+
         let mut out = vec![0u16; BLOCK * BLOCK];
         for row in 0..h {
             out[row * BLOCK..row * BLOCK + w].copy_from_slice(&data[row * w..row * w + w]);
         }
-        Some(out)
+        Ok(Some(Arc::from(out)))
     }
 }
 
@@ -438,7 +435,7 @@ impl Pyramid {
     pub(crate) fn open(root: &Path, doc: &Doc) -> Result<Self> {
         let mut levels = Vec::new();
         for z in doc.grid.coarsest_level..=doc.grid.finest_level {
-            if let Some(l) = Level::open(root, z)? {
+            if let Some(l) = Level::open(root, z, &doc.blocks)? {
                 levels.push(l);
             }
         }
@@ -465,14 +462,16 @@ impl Pyramid {
         }
     }
 
+    /// Blocks this pyramid read rather than found cached. Each block is read
+    /// by one thread only, so these add up across a render's threads.
+    fn reads(&self) -> usize {
+        self.levels.iter().map(|l| l.reads).sum()
+    }
+
     /// Finest available elevation at a point, for the eye position.
     pub(crate) fn sample_finest(&mut self, x: f64, y: f64) -> Option<f64> {
         let top = self.levels.last().map(|l| l.z)?;
         self.sample(top, x, y)
-    }
-
-    fn cached_blocks(&self) -> usize {
-        self.levels.iter().map(|l| l.blocks.len()).sum()
     }
 }
 
@@ -1506,7 +1505,7 @@ pub fn render(
         pixels: Vec<[u8; 3]>,
         depth: Vec<u16>,
         samples: usize,
-        blocks: usize,
+        reads: usize,
         sky: usize,
         /// Peak index, which bracketing ray this was, and that ray's horizon
         /// angle at the peak's distance.
@@ -1641,7 +1640,7 @@ pub fn render(
                 pixels,
                 depth,
                 samples,
-                blocks: pyr.cached_blocks(),
+                reads: pyr.reads(),
                 sky,
                 answers: peak_results,
                 profile,
@@ -1653,7 +1652,7 @@ pub fn render(
     let mut depth_img =
         image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::new(out_w as u32, out_h as u32);
     let mut samples = 0usize;
-    let mut blocks = 0usize;
+    let mut reads = 0usize;
     let mut sky = 0usize;
     let mut cells = 0usize;
     // Horizon angle from each bracketing ray, per peak.
@@ -1671,7 +1670,7 @@ pub fn render(
             ..
         } = &part;
         samples += part.samples;
-        blocks += part.blocks;
+        reads += part.reads;
         sky += part.sky;
         for &(i, slot, h) in &part.answers {
             horizon[i][slot as usize] = h;
@@ -1775,7 +1774,7 @@ pub fn render(
             height: out_h,
             eye_elevation: eye,
             samples,
-            blocks,
+            blocks: reads,
             sky_fraction: sky as f64 / cells.max(1) as f64,
             peak_profile_step: grid.step,
             far_distance,

@@ -119,7 +119,7 @@ early.
 
 Level is chosen per sample -- the coarsest whose ground cell still resolves the
 angular step at that distance -- which is what keeps cost logarithmic in range.
-A full 360° at 0.05°/px marches ~52 M samples in ~15 s, touching ~400 cached
+A full 360° at 0.05°/px marches ~52 M samples in ~15 s, reading ~400
 blocks (well under 100 MB).
 
 Sampling is bilinear. With nearest-neighbour, adjacent rays at 2 km are 1.75 m

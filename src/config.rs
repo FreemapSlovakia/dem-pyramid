@@ -12,6 +12,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::blocks::BlockCache;
 use crate::coverage::Coverage;
 use crate::grid::merc_to_lonlat;
 use std::sync::Arc;
@@ -55,10 +56,13 @@ pub struct Source {
     pub coverage: Option<Arc<Coverage>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct Doc {
     pub grid: Grid,
     pub sources: Vec<Source>,
+    /// Pyramid blocks, shared by every render this process makes.
+    #[serde(skip)]
+    pub blocks: Arc<BlockCache>,
 }
 
 /// One row of one level's index.
@@ -173,7 +177,7 @@ pub fn read_levels(index_dir: &Path, grid: &Grid) -> Result<Levels> {
 /// its own rows, so priorities that differ or collide between levels -- an
 /// index run cut short across a renumbering -- cost only the order credits
 /// are listed in, which takes the coarsest level's; `check` reports the lag.
-pub fn from_levels(levels: &Levels, grid: Grid) -> Result<Doc> {
+pub fn from_levels(levels: &Levels, grid: Grid, cache_mb: u64) -> Result<Doc> {
     let mut sources: Vec<Source> = Vec::new();
 
     for (_, rows) in levels {
@@ -198,11 +202,15 @@ pub fn from_levels(levels: &Levels, grid: Grid) -> Result<Doc> {
     // would take it from.
     sources.sort_by_key(|s| -s.priority);
 
-    Ok(Doc { grid, sources })
+    Ok(Doc {
+        grid,
+        sources,
+        blocks: Arc::new(BlockCache::new(cache_mb)),
+    })
 }
 
-pub fn load(index_dir: &Path, grid: Grid) -> Result<Doc> {
-    from_levels(&read_levels(index_dir, &grid)?, grid)
+pub fn load(index_dir: &Path, grid: Grid, cache_mb: u64) -> Result<Doc> {
+    from_levels(&read_levels(index_dir, &grid)?, grid, cache_mb)
 }
 
 /// Datasets the mosaic can order: no id twice and no priority shared, given as
@@ -253,7 +261,7 @@ mod tests {
             (8, vec![row("sk", -10)]),
             (14, vec![row("sk", -10), row("de_by", -245)]),
         ];
-        let ids: Vec<String> = from_levels(&levels, grid())
+        let ids: Vec<String> = from_levels(&levels, grid(), 0)
             .unwrap()
             .sources
             .into_iter()
@@ -271,7 +279,7 @@ mod tests {
             (8, vec![row("sk", -10), row("cz", -20)]),
             (14, vec![row("sk", -20), row("cz", -10), row("pl", -10)]),
         ];
-        let doc = from_levels(&levels, grid()).unwrap();
+        let doc = from_levels(&levels, grid(), 0).unwrap();
 
         assert_eq!(doc.sources[0].id, "sk");
         assert_eq!(doc.sources.len(), 3);

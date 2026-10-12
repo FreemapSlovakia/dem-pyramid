@@ -79,7 +79,7 @@ pub fn run(index_dir: &Path, elevation_sources: &Path, g: Grid) -> Result<()> {
     let lag = match &levels {
         Ok(levels) => {
             let lag = lagging(levels, &rasters, &g);
-            match config::from_levels(levels, g) {
+            match config::from_levels(levels, g, 0) {
                 Ok(doc) => {
                     let ids = doc.sources.iter().map(|s| s.id.as_str());
                     if let Err(e) = credit::check_attributions(ids, &entries) {

@@ -48,6 +48,9 @@ IOSchedulingPriority=6
 # memory while the RGBA image is still live, and 96 megapixels then become
 # 10-bit 4:4:4.
 #
+# On top of that the pyramid blocks every render shares, up to 1.5 GB
+# (`--block-cache-mb`), and the index levels each render thread keeps open.
+#
 # Affordable on 62 GB, and renders are serialised. The cap is here because
 # nothing else bounds it: a Rust allocation failure aborts rather than failing
 # the request, so without this a pathological render competes with the tile
@@ -55,8 +58,13 @@ IOSchedulingPriority=6
 # and restarts than that it takes the site with it.
 #
 # High before Max, so the kernel reclaims and throttles before it kills.
-MemoryHigh=8G
-MemoryMax=12G
+MemoryHigh=10G
+MemoryMax=14G
+
+# Every render thread keeps each index level open across requests, and each
+# level its sources behind it: ~200 descriptors after a dozen renders, more as
+# threads come and go. Headroom over systemd's soft default of 1024.
+LimitNOFILE=65536
 
 # The service drains on SIGTERM instead of dropping renders, so a restart has
 # to wait for the render in flight -- one, since the queue behind it is shed.
