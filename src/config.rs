@@ -58,7 +58,7 @@ pub struct Doc {
 pub fn validate(sources: &[Source]) -> Result<()> {
     // An index over nothing renders nothing; this is a broken source list.
     if sources.is_empty() {
-        bail!("no dataset is marked for the pyramid");
+        bail!("no dataset in the source list links a mercator.tif");
     }
 
     let mut by_id: HashMap<&str, ()> = HashMap::new();

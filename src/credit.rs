@@ -72,9 +72,6 @@ struct SourceJson {
     name: String,
     #[serde(default)]
     attributions: Vec<Attribution>,
-    /// Whether the pyramid reads this dataset.
-    #[serde(default)]
-    pyramid: bool,
 }
 
 /// One dataset in the elevation API's list.
@@ -88,8 +85,10 @@ pub struct Entry {
     /// The model this dataset belongs to; several entries share one.
     pub name: String,
     pub attributions: Vec<Attribution>,
-    /// Whether the pyramid reads this dataset.
-    pub pyramid: bool,
+    /// Whether the directory links a `mercator.tif`, which is what puts a
+    /// dataset in the pyramid. A dangling link counts, so `refresh` reports it
+    /// rather than quietly leaving the dataset out.
+    pub mercator: bool,
 }
 
 /// Reads the elevation API's source tree: one subdirectory per dataset, each
@@ -126,7 +125,7 @@ pub fn load_entries(dir: &Path) -> Result<Vec<Entry>> {
             path: subdir.clone(),
             name: parsed.name,
             attributions: parsed.attributions,
-            pyramid: parsed.pyramid,
+            mercator: subdir.join("mercator.tif").symlink_metadata().is_ok(),
         });
     }
 
@@ -148,7 +147,7 @@ pub fn credits_of(sources: &[Source], entries: &[Entry]) -> Credits {
 
     for entry in entries
         .iter()
-        .filter(|e| e.pyramid && sources.iter().any(|s| s.id == id_of(&e.dir)))
+        .filter(|e| e.mercator && sources.iter().any(|s| s.id == id_of(&e.dir)))
     {
         let into = credits.entry(entry.name.clone()).or_default();
 
@@ -171,17 +170,17 @@ pub fn credits_of(sources: &[Source], entries: &[Entry]) -> Credits {
 /// be served confidently miscredited, which is worse than being uncredited.
 pub fn check_attributions(sources: &[Source], entries: &[Entry]) -> Result<()> {
     for source in sources {
-        // `pyramid` too: a dataset since unmarked upstream would otherwise go
-        // on being served on the strength of a cache that predates it.
-        // By id rather than directory, so a renumbered dataset is still credited
-        // until `refresh` picks up its new priority.
+        // `mercator` too: a dataset whose raster was unlinked upstream would
+        // otherwise go on being served on the strength of a cache that
+        // predates it. By id rather than directory, so a renumbered dataset is
+        // still credited until `refresh` picks up its new priority.
         let Some(entry) = entries
             .iter()
-            .find(|e| e.pyramid && id_of(&e.dir) == source.id)
+            .find(|e| e.mercator && id_of(&e.dir) == source.id)
         else {
             bail!(
-                "{}: no longer marked for the pyramid in the elevation source \
-                 list, so nothing says how to credit it",
+                "{}: no longer has a mercator.tif in the elevation source list, \
+                 so nothing says how to credit it",
                 source.id
             );
         };
@@ -559,7 +558,7 @@ mod tests {
             dir: dir.into(),
             path: dir.into(),
             name: name.into(),
-            pyramid: true,
+            mercator: true,
             attributions: if credited {
                 vec![Attribution {
                     name: "DMR 5.0: ÚGKK SR".into(),
@@ -580,9 +579,9 @@ mod tests {
         assert!(check_attributions(&doc.sources, &[entry("100-sk", "sk", false)]).is_err());
         assert!(check_attributions(&doc.sources, &[entry("100-sk", "sk", true)]).is_ok());
 
-        let mut unmarked = entry("100-sk", "sk", true);
-        unmarked.pyramid = false;
-        assert!(check_attributions(&doc.sources, &[unmarked]).is_err());
+        let mut unlinked = entry("100-sk", "sk", true);
+        unlinked.mercator = false;
+        assert!(check_attributions(&doc.sources, &[unlinked]).is_err());
     }
 
     /// A new dataset under a name that is already credited must not inherit

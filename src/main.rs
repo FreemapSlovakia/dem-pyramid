@@ -59,8 +59,8 @@ enum Command {
     List,
     /// Machine-readable dump with defaults resolved.
     Json,
-    /// Measure the raster of every dataset the elevation source list marks
-    /// for the pyramid, and cache what the index and crediting need.
+    /// Measure every dataset in the elevation source list that links a
+    /// `mercator.tif`, and cache what the index and crediting need.
     Refresh {
         /// The elevation API's source list: a checkout of
         /// FreemapSlovakia/elevation-sources.

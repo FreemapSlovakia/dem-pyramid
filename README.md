@@ -82,10 +82,10 @@ from the list, so restart only after `refresh`.
 
 The sources are not configured here. They come from
 [`elevation-sources`](https://github.com/FreemapSlovakia/elevation-sources),
-checked out on fm6: every dataset marked `"pyramid": true` is in the pyramid,
-its directory's number is its priority (`010-sk` outranks `999-gedtm30`), its
-`source.json` credits it, and its `mercator.tif` link is the raster read — the
-one terrain-tiles serves. The id is the directory without its number:
+checked out on fm6: every dataset that links a `mercator.tif` — the raster
+terrain-tiles serves — is in the pyramid, read from that raster; its
+directory's number is its priority (`010-sk` outranks `999-gedtm30`), and its
+`source.json` credits it. The id is the directory without its number:
 `100-es-30` is `es_30`. Everything else is measured from the raster, and
 `refresh` refuses one that is off the z8 pixel grid, in other units, or short
 of an overview.

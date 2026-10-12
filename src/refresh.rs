@@ -184,14 +184,14 @@ pub fn cache_path(root: &Path) -> PathBuf {
     root.join("state").join("sources.json")
 }
 
-/// Measure every dataset the source list marks for the pyramid, reporting
+/// Measure every dataset that links a `mercator.tif`, reporting
 /// failures rather than stopping at the first. The ids that failed come back
 /// with the rest.
 pub fn derive_all(entries: &[Entry], coarsest: u32) -> (Vec<Source>, Vec<String>) {
     let mut out = Vec::new();
     let mut failed = Vec::new();
 
-    for entry in entries.iter().filter(|e| e.pyramid) {
+    for entry in entries.iter().filter(|e| e.mercator) {
         match derive(entry, coarsest) {
             Ok(d) => out.push(d),
             Err(e) => {
