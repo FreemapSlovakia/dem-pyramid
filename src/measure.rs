@@ -1,21 +1,16 @@
-//! Measure the rasters the pyramid reads, once.
+//! Measure the rasters the elevation source list links, for the index.
 //!
-//! The elevation source list says which datasets the pyramid holds, in what
-//! order, and how each is credited, and links each one's `mercator.tif` --
-//! the raster terrain-tiles serves. Everything else follows from that raster.
-//! Measuring costs one header read per raster, so it is done here and cached
-//! rather than on every start.
-//!
-//! The cache is a build artifact, not configuration: it is regenerated rather
-//! than edited, and `check` fails when it no longer matches the data.
+//! The list says which datasets there are, in what order, and links each one's
+//! `mercator.tif` -- the raster terrain-tiles serves. Everything else the index
+//! needs follows from that raster, and is measured whenever it is written.
 
 use anyhow::{Context, Result, bail};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crate::config::{Source, level_res};
+use crate::config::level_res;
 use crate::credit::Entry;
 use crate::gdal_cli;
-use crate::grid::{ORIGIN, TERRAIN_STEPS_PER_M, merc_to_lonlat};
+use crate::grid::{self, ORIGIN, TERRAIN_STEPS_PER_M, merc_to_lonlat};
 use gdal::spatial_ref::SpatialRef;
 
 /// terrain-tiles' nodata, which the index's conversion leaves as 0.
@@ -46,8 +41,7 @@ fn priority_of(dir: &str) -> Result<i64> {
 }
 
 /// What the dataset directory's `mercator.tif` link points at, absolute: the
-/// index is opened from wherever `serve` runs, and a link repointed later
-/// shows in `check` as a changed path.
+/// index is opened from wherever `serve` runs.
 fn raster_of(dir: &Path) -> Result<String> {
     let link = dir.join("mercator.tif");
     let abs = std::fs::canonicalize(&link)
@@ -69,18 +63,13 @@ fn level_of(res: f64) -> Option<u32> {
     ((level_res(z) - res).abs() < 1e-6 * res).then_some(z)
 }
 
-/// A measured raster: its base zoom and its lon/lat box.
-struct Measured {
-    base_level: u32,
-    bbox: [f64; 4],
-}
-
 /// Held to everything the index's `vrt://` conversion assumes: EPSG:3857,
 /// Int32 in 2 mm steps with terrain-tiles' nodata, and an overview per zoom
 /// down to the coarsest level, each exactly half the last and on that zoom's
 /// pixel grid. A raster off any of these would be read silently wrong -- the
 /// GTI resamples a misaligned row onto its own grid -- not refused.
-fn measure(info: &serde_json::Value, path: &str, coarsest: u32) -> Result<Measured> {
+/// Its base zoom and lon/lat extent, if it holds to all that.
+fn measure(info: &serde_json::Value, path: &str, coarsest: u32) -> Result<(u32, [f64; 4])> {
     let wkt = info["coordinateSystem"]["wkt"]
         .as_str()
         .with_context(|| format!("{path}: no coordinate system"))?;
@@ -157,67 +146,97 @@ fn measure(info: &serde_json::Value, path: &str, coarsest: u32) -> Result<Measur
     let (west, south) = merc_to_lonlat(gt[0], y0);
     let (east, north) = merc_to_lonlat(x1, gt[3]);
 
-    Ok(Measured {
-        base_level: level,
-        bbox: [west, south, east, north],
-    })
+    if west >= east || south >= north {
+        bail!("{path}: degenerate extent");
+    }
+
+    Ok((level, [west, south, east, north]))
 }
 
-/// Measure one dataset's raster.
-pub fn derive(entry: &Entry, coarsest: u32) -> Result<Source> {
-    let id = id_of(&entry.dir);
+/// One dataset's raster, measured for the index.
+#[derive(Debug)]
+pub struct Raster {
+    /// The directory without its number, dashes as underscores: `es_30`.
+    pub id: String,
+    pub dir: String,
+    pub path: String,
+    /// The directory's number, negated: higher wins.
+    pub priority: i64,
+    /// Zoom of the raster's own pixels; overviews run from there down.
+    pub base_level: u32,
+    pub bbox: [f64; 4],
+}
+
+fn raster(entry: &Entry, coarsest: u32) -> Result<Raster> {
     let path = raster_of(&entry.path)?;
-
     let info = gdal_cli::info_json(&path).with_context(|| format!("reading {path}"))?;
-    let m = measure(&info, &path, coarsest)?;
 
-    Ok(Source {
-        id,
+    let (base_level, bbox) = measure(&info, &path, coarsest)?;
+
+    Ok(Raster {
+        id: id_of(&entry.dir),
         dir: entry.dir.clone(),
-        path,
         priority: priority_of(&entry.dir)?,
-        base_level: m.base_level,
-        bbox: m.bbox,
+        base_level,
+        bbox,
+        path,
     })
 }
 
-/// Where the cache lives. Under the data root rather than the checkout: it
-/// describes the data, is regenerated from it, and is never committed.
-pub fn cache_path(root: &Path) -> PathBuf {
-    root.join("state").join("sources.json")
-}
-
-/// Measure every dataset that links a `mercator.tif`, reporting
-/// failures rather than stopping at the first. The ids that failed come back
-/// with the rest.
-pub fn derive_all(entries: &[Entry], coarsest: u32) -> (Vec<Source>, Vec<String>) {
+/// Every dataset that links a `mercator.tif`, highest priority first, with
+/// what could not be measured beside them as (directory, reason).
+pub fn rasters(entries: &[Entry], coarsest: u32) -> (Vec<Raster>, Vec<(String, String)>) {
     let mut out = Vec::new();
     let mut failed = Vec::new();
 
     for entry in entries.iter().filter(|e| e.mercator) {
-        match derive(entry, coarsest) {
-            Ok(d) => out.push(d),
-            Err(e) => {
-                println!("FAIL {}: {e:#}", entry.dir);
-                failed.push(id_of(&entry.dir));
-            }
+        match raster(entry, coarsest) {
+            Ok(r) => out.push(r),
+            Err(e) => failed.push((entry.dir.clone(), format!("{e:#}"))),
         }
     }
 
-    out.sort_by_key(|d| -d.priority);
+    out.sort_by_key(|r| -r.priority);
 
     (out, failed)
 }
 
-pub fn write(path: &Path, derived: &[Source]) -> Result<()> {
-    std::fs::create_dir_all(path.parent().context("no parent")?)?;
+/// One row `bin/index.sh` writes.
+#[derive(Debug)]
+pub struct Planned<'a> {
+    pub id: &'a str,
+    pub priority: i64,
+    pub location: String,
+    pub bbox: [f64; 4],
+}
 
-    // Through a temp file: a half-written cache is an index against nothing.
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(derived)? + "\n")?;
-    std::fs::rename(&tmp, path)?;
+/// Level `z`'s rows, from every raster that reaches it.
+pub fn rows(rasters: &[Raster], z: u32) -> Vec<Planned<'_>> {
+    rasters
+        .iter()
+        .filter_map(|r| {
+            Some(Planned {
+                id: &r.id,
+                priority: r.priority,
+                location: grid::location(&r.path, r.base_level, z)?,
+                bbox: r.bbox,
+            })
+        })
+        .collect()
+}
 
-    Ok(())
+/// What the index cannot be built over: nothing at all, or two datasets the
+/// mosaic could not tell apart.
+pub fn validate(rasters: &[Raster]) -> Result<()> {
+    if rasters.is_empty() {
+        bail!("no dataset in the source list links a mercator.tif");
+    }
+
+    crate::config::check_distinct(
+        rasters
+            .iter()
+            .map(|r| (r.id.as_str(), r.priority, r.dir.as_str())),
+    )
 }
 
 #[cfg(test)]
@@ -265,6 +284,27 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    fn fake(dir: &str, priority: i64) -> Raster {
+        Raster {
+            id: id_of(dir),
+            dir: dir.into(),
+            path: String::new(),
+            priority,
+            base_level: 17,
+            bbox: [0.0, 0.0, 1.0, 1.0],
+        }
+    }
+
+    /// Two directories spelling one dataset, or sharing a number, leave the
+    /// mosaic nothing to order them by.
+    #[test]
+    fn an_index_needs_distinct_datasets_and_numbers() {
+        assert!(validate(&[]).is_err());
+        assert!(validate(&[fake("090-es-29", -90), fake("100-es-30", -100)]).is_ok());
+        assert!(validate(&[fake("090-es-29", -90), fake("100-es_29", -100)]).is_err());
+        assert!(validate(&[fake("090-es-29", -90), fake("090-es-30", -90)]).is_err());
+    }
+
     #[test]
     fn a_pixel_is_matched_to_its_zoom_exactly() {
         assert_eq!(level_of(0.597_164_283_477_939), Some(18));
@@ -299,16 +339,10 @@ mod tests {
 
     #[test]
     fn sk_measures_at_z18_with_its_box() {
-        let m = measure(&sk_info(), "sk.tif", 8).unwrap();
-        assert_eq!(m.base_level, 18);
-
-        let [w, s, e, n] = m.bbox;
-        assert!(
-            (w - 15.46875).abs() < 1e-9 && (e - 23.90625).abs() < 1e-9,
-            "{:?}",
-            m.bbox
-        );
-        assert!(s < 47.75 && n > 49.6 && s < n, "{:?}", m.bbox);
+        let (level, [w, s, e, n]) = measure(&sk_info(), "sk.tif", 8).unwrap();
+        assert_eq!(level, 18);
+        assert!((w - 15.46875).abs() < 1e-9 && (e - 23.90625).abs() < 1e-9);
+        assert!(s < 47.75 && n > 49.6 && s < n);
     }
 
     /// One overview short of z8, and the coarsest level would be read from a

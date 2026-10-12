@@ -1,13 +1,18 @@
-//! The rasters the pyramid indexes, and the levels it spans.
+//! What the pyramid serves, and the levels it spans.
 //!
-//! Nothing here is authored. The datasets, their order and their credits come
-//! from the elevation API's source list, everything about their rasters is
-//! measured by `refresh`, and this reads back what it cached.
+//! Nothing here is authored. Each level of the index `bin/index.sh` writes
+//! holds a row per dataset reaching it, carrying its id and priority, with the
+//! raster's extent as the row's geometry; what renders read and what they
+//! credit both come from there.
 
-use anyhow::{Result, bail};
-use serde::{Deserialize, Serialize};
+use anyhow::{Result, anyhow, bail};
+use gdal::vector::LayerAccess;
+use gdal::{Dataset, DatasetOptions, GdalOpenFlags};
+use serde::Serialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::grid::merc_to_lonlat;
 
 /// Web Mercator, full extent, in projected metres.
 pub const EARTH_CIRCUMFERENCE: f64 = 2.0 * std::f64::consts::PI * 6378137.0;
@@ -24,90 +29,239 @@ pub fn ground_res(z: u32, lat_deg: f64) -> f64 {
     level_res(z) * lat_deg.to_radians().cos()
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct Grid {
     pub finest_level: u32,
     pub coarsest_level: u32,
 }
 
-/// One dataset the pyramid reads, as `refresh` measured its raster.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// One dataset the index serves.
+#[derive(Debug, Clone, Serialize)]
 pub struct Source {
     /// The directory without its number, dashes as underscores: `es_30`.
     pub id: String,
-    /// The directory in the elevation source list, so a complaint about a
-    /// value can be traced to something a person can edit.
-    pub dir: String,
-    /// The terrain-tiles raster.
-    pub path: String,
     /// The directory's number, negated: higher wins.
     pub priority: i64,
-    /// Zoom of the raster's own pixels; overviews run from there down.
-    pub base_level: u32,
     pub bbox: [f64; 4],
 }
+
 #[derive(Debug, Serialize)]
 pub struct Doc {
     pub grid: Grid,
     pub sources: Vec<Source>,
 }
 
-/// Hold the cache to what the index assumes of it.
-pub fn validate(sources: &[Source]) -> Result<()> {
-    // An index over nothing renders nothing; this is a broken source list.
-    if sources.is_empty() {
-        bail!("no dataset in the source list links a mercator.tif");
+/// One row of one level's index.
+#[derive(Debug, PartialEq)]
+pub struct Row {
+    pub dataset: String,
+    pub priority: i64,
+    /// What the GTI opens: the raster's overview for this level, converted.
+    pub location: String,
+    pub bbox: [f64; 4],
+}
+
+const HINT: &str = "Run `bin/index.sh` to write it.";
+
+/// Where the index lives under the data root.
+pub fn index_dir(root: &Path) -> PathBuf {
+    root.join("index")
+}
+
+/// Level `z`'s index, as both the marcher and the loader open it.
+pub fn level_path(index_dir: &Path, z: u32) -> PathBuf {
+    index_dir.join(format!("z{z}.gti.gpkg"))
+}
+
+/// Every row of level `z`, or `None` where the level has no index.
+fn read_level(index_dir: &Path, z: u32) -> Result<Option<Vec<Row>>> {
+    let path = level_path(index_dir, z);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let err = |e: &dyn std::fmt::Display| anyhow!("{}: {e}\n{HINT}", path.display());
+
+    // As the GeoPackage it is, not as the raster the GTI driver would take it
+    // for, which has no layers.
+    let ds = Dataset::open_ex(
+        &path,
+        DatasetOptions {
+            open_flags: GdalOpenFlags::GDAL_OF_VECTOR,
+            allowed_drivers: Some(&["GPKG"]),
+            ..Default::default()
+        },
+    )
+    .map_err(|e| err(&e))?;
+    let mut layer = ds.layer_by_name("tiles").map_err(|e| err(&e))?;
+
+    // On the layer, not per row, so a level with no rows cannot skip it.
+    let field = |name: &str| {
+        layer
+            .defn()
+            .field_index(name)
+            .map_err(|_| err(&format!("no `{name}` column")))
+    };
+    let (dataset_ix, priority_ix, location_ix) =
+        (field("dataset")?, field("priority")?, field("location")?);
+
+    let mut rows = Vec::new();
+
+    for f in layer.features() {
+        let dataset = f
+            .field_as_string(dataset_ix)?
+            .ok_or_else(|| err(&"a row without a dataset"))?;
+        let priority = f
+            .field_as_integer64(priority_ix)?
+            .ok_or_else(|| err(&format!("{dataset} has no priority")))?;
+        let location = f.field_as_string(location_ix)?.unwrap_or_default();
+        let env = f
+            .geometry()
+            .ok_or_else(|| err(&format!("{dataset} has no extent")))?
+            .envelope();
+        let (west, south) = merc_to_lonlat(env.MinX, env.MinY);
+        let (east, north) = merc_to_lonlat(env.MaxX, env.MaxY);
+
+        rows.push(Row {
+            dataset,
+            priority,
+            location,
+            bbox: [west, south, east, north],
+        });
     }
 
-    let mut by_id: HashMap<&str, ()> = HashMap::new();
-    let mut by_priority: HashMap<i64, &str> = HashMap::new();
+    // `index.sh` removes a level no dataset reaches rather than writing it
+    // empty, so an empty one was not written by it.
+    if rows.is_empty() {
+        return Err(err(&"no rows"));
+    }
 
-    for s in sources {
-        if by_id.insert(&s.id, ()).is_some() {
-            bail!("duplicate source id: {}", s.id);
+    Ok(Some(rows))
+}
+
+/// Each indexed level's rows, coarsest first.
+pub type Levels = Vec<(u32, Vec<Row>)>;
+
+pub fn read_levels(index_dir: &Path, grid: &Grid) -> Result<Levels> {
+    let mut levels = Vec::new();
+
+    for z in grid.coarsest_level..=grid.finest_level {
+        if let Some(rows) = read_level(index_dir, z)? {
+            levels.push((z, rows));
         }
-        if let Some(other) = by_priority.insert(s.priority, &s.id) {
+    }
+
+    if levels.is_empty() {
+        bail!("{}: no index\n{HINT}", index_dir.display());
+    }
+
+    Ok(levels)
+}
+
+/// The datasets the index serves, highest priority first: every dataset on
+/// any level, since a render reads them all, and a level indexed on its own
+/// may hold one the others do not yet. Each level orders its own pixels by
+/// its own rows, so priorities that differ or collide between levels -- an
+/// index run cut short across a renumbering -- cost only the order credits
+/// are listed in, which takes the coarsest level's; `check` reports the lag.
+pub fn from_levels(levels: &Levels, grid: Grid) -> Result<Doc> {
+    let mut sources: Vec<Source> = Vec::new();
+
+    for (_, rows) in levels {
+        for r in rows {
+            if !sources.iter().any(|s| s.id == r.dataset) {
+                sources.push(Source {
+                    id: r.dataset.clone(),
+                    priority: r.priority,
+                    bbox: r.bbox,
+                });
+            }
+        }
+    }
+
+    if sources.is_empty() {
+        bail!("the index holds no dataset\n{HINT}");
+    }
+
+    // Priority order, so the first box holding a point is the one the mosaic
+    // would take it from.
+    sources.sort_by_key(|s| -s.priority);
+
+    Ok(Doc { grid, sources })
+}
+
+pub fn load(index_dir: &Path, grid: Grid) -> Result<Doc> {
+    from_levels(&read_levels(index_dir, &grid)?, grid)
+}
+
+/// Datasets the mosaic can order: no id twice and no priority shared, given as
+/// (id, priority, what to name it by in a complaint).
+pub fn check_distinct<'a>(items: impl IntoIterator<Item = (&'a str, i64, &'a str)>) -> Result<()> {
+    let mut ids: HashMap<&str, &str> = HashMap::new();
+    let mut priorities: HashMap<i64, &str> = HashMap::new();
+
+    for (id, priority, label) in items {
+        if let Some(other) = ids.insert(id, label) {
+            bail!("{other} and {label} are both dataset {id}");
+        }
+        if let Some(other) = priorities.insert(priority, label) {
             bail!(
-                "duplicate priority {}: {other} and {} -- mosaic order would be \
-                 non-deterministic",
-                s.priority,
-                s.id
+                "{other} and {label} share priority {priority}, so the mosaic order \
+                 between them is undefined"
             );
-        }
-
-        let [lo_lon, lo_lat, hi_lon, hi_lat] = s.bbox;
-        if lo_lon >= hi_lon || lo_lat >= hi_lat {
-            bail!("{}: degenerate bbox {:?}", s.id, s.bbox);
         }
     }
 
     Ok(())
 }
 
-/// Read what `refresh` measured, newest wins over nothing: a missing cache is
-/// an error naming the command that writes it, because every other failure it
-/// would cause is harder to read than this one.
-pub fn load(path: &Path, grid: Grid) -> Result<Doc> {
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        anyhow::anyhow!(
-            "{}: {e}\nRun `dem-tool refresh` on the data host to measure the \
-             sources and write it.",
-            path.display()
-        )
-    })?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let mut sources: Vec<Source> = serde_json::from_str(&text).map_err(|e| {
-        anyhow::anyhow!(
-            "{}: {e}\nRun `dem-tool refresh` to rewrite it in this version's format.",
-            path.display()
-        )
-    })?;
+    fn row(dataset: &str, priority: i64) -> Row {
+        Row {
+            dataset: dataset.into(),
+            priority,
+            location: format!("vrt:///t/{dataset}.tif"),
+            bbox: [0.0, 0.0, 1.0, 1.0],
+        }
+    }
 
-    // Priority order, so the first box holding a point is the one the mosaic
-    // would take it from.
-    sources.sort_by_key(|s| -s.priority);
+    fn grid() -> Grid {
+        Grid {
+            finest_level: 14,
+            coarsest_level: 8,
+        }
+    }
 
-    validate(&sources)?;
+    /// A dataset on a fine level only is still served: renders read it.
+    #[test]
+    fn every_level_contributes_its_datasets() {
+        let levels = vec![
+            (8, vec![row("sk", -10)]),
+            (14, vec![row("sk", -10), row("de_by", -245)]),
+        ];
+        let ids: Vec<String> = from_levels(&levels, grid())
+            .unwrap()
+            .sources
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
 
-    Ok(Doc { grid, sources })
+        assert_eq!(ids, ["sk", "de_by"]);
+    }
+
+    /// Levels from two index runs across a renumbering disagree, even to the
+    /// point of two datasets sharing a number; serving goes on regardless.
+    #[test]
+    fn levels_that_disagree_on_priority_still_load() {
+        let levels = vec![
+            (8, vec![row("sk", -10), row("cz", -20)]),
+            (14, vec![row("sk", -20), row("cz", -10), row("pl", -10)]),
+        ];
+        let doc = from_levels(&levels, grid()).unwrap();
+
+        assert_eq!(doc.sources[0].id, "sk");
+        assert_eq!(doc.sources.len(), 3);
+    }
 }

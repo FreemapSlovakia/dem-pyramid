@@ -307,7 +307,7 @@ struct Level {
 
 impl Level {
     fn open(root: &Path, z: u32) -> Result<Option<Self>> {
-        let path = root.join("index").join(format!("z{z}.gti.gpkg"));
+        let path = crate::config::level_path(&crate::config::index_dir(root), z);
         if !path.exists() {
             return Ok(None);
         }

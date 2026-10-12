@@ -15,23 +15,18 @@ mod credit;
 mod gdal_cli;
 mod gradient;
 mod grid;
+mod measure;
 mod panorama;
 mod peaks;
 mod progress;
 mod queue;
 mod rank;
-mod refresh;
 mod server;
 mod viewshed;
 
 #[derive(Parser)]
 #[command(about, version)]
 struct Cli {
-    /// Where `refresh` cached what it measured. Defaults to
-    /// `<root>/state/sources.json`.
-    #[arg(long, global = true)]
-    sources: Option<PathBuf>,
-
     /// Finest and coarsest pyramid levels.
     #[arg(long, global = true, default_value_t = 14)]
     finest_level: u32,
@@ -55,25 +50,24 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
-    /// Tabular overview of every source.
+    /// The datasets the index serves.
     List,
     /// Machine-readable dump with defaults resolved.
     Json,
-    /// Measure every dataset in the elevation source list that links a
-    /// `mercator.tif`, and cache what the index and crediting need.
-    Refresh {
+    /// Fail on anything that would stop `bin/index.sh` or `serve`, and say
+    /// when the index lags the source list.
+    Check {
         /// The elevation API's source list: a checkout of
         /// FreemapSlovakia/elevation-sources.
         #[arg(long, env = "ELEVATION_SOURCES_DIR", default_value = credit::DEFAULT_DIR)]
         elevation_sources: PathBuf,
     },
-    /// Re-measure every source and fail if the cache has fallen behind.
-    Check {
+    /// Measure the source list's rasters and print every level's index rows,
+    /// for `bin/index.sh`.
+    IndexPlan {
         #[arg(long, env = "ELEVATION_SOURCES_DIR", default_value = credit::DEFAULT_DIR)]
         elevation_sources: PathBuf,
     },
-    /// What contributes to one pyramid level, for the index builder.
-    IndexPlan { level: u32 },
     /// Serve panoramas over HTTP.
     Serve {
         #[arg(long, default_value = "127.0.0.1:3100")]
@@ -245,67 +239,26 @@ fn main() -> Result<()> {
         coarsest_level: cli.coarsest_level,
     };
 
-    let cache = cli
-        .sources
-        .clone()
-        .unwrap_or_else(|| refresh::cache_path(&cli.root));
-
-    // `refresh` writes the cache, so it cannot require one.
-    let doc = if matches!(cli.command, Command::Refresh { .. }) {
-        config::Doc {
-            grid,
-            sources: Vec::new(),
-        }
-    } else {
-        config::load(&cache, grid)?
-    };
+    let (coarsest, finest) = (grid.coarsest_level, grid.finest_level);
+    let index_dir = config::index_dir(&cli.root);
+    let index = |grid| config::load(&index_dir, grid);
 
     match cli.command {
         Command::List => {
-            println!("{:14} {:>5} {:>4}  path", "id", "prio", "z");
-            println!("{}", "-".repeat(72));
+            let doc = index(grid)?;
+            println!("{:14} {:>5}", "id", "prio");
+            println!("{}", "-".repeat(20));
             for s in &doc.sources {
-                println!(
-                    "{:14} {:>5} {:>4}  {}",
-                    s.id, s.priority, s.base_level, s.path
-                );
+                println!("{:14} {:>5}", s.id, s.priority);
             }
         }
         Command::Json => {
-            serde_json::to_writer_pretty(std::io::stdout(), &doc)?;
+            serde_json::to_writer_pretty(std::io::stdout(), &index(grid)?)?;
             println!();
         }
-        Command::Refresh { elevation_sources } => {
-            let entries = credit::load_entries(&elevation_sources)?;
-            let (derived, failed) = refresh::derive_all(&entries, doc.grid.coarsest_level);
-
-            config::validate(&derived)?;
-            credit::check_attributions(&derived, &entries)?;
-
-            // Written only once every raster has been read. A cache silently
-            // missing a source that was merely unreadable for a moment indexes
-            // a mosaic with a hole in it, and nothing downstream would say so.
-            if !failed.is_empty() {
-                anyhow::bail!("{} raster(s) could not be measured", failed.len());
-            }
-
-            refresh::write(&cache, &derived)?;
-
-            for s in &derived {
-                println!(
-                    "ok   {:14} z{:<3} {:14} {}",
-                    s.id, s.base_level, s.dir, s.path
-                );
-            }
-
-            println!(
-                "\n{} of {} datasets measured into {}",
-                derived.len(),
-                entries.len(),
-                cache.display()
-            );
+        Command::Check { elevation_sources } => {
+            check::run(&index_dir, &elevation_sources, grid)?;
         }
-        Command::Check { elevation_sources } => check::run(&doc, &elevation_sources)?,
         Command::Panorama {
             lon,
             lat,
@@ -428,6 +381,7 @@ fn main() -> Result<()> {
                 },
                 gradient,
             };
+            let doc = index(grid)?;
             let t0 = std::time::Instant::now();
             // Nothing cancels a CLI render; the flag exists for the server.
             let cancel = panorama::Cancel::default();
@@ -537,24 +491,35 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(server::serve(
                 cli.root.clone(),
-                doc,
+                index(grid)?,
                 &elevation_sources,
                 peaks_file,
                 &listen,
             ))?;
         }
-        Command::IndexPlan { level } => {
-            // `refresh` checked overviews only down to the coarsest level.
+        Command::IndexPlan { elevation_sources } => {
+            let entries = credit::load_entries(&elevation_sources)?;
+            let (rasters, failed) = measure::rasters(&entries, coarsest);
+
+            // All or nothing: an index silently missing a raster that was
+            // merely unreadable for a moment has a hole in it.
+            for (dir, why) in &failed {
+                eprintln!("FAIL {dir}: {why}");
+            }
             anyhow::ensure!(
-                (doc.grid.coarsest_level..=doc.grid.finest_level).contains(&level),
-                "level {level} is outside the pyramid (z{}..z{})",
-                doc.grid.coarsest_level,
-                doc.grid.finest_level
+                failed.is_empty(),
+                "{} raster(s) could not be measured",
+                failed.len()
             );
-            println!("RES\t{}", config::level_res(level));
-            for s in &doc.sources {
-                if let Some(loc) = grid::location(&s.path, s.base_level, level) {
-                    println!("SRC\t{}\t{}\t{loc}", s.id, s.priority);
+            measure::validate(&rasters)?;
+            // Refused here rather than at the next restart, when `serve` would
+            // stop over it with the new index already in place.
+            credit::check_attributions(rasters.iter().map(|r| r.id.as_str()), &entries)?;
+
+            for z in (coarsest..=finest).rev() {
+                println!("RES\t{z}\t{}", config::level_res(z));
+                for row in measure::rows(&rasters, z) {
+                    println!("SRC\t{z}\t{}\t{}\t{}", row.id, row.priority, row.location);
                 }
             }
         }

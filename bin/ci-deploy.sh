@@ -118,13 +118,13 @@ nice -n 19 "$CARGO" build --release --quiet
 nice -n 19 "$CARGO" test --release --quiet
 
 # The pyramid's sources come from the elevation API's list and everything about
-# them is measured from the rasters, so the only thing that can be wrong here is
-# a cache that has fallen behind the data. `check` re-measures and fails if it
-# has, rather than letting a deploy build against last month's geometry.
+# them is measured from the rasters. `check` fails on whatever would stop the
+# new binary from starting -- an index it cannot read, a dataset it serves that
+# the list no longer credits -- before the restart rather than after it.
 #
 # Fetched first, and the working tree required clean: the list is authoritative
-# from its repository, so a copy edited in place would check the cache against a
-# local opinion rather than against what is published.
+# from its repository, so a copy edited in place would check against a local
+# opinion rather than against what is published.
 if [ -d "$ELEVATION_SOURCES/.git" ]; then
 	git -C "$ELEVATION_SOURCES" fetch --quiet origin || {
 		echo "ci-deploy: could not fetch the elevation source list" >&2

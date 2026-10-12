@@ -27,9 +27,8 @@ On fm6:
 ```
 /fm/storage2/dem/
   build/                this repo
-  state/sources.json    what `refresh` measured: every raster the index reads
-  index/z{14..8}.gti.gpkg   one GTI per level, rows only
-  logs/ state/ tmp/
+  index/z{14..8}.gti.gpkg   one GTI per level: a row per dataset, its id and priority
+  logs/ state/ tmp/      step logs, step exit codes and the deploy marker, scratch
 ```
 
 ## Design in one paragraph
@@ -60,25 +59,25 @@ deploys the binary and the unit; `bin/sync.sh` pushes work in progress without
 one. Long steps go in tmux and log to `$DEM_ROOT/logs/<step>.log`, so nothing
 depends on staying attached.
 
-**Start with `check`.** It re-measures every raster and names whatever no
-longer matches the cache, ending with the command that fixes it.
+**Start with `check`.** It fails on whatever would stop `index.sh` or `serve`
+— a raster the index cannot read, a dataset served without a credit — and says
+when the index lags the source list.
 
 | to | run |
 | --- | --- |
-| see what the pyramid reads | `./target/release/dem-tool list` |
-| find out whether the cache is current | `./target/release/dem-tool check` |
-| bring the cache up to date | `./target/release/dem-tool refresh` |
-| make the cache visible to renders | `bin/run.sh index bash bin/index.sh` |
+| see what the pyramid serves | `./target/release/dem-tool list` |
+| find out whether anything is wrong | `./target/release/dem-tool check` |
+| index what the source list holds now | `bin/run.sh index bash bin/index.sh` |
 
-`index.sh` takes levels to narrow it, and `INDEX_DIR` to write somewhere other
-than `index/`. Each level is written to a temporary file and moved into place,
+`index.sh` takes levels to narrow it. Each level is written to a temporary file and moved into place,
 so killing it leaves the previous index; a full run takes minutes.
 
 A change in the sources — a dataset added, removed or renumbered in the source
-list, or its raster rebuilt at another zoom — needs `refresh`, then `index.sh`,
-then `systemctl restart terrain`. `serve` reads `state/sources.json` and the elevation source list for
-crediting at startup, and refuses to start while a cached source is missing
-from the list, so restart only after `refresh`.
+list, or its raster rebuilt at another zoom — needs `index.sh`, then `systemctl
+restart terrain`. `serve` reads which datasets it serves from the index and
+their credits from the source list at startup, and refuses to start while the
+index holds a dataset the list no longer credits, so after removing one, index
+before restarting.
 
 The sources are not configured here. They come from
 [`elevation-sources`](https://github.com/FreemapSlovakia/elevation-sources),
@@ -86,9 +85,9 @@ checked out on fm6: every dataset that links a `mercator.tif` — the raster
 terrain-tiles serves — is in the pyramid, read from that raster; its
 directory's number is its priority (`010-sk` outranks `999-gedtm30`), and its
 `source.json` credits it. The id is the directory without its number:
-`100-es-30` is `es_30`. Everything else is measured from the raster, and
-`refresh` refuses one that is off the z8 pixel grid, in other units, or short
-of an overview.
+`100-es-30` is `es_30`. Everything else is measured from the raster whenever
+the index is written, and `index.sh` refuses one that is off the z8 pixel grid,
+in other units, or short of an overview.
 
 Vertical datums differ across sources (RH2000, IGN69, LN02, EGM2008 …).
 Offsets are decimetre-scale — invisible to the ray marcher, visible in a
@@ -189,8 +188,8 @@ deploy. By hand:
 One `POST /panorama` returning image, depth and peaks in a single
 multipart/form-data body. See [docs/API.md](docs/API.md).
 
-It reads `state/sources.json` and the source list at startup and refuses to
-start if a source it would serve has no credit, so a render can always say
-whose data answered it.
+It reads the index and the source list at startup and refuses to start if a
+dataset it would serve has no credit, so a render can always say whose data
+answered it.
 
 Not yet done: sun path, caching/precomputation.

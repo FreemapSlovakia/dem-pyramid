@@ -23,8 +23,8 @@
 //! tree -- and a dataset gained there is credited here without a release.
 
 use crate::config::{Doc, Source};
+use crate::measure::{id_of, model_of};
 use crate::panorama::destination;
-use crate::refresh::{id_of, model_of};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -82,7 +82,7 @@ pub struct Entry {
     pub path: std::path::PathBuf,
     pub attributions: Vec<Attribution>,
     /// Whether the directory links a `mercator.tif`, which is what puts a
-    /// dataset in the pyramid. A dangling link counts, so `refresh` reports it
+    /// dataset in the pyramid. A dangling link counts, so `index.sh` reports it
     /// rather than quietly leaving the dataset out.
     pub mercator: bool,
 }
@@ -129,15 +129,15 @@ pub fn load_entries(dir: &Path) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
-/// The list's entries for a cached source that still link a `mercator.tif`,
-/// matched by id rather than directory, so a renumbered dataset is still
-/// credited until `refresh` picks up its new priority. More than one is two
-/// directories spelling one id, and neither can be trusted to be the raster
-/// `refresh` measured.
-fn entries_of<'a>(source: &Source, entries: &'a [Entry]) -> Vec<&'a Entry> {
+/// The list's entries for a dataset the index serves that still link a
+/// `mercator.tif`, matched by id rather than directory, so a renumbered dataset
+/// is still credited until the index picks up its new priority. More than one
+/// is two directories spelling one id, and neither can be trusted to be the
+/// raster that was indexed.
+fn entries_of<'a>(id: &str, entries: &'a [Entry]) -> Vec<&'a Entry> {
     entries
         .iter()
-        .filter(|e| e.mercator && id_of(&e.dir) == source.id)
+        .filter(|e| e.mercator && id_of(&e.dir) == id)
         .collect()
 }
 
@@ -146,7 +146,7 @@ fn entries_of<'a>(source: &Source, entries: &'a [Entry]) -> Vec<&'a Entry> {
 pub fn credits_of(sources: &[Source], entries: &[Entry]) -> Credits {
     sources
         .iter()
-        .filter_map(|s| match entries_of(s, entries).as_slice() {
+        .filter_map(|s| match entries_of(&s.id, entries).as_slice() {
             [e] => Some((
                 s.id.clone(),
                 Seen {
@@ -161,19 +161,22 @@ pub fn credits_of(sources: &[Source], entries: &[Entry]) -> Credits {
 
 /// Fails unless every source the pyramid serves is in the elevation API's list
 /// exactly once, with a credit to show.
-pub fn check_attributions(sources: &[Source], entries: &[Entry]) -> Result<()> {
-    for source in sources {
-        let entry = match entries_of(source, entries).as_slice() {
+pub fn check_attributions<'a>(
+    ids: impl IntoIterator<Item = &'a str>,
+    entries: &[Entry],
+) -> Result<()> {
+    for id in ids {
+        let entry = match entries_of(id, entries).as_slice() {
             [e] => *e,
             [] => bail!(
                 "{}: no longer has a mercator.tif in the elevation source list, \
                  so nothing says how to credit it",
-                source.id
+                id
             ),
             many => bail!(
                 "{}: several directories in the elevation source list are this \
                  dataset: {}",
-                source.id,
+                id,
                 many.iter()
                     .map(|e| e.dir.as_str())
                     .collect::<Vec<_>>()
@@ -182,7 +185,7 @@ pub fn check_attributions(sources: &[Source], entries: &[Entry]) -> Result<()> {
         };
 
         if entry.attributions.is_empty() {
-            bail!("{}: {} carries no attribution", source.id, entry.dir);
+            bail!("{}: {} carries no attribution", id, entry.dir);
         }
     }
 
@@ -312,7 +315,7 @@ pub fn sources_seen(
         .map(|(source, _)| {
             // `check_attributions` refuses to serve a source without one.
             credits.get(&source.id).cloned().unwrap_or_else(|| Seen {
-                source: model_of(&source.dir).to_owned(),
+                source: source.id.clone(),
                 attributions: Vec::new(),
             })
         })
@@ -327,10 +330,7 @@ mod tests {
     fn source(model: &str, priority: i64, bbox: [f64; 4]) -> Source {
         Source {
             id: model.replace('-', "_"),
-            dir: format!("100-{model}"),
-            path: String::new(),
             priority,
-            base_level: 17,
             bbox,
         }
     }
@@ -346,6 +346,10 @@ mod tests {
             },
             sources,
         }
+    }
+
+    fn ids(sources: &[Source]) -> impl Iterator<Item = &str> {
+        sources.iter().map(|s| s.id.as_str())
     }
 
     fn names(seen: &[Seen]) -> Vec<&str> {
@@ -378,7 +382,13 @@ mod tests {
             source("gedtm30", 0, [-180.00125, -65.00125, 180.00125, 85.00125]),
         ]);
 
-        let seen = sources_seen(&doc, &Credits::new(), -6.0, 40.0, 50_000.0, 0.0, 360.0);
+        let list = [
+            entry("090-es-29", true),
+            entry("100-es-30", true),
+            entry("999-gedtm30", true),
+        ];
+        let credits = credits_of(&doc.sources, &list);
+        let seen = sources_seen(&doc, &credits, -6.0, 40.0, 50_000.0, 0.0, 360.0);
 
         assert_eq!(names(&seen), ["es-29", "es-30", "gedtm30"]);
     }
@@ -519,16 +529,16 @@ mod tests {
     fn a_source_with_no_credit_refuses_to_serve() {
         let doc = doc(vec![source("sk", 230, [16.8, 47.7, 22.6, 49.7])]);
 
-        assert!(check_attributions(&doc.sources, &[]).is_err());
-        assert!(check_attributions(&doc.sources, &[entry("100-sk", false)]).is_err());
-        assert!(check_attributions(&doc.sources, &[entry("100-sk", true)]).is_ok());
+        assert!(check_attributions(ids(&doc.sources), &[]).is_err());
+        assert!(check_attributions(ids(&doc.sources), &[entry("100-sk", false)]).is_err());
+        assert!(check_attributions(ids(&doc.sources), &[entry("100-sk", true)]).is_ok());
 
         let mut unlinked = entry("100-sk", true);
         unlinked.mercator = false;
-        assert!(check_attributions(&doc.sources, &[unlinked]).is_err());
+        assert!(check_attributions(ids(&doc.sources), &[unlinked]).is_err());
     }
 
-    /// A cached dataset missing from the list is refused, whatever else the
+    /// An indexed dataset missing from the list is refused, whatever else the
     /// list credits.
     #[test]
     fn a_dataset_missing_from_the_list_is_refused() {
@@ -537,8 +547,8 @@ mod tests {
 
         let list = [entry("100-de_by", true)];
 
-        assert!(check_attributions(&doc(vec![de_by.clone()]).sources, &list).is_ok());
-        assert!(check_attributions(&doc(vec![de_by, de_nw]).sources, &list).is_err());
+        assert!(check_attributions(ids(std::slice::from_ref(&de_by)), &list).is_ok());
+        assert!(check_attributions(ids(&[de_by, de_nw]), &list).is_err());
     }
 
     /// A directory respelt between `-` and `_` upstream is still the same
@@ -548,12 +558,12 @@ mod tests {
         let doc = doc(vec![source("es_29", 190, [-9.4, 36.0, -5.4, 43.9])]);
         let list = [entry("090-es-29", true)];
 
-        assert!(check_attributions(&doc.sources, &list).is_ok());
+        assert!(check_attributions(ids(&doc.sources), &list).is_ok());
 
         let credits = credits_of(&doc.sources, &list);
         let seen = sources_seen(&doc, &credits, -7.0, 40.0, 20_000.0, 0.0, 360.0);
         assert!(!seen[0].attributions.is_empty(), "{seen:?}");
-        // Named as the list spells it now, not as the cache last saw it.
+        // Named as the list spells it now, not as the index last saw it.
         assert_eq!(seen[0].source, "es-29");
     }
 
@@ -564,7 +574,7 @@ mod tests {
         let doc = doc(vec![source("es_29", 190, [-9.4, 36.0, -5.4, 43.9])]);
         let list = [entry("090-es-29", true), entry("100-es_29", true)];
 
-        assert!(check_attributions(&doc.sources, &list).is_err());
+        assert!(check_attributions(ids(&doc.sources), &list).is_err());
     }
 
     /// The list's other datasets lend nothing to a render.

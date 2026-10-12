@@ -17,9 +17,9 @@ on:
   push:
     branches: [main]
     # Docs-only commits should not restart the service and drop a render.
-    # The sources themselves no longer live here: they come from the elevation
-    # API's list and are measured into a cache on the data host, so adding one
-    # reaches production through `dem-tool refresh` rather than through a commit.
+    # The sources themselves do not live here: they come from the elevation
+    # API's list, so adding one reaches production through `bin/index.sh` on the
+    # data host rather than through a commit.
     paths:
       - 'src/**'
       - 'Cargo.toml'
