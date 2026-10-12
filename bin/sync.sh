@@ -3,7 +3,7 @@
 # a reviewable diff; fm6 only ever holds a copy.
 #
 #   scripts -> fm6:/fm/storage2/dem/build
-#   data    -> fm6:/fm/storage2/dem/{footprints,norm,index,logs,state,tmp}
+#   data    -> fm6:/fm/storage2/dem/{index,logs,state,tmp}
 #
 # storage1 is at 93% with 1.2 T free and holds the sources; nothing is written
 # there. storage2 has 5.3 T.
@@ -14,7 +14,7 @@ HOST="${HOST:-fm6}"
 DEM_ROOT="${DEM_ROOT:-/fm/storage2/dem}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-ssh "$HOST" "mkdir -p $DEM_ROOT/build $DEM_ROOT/footprints $DEM_ROOT/logs $DEM_ROOT/state $DEM_ROOT/tmp"
+ssh "$HOST" "mkdir -p $DEM_ROOT/build $DEM_ROOT/logs $DEM_ROOT/state $DEM_ROOT/tmp"
 
 rsync -a --delete \
   --exclude '.git' \

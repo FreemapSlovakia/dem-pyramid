@@ -1,104 +1,96 @@
 #!/usr/bin/env bash
-# Layer B: the composite, as an index only.
+# The pyramid: one GTI per level over the rasters terrain-tiles serves.
 #
-# One GTI per pyramid level over the Layer A tiles. Coarser levels reference
-# each tile's overviews through `vrt://<file>?ovr=<n>` connection strings, so
-# no pixels are copied and no wrapper files are written -- a level's index is
-# a few kilobytes of rows.
+# Each row is a `vrt://` connection string `dem-tool index-plan` writes: the
+# raster's overview for that level, converted on read to the uint16 encoding
+# the marcher reads. No pixels are copied -- a level's index is a few rows.
 #
 # Overlap is resolved at read time by the SORT_FIELD: higher priority is
 # rendered last, so it wins, and nodata falls through to whatever is beneath.
-# That is why adding a source costs a warp plus row inserts, and why changing
-# priorities costs nothing at all.
 #
 # Usage: bin/index.sh [level ...]        default: every level, finest first
+#        INDEX_DIR=<dir> bin/index.sh    write somewhere other than index/
 
 set -euo pipefail
 
 DEM_ROOT="${DEM_ROOT:-/fm/storage2/dem}"
 TOOL="${TOOL:-$DEM_ROOT/build/target/release/dem-tool}"
+INDEX_DIR="${INDEX_DIR:-$DEM_ROOT/index}"
 
 levels=("$@")
 if [ ${#levels[@]} -eq 0 ]; then
   levels=(14 13 12 11 10 9 8)
 fi
 
-mkdir -p "$DEM_ROOT/index"
+mkdir -p "$INDEX_DIR"
 
 for z in "${levels[@]}"; do
-  index="$DEM_ROOT/index/z$z.gti.gpkg"
+  index="$INDEX_DIR/z$z.gti.gpkg"
   tmp="$index.tmp.gti.gpkg"
   rm -f "$tmp"
 
   res=""
-  first=1
-  declare -a present=()
+  ids=()
+  priorities=()
+  locs=()
 
-  while IFS=$'\t' read -r kind id priority ovr dir; do
+  # An assignment, not a process substitution, so `set -e` sees the plan fail
+  # rather than reading it as a level with no sources.
+  plan=$("$TOOL" index-plan "$z")
+
+  while IFS=$'\t' read -r kind a b c; do
     case "$kind" in
-      RES) res="$id"; continue ;;
-      SRC) ;;
-      *) continue ;;
+      RES) res="$a" ;;
+      SRC) ids+=("$a"); priorities+=("$b"); locs+=("$c") ;;
     esac
+  done <<<"$plan"
 
-    [ -d "$dir" ] || continue
-
-    # Collect this source's tiles, as base images or as overview references.
-    locs=()
-    for f in "$dir"/*.tif; do
-      [ -e "$f" ] || continue
-      # Tiles are written as NAME.tif.tmp.tif and renamed into place, so the
-      # glob also matches whatever the builder is writing right now. Indexing
-      # one is a race: usually gdaltindex cannot open it and warns, but a tile
-      # complete enough to open gets a row pointing at a name that disappears
-      # at the rename, and the level then reads as a hole until the next
-      # reindex. Renders stay reproducible only if the index ignores them.
-      case "$f" in *.tmp.tif) continue ;; esac
-      if [ "$ovr" -lt 0 ]; then
-        locs+=("$f")
-      else
-        locs+=("vrt://$f?ovr=$ovr")
-      fi
-    done
-    [ ${#locs[@]} -gt 0 ] || continue
-
-    mo=()
-    if [ "$first" = 1 ]; then
-      # SORT_FIELD names a column added below; nothing opens the index in
-      # between, so referring to it before it exists is harmless.
-      mo=(-mo SORT_FIELD=priority -mo SORT_FIELD_ASC=YES)
-      first=0
-    fi
-
-    gdaltindex -q -f GPKG -lyr_name tiles \
-      -tr "$res" "$res" -ot UInt16 -bandcount 1 -nodata 0 \
-      -write_absolute_path "${mo[@]}" \
-      "$tmp" "${locs[@]}"
-
-    present+=("$id:$priority:${#locs[@]}")
-  done < <("$TOOL" index-plan "$z")
-
-  if [ "$first" = 1 ]; then
-    echo "z$z: no tiles yet, skipped"
-    rm -f "$tmp"
+  # Removed rather than kept: the marcher would go on reading what it held.
+  if [ ${#locs[@]} -eq 0 ]; then
+    rm -f "$index"
+    echo "z$z: no source reaches this level, index removed"
     continue
   fi
 
-  # Priority per row, matched on the source directory in the location string.
+  # gdaltindex exits 0 having skipped a raster it cannot open, or having read
+  # overview 1 for an `ovr=` the raster lacks; both only show on stderr. The
+  # SORT_FIELD column is added below, before anything opens the index.
+  if ! warnings=$(gdaltindex -q -f GPKG -lyr_name tiles \
+      -tr "$res" "$res" -ot UInt16 -bandcount 1 -nodata 0 \
+      -mo SORT_FIELD=priority -mo SORT_FIELD_ASC=YES \
+      "$tmp" "${locs[@]}" 2>&1 >/dev/null) || [ -n "$warnings" ]; then
+    echo "z$z: gdaltindex: ${warnings:-failed}" >&2
+    echo "z$z: index not replaced" >&2
+    rm -f "$tmp"
+    exit 1
+  fi
+
   ogrinfo "$tmp" -sql "ALTER TABLE tiles ADD COLUMN priority INTEGER" >/dev/null
-  for entry in "${present[@]}"; do
-    id="${entry%%:*}"
-    rest="${entry#*:}"
-    priority="${rest%%:*}"
-    ogrinfo "$tmp" -sql \
-      "UPDATE tiles SET priority = $priority WHERE location LIKE '%/norm/$id/%'" \
-      >/dev/null
+  cases=""
+  for i in "${!locs[@]}"; do
+    cases+=" WHEN '${locs[$i]//\'/\'\'}' THEN ${priorities[$i]}"
   done
+  ogrinfo "$tmp" -sql "UPDATE tiles SET priority = CASE location$cases END" >/dev/null
+
+  # One prioritised row per planned raster, or the level is not what was
+  # planned: a missing row is a hole, and a row whose location gdaltindex
+  # rewrote keeps a NULL priority and sorts unpredictably.
+  count() {
+    ogrinfo -q "$tmp" -sql "SELECT COUNT(*) AS n FROM tiles $1" |
+      sed -n 's/.*n (Integer) = //p'
+  }
+  rows=$(count "")
+  unset_rows=$(count "WHERE priority IS NULL")
+  if [ "${rows:-}" != ${#locs[@]} ] || [ "${unset_rows:-1}" != 0 ]; then
+    echo "z$z: ${rows:-?} row(s) for ${#locs[@]} planned, ${unset_rows:-?} without" \
+      "a priority; index not replaced" >&2
+    rm -f "$tmp"
+    exit 1
+  fi
 
   mv "$tmp" "$index"
   echo "z$z: $index"
-  for entry in "${present[@]}"; do
-    IFS=: read -r id priority n <<<"$entry"
-    printf "   %-12s priority=%-4s tiles=%s\n" "$id" "$priority" "$n"
+  for i in "${!ids[@]}"; do
+    printf "   %-14s priority=%s\n" "${ids[$i]}" "${priorities[$i]}"
   done
 done

@@ -327,6 +327,24 @@ fn opacity(ray_t: f64, prev: Option<(f64, f64)>, d: f64, h: f64) -> u8 {
     (v * 254.0).round() as u8 + 1
 }
 
+fn viewpoint_ground(pyr: &mut Pyramid, p: &Params) -> Result<f64> {
+    let (ex, ey) = lonlat_to_merc(p.lon, p.lat);
+    let at_point = pyr
+        .sample_finest(ex, ey)
+        .context("viewpoint has no elevation data")?;
+    let r = p.eye_search_radius / p.lat.to_radians().cos();
+    let mut best = at_point;
+    if r > 0.0 {
+        for k in 0..8 {
+            let a = f64::from(k) * std::f64::consts::FRAC_PI_4;
+            if let Some(h) = pyr.sample_finest(ex + r * a.cos(), ey + r * a.sin()) {
+                best = best.max(h);
+            }
+        }
+    }
+    Ok(best)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,22 +459,4 @@ mod tests {
             }
         }
     }
-}
-
-fn viewpoint_ground(pyr: &mut Pyramid, p: &Params) -> Result<f64> {
-    let (ex, ey) = lonlat_to_merc(p.lon, p.lat);
-    let at_point = pyr
-        .sample_finest(ex, ey)
-        .context("viewpoint has no elevation data")?;
-    let r = p.eye_search_radius / p.lat.to_radians().cos();
-    let mut best = at_point;
-    if r > 0.0 {
-        for k in 0..8 {
-            let a = f64::from(k) * std::f64::consts::FRAC_PI_4;
-            if let Some(h) = pyr.sample_finest(ex + r * a.cos(), ey + r * a.sin()) {
-                best = best.max(h);
-            }
-        }
-    }
-    Ok(best)
 }

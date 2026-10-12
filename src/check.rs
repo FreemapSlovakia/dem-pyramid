@@ -1,14 +1,12 @@
 //! Is the cache still what the data says?
 //!
-//! `refresh` measures the sources and writes what the build needs; everything
-//! downstream reads that rather than the rasters, which is what keeps a build
-//! from opening a 44 MB VRT once per tile just to ask its resolution. The cost
-//! is that the cache can fall behind: a source regenerated upstream, a dataset
-//! added to the list, a raster whose nodata changed.
+//! `refresh` measures the rasters and writes what the index needs; everything
+//! downstream reads that rather than the rasters. The cost is that the cache
+//! can fall behind: a dataset added, renumbered or renamed in the elevation
+//! source list, or its raster rebuilt at another zoom.
 //!
 //! So this re-measures and holds the answer against the cache. Headers only --
-//! no pixel is read. It has already caught nodata sentinels that differ
-//! between files of the same country.
+//! no pixel is read.
 
 use anyhow::{Result, bail};
 use std::path::Path;
@@ -16,7 +14,7 @@ use std::path::Path;
 use crate::config::{Doc, Source};
 use crate::{credit, refresh};
 
-/// Everything a build would read, compared field by field.
+/// Everything the index or a credit would read, compared field by field.
 fn differences(was: &Source, now: &Source) -> Vec<String> {
     let mut notes = Vec::new();
 
@@ -26,44 +24,22 @@ fn differences(was: &Source, now: &Source) -> Vec<String> {
         }
     };
 
-    // Both are path components for norm/ and footprints/, so a rename
-    // silently repoints every tile the source has already built.
-    note("id", was.id.clone(), now.id.clone());
     note("dir", was.dir.clone(), now.dir.clone());
     note("api_name", was.api_name.clone(), now.api_name.clone());
+    note("path", was.path.clone(), now.path.clone());
     note(
         "priority",
         was.priority.to_string(),
         now.priority.to_string(),
     );
-    note("nodata", was.nodata.to_string(), now.nodata.to_string());
     note(
-        "finest_level",
-        was.finest_level.to_string(),
-        now.finest_level.to_string(),
+        "base_level",
+        was.base_level.to_string(),
+        now.base_level.to_string(),
     );
-    note("resampling", was.resampling.clone(), now.resampling.clone());
-    note(
-        "footprint",
-        format!("{:?}", was.footprint),
-        format!("{:?}", now.footprint),
-    );
-    note(
-        "fill_nodata_md",
-        format!("{:?}", was.fill_nodata_md),
-        format!("{:?}", now.fill_nodata_md),
-    );
-
-    // Measured, so a hair of float drift between GDAL versions is not news.
-    if (was.native_res - now.native_res).abs() > 0.05 * now.native_res {
-        notes.push(format!(
-            "native_res: cached {:.4} m, measured {:.4} m",
-            was.native_res, now.native_res
-        ));
-    }
 
     // A box that moved by a fraction of a degree is the same box; anything
-    // more changes which tiles the source is asked for.
+    // more changes which renders credit the source.
     let moved = was
         .bbox
         .iter()
@@ -84,13 +60,12 @@ fn differences(was: &Source, now: &Source) -> Vec<String> {
 pub fn run(doc: &Doc, elevation_sources: &Path) -> Result<()> {
     let entries = credit::load_entries(elevation_sources)?;
 
-    let (measured, unreadable) =
-        refresh::derive_all(&entries, doc.grid.coarsest_level, doc.grid.finest_level);
+    let (measured, unreadable) = refresh::derive_all(&entries, doc.grid.coarsest_level);
 
-    let mut problems = unreadable;
+    let mut problems = unreadable.len();
 
     for now in &measured {
-        match doc.sources.iter().find(|s| s.path == now.path) {
+        match doc.sources.iter().find(|s| s.id == now.id) {
             None => {
                 println!(
                     "FAIL {}: in the source list, missing from the cache",
@@ -115,16 +90,17 @@ pub fn run(doc: &Doc, elevation_sources: &Path) -> Result<()> {
     }
 
     for was in &doc.sources {
-        if !measured.iter().any(|m| m.path == was.path) {
+        // One already reported unreadable is not also gone from the list.
+        if !measured.iter().any(|m| m.id == was.id) && !unreadable.contains(&was.id) {
             println!(
-                "FAIL {}: in the cache, no longer built by the source list",
+                "FAIL {}: in the cache, no longer in the source list",
                 was.id
             );
             problems += 1;
         }
     }
 
-    // After the report, not before it: a dataset unmarked upstream fails the
+    // After the report, not before it: a dataset renamed upstream fails the
     // licence rule too, and stopping on that first would answer a stale cache
     // with a complaint about credits and hide every other drift behind it.
     credit::check_attributions(&doc.sources, &entries)?;
@@ -132,8 +108,8 @@ pub fn run(doc: &Doc, elevation_sources: &Path) -> Result<()> {
     if problems > 0 {
         bail!(
             "\n{problems} disagreement(s) with the data.\n\
-             Run `dem-tool refresh` to bring the cache up to date, then rebuild \
-             whatever the changed values affect."
+             Run `dem-tool refresh` to bring the cache up to date, then \
+             `bin/index.sh` and restart terrain."
         );
     }
 
@@ -145,65 +121,48 @@ pub fn run(doc: &Doc, elevation_sources: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{FootprintMode, Nodata};
 
-    fn source(id: &str, native_res: f64) -> Source {
+    fn source(id: &str) -> Source {
         Source {
             id: id.into(),
             dir: format!("010-{id}"),
             api_name: id.into(),
-            path: format!("/dtm/{id}.tif"),
-            priority: 100,
-            native_res,
+            path: format!("/terrain/{id}.tif"),
+            priority: -1,
+            base_level: 18,
             bbox: [0.0, 0.0, 1.0, 1.0],
-            nodata: Nodata::Declared("declared".into()),
-            finest_level: 14,
-            resampling: "average".into(),
-            footprint: FootprintMode::Bbox,
-            fill_nodata_md: None,
         }
     }
 
     #[test]
     fn an_unchanged_source_reports_nothing() {
-        assert!(differences(&source("sk", 1.0), &source("sk", 1.0)).is_empty());
-    }
-
-    /// Float noise between GDAL versions is not a change; a real resolution
-    /// change is.
-    #[test]
-    fn resolution_tolerates_noise_but_not_a_change() {
-        assert!(differences(&source("sk", 1.0), &source("sk", 1.0000001)).is_empty());
-        assert_eq!(differences(&source("sk", 1.0), &source("sk", 2.0)).len(), 1);
+        assert!(differences(&source("sk"), &source("sk")).is_empty());
     }
 
     #[test]
-    fn a_moved_box_is_reported() {
-        let was = source("sk", 1.0);
-        let mut now = source("sk", 1.0);
+    fn a_moved_box_is_reported_and_noise_is_not() {
+        let mut now = source("sk");
+        now.bbox = [0.0, 0.0, 1.0001, 1.0];
+        assert!(differences(&source("sk"), &now).is_empty());
+
         now.bbox = [0.0, 0.0, 1.5, 1.0];
-
-        assert_eq!(differences(&was, &now).len(), 1);
+        assert_eq!(differences(&source("sk"), &now).len(), 1);
     }
 
-    /// Every field the build reads is compared, so a change in any one of them
-    /// is caught rather than silently built against.
+    /// Every field the index or a credit reads is compared, so a change in any
+    /// one of them is caught rather than silently served.
     #[test]
-    fn each_build_input_is_compared() {
-        let was = source("sk", 1.0);
+    fn each_input_is_compared() {
+        let was = source("sk");
 
         for mutate in [
-            (|s: &mut Source| s.id = "other".into()) as fn(&mut Source),
-            |s| s.dir = "020-other".into(),
+            (|s: &mut Source| s.dir = "020-other".into()) as fn(&mut Source),
             |s| s.api_name = "other".into(),
-            |s| s.priority = 1,
-            |s| s.nodata = Nodata::Value(-9999.0),
-            |s| s.finest_level = 12,
-            |s| s.resampling = "bilinear".into(),
-            |s| s.footprint = FootprintMode::Tiles,
-            |s| s.fill_nodata_md = Some(5),
+            |s| s.path = "/elsewhere/sk.tif".into(),
+            |s| s.priority = -2,
+            |s| s.base_level = 17,
         ] {
-            let mut now = source("sk", 1.0);
+            let mut now = source("sk");
             mutate(&mut now);
             assert_eq!(differences(&was, &now).len(), 1);
         }

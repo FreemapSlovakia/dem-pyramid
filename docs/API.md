@@ -552,11 +552,10 @@ are given rather than keeping a copy of the licence text.
 
 They are derived from the *view*, not from the pixels: the mosaic keeps no
 record of where a sample came from, so the sector is swept and every model whose
-box covers a sample is named. Every one, not just the highest priority: tiles are
-filtered against each source's real footprint, and nodata falls through, so
-ground inside a national box is routinely served by whatever lies beneath it --
-GEDTM30 answers much of the area the national boxes overstate. Sources are
-compared by their declared lon/lat box, which bounds where one *could*
+box covers a sample is named. Every one, not just the highest priority: nodata
+falls through, so ground inside a national box is routinely served by whatever
+lies beneath it -- GEDTM30 answers much of the area the national boxes
+overstate. Sources are compared by their measured lon/lat box, which bounds where one *could*
 contribute, so the list errs towards naming a model that contributed nothing.
 
 The credit lines are not this service's. They are read at startup from the

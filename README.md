@@ -10,16 +10,14 @@ directory is a checkout of this repository. All data lives on fm6 under
 ## Layout
 
 ```
-src/                    dem-tool: source measurement, staleness check, footprints
+src/                    dem-tool: source measurement, staleness check, index plan, renders
+bin/index.sh            write the per-level indexes
 bin/run.sh              deprioritised, logged step runner
 bin/sync.sh             push to fm6 and build there
 ```
 
-Orchestration is bash calling the GDAL command line tools; `dem-tool` holds the
-parts that are actual logic. It shells out to `gdalinfo -json`, `gdalsrsinfo`
-and `ogr2ogr` for most of that, and links libgdal where a subprocess per call
-would not do: the ray marcher reading the index, and the coordinate transforms
-that size each source's extent.
+`dem-tool` reads the index through libgdal, and shells out to `gdalinfo -json`
+and `ogr2ogr` where a tool's output is simpler to read than the bindings.
 
 The binary is built **on fm6** — its glibc (2.41) is older than the
 workstation's (2.42), so a locally built binary would not run there.
@@ -29,22 +27,23 @@ On fm6:
 ```
 /fm/storage2/dem/
   build/                this repo
-  state/sources.json    what `refresh` measured: every source the build reads
-  footprints/           <id>.gpkg + summary.json
-  norm/<id>/            Layer A: per-source zoom-aligned COGs + overviews
-  index/z{14..8}.gti.gpkg   Layer B: composite, index only
+  state/sources.json    what `refresh` measured: every raster the index reads
+  index/z{14..8}.gti.gpkg   one GTI per level, rows only
   logs/ state/ tmp/
 ```
 
 ## Design in one paragraph
 
-Two layers. **Layer A** warps each source exactly once, ever, into its own
-zoom-aligned COG tiles on the global Web-Mercator grid. **Layer B** is a GTI
-index per level with priority as a sort column — no pixels, so adding a source
-means warping that source and inserting rows. Each source is materialised only
-at levels at or coarser than its own resolution, so z14/z13 are sparse
-(national data only) and the ray marcher falls back to the finest level that
-has data. Nothing is ever rebuilt from scratch.
+The pyramid holds no pixels. It reads the rasters terrain-tiles serves for
+hillshading — one Cloud-Optimized GeoTIFF per country, EPSG:3857 on the XYZ
+grid of its zoom, Int32 in 2 mm steps, overviews down to z8 — through one GTI
+index per level. Each row is a `vrt://` connection string that picks the
+raster's overview for that level and converts it on read to the marcher's
+uint16 decimetres (`scale=-250000,3026750,0,65535`, nodata 0); GDAL rounds the
+conversion and leaves nodata as 0. Priority is a sort column, so overlap is
+resolved at read time and nodata falls through to whatever is beneath. A raster
+contributes only to levels at or coarser than its own zoom, so gedtm30 (z13) is
+absent from z14 and the marcher falls back to the finest level that has data.
 
 ## Grid
 
@@ -54,11 +53,6 @@ resolution at 49N is `102700 / 2^z`, so z14 is 6.27 m there, 3.0 m in northern
 Norway and 7.8 m in southern Spain. The marcher picks a level from the *local*
 ground cell size, not from a fixed distance table.
 
-Tiles are 32768 px at z14 = 313.086 km, origin at the Web-Mercator origin, with
-512 px blocks — so the in-file overview chain reaches z8 and the tile grid never
-shifts when a source is added. That fixed grid is what makes incremental
-rebuilds possible.
-
 ## Usage
 
 Everything below runs on fm6 in `/fm/storage2/dem/build`. A push to `main`
@@ -66,78 +60,39 @@ deploys the binary and the unit; `bin/sync.sh` pushes work in progress without
 one. Long steps go in tmux and log to `$DEM_ROOT/logs/<step>.log`, so nothing
 depends on staying attached.
 
-**Start with `check`.** It re-measures every source and names whatever no longer
-matches the cache, ending with the command that fixes it. That is how a dataset
-added to the source list upstream gets noticed rather than missed.
+**Start with `check`.** It re-measures every raster and names whatever no
+longer matches the cache, ending with the command that fixes it.
 
 | to | run |
 | --- | --- |
-| see what the pyramid is built from | `./target/release/dem-tool list` |
+| see what the pyramid reads | `./target/release/dem-tool list` |
 | find out whether the cache is current | `./target/release/dem-tool check` |
 | bring the cache up to date | `./target/release/dem-tool refresh` |
-| build tiles for whatever is new | `bin/run.sh layer-a bash bin/build-all.sh` |
-| make built tiles visible to renders | `bin/run.sh index bash bin/index.sh` |
-| materialise the global fallback | `bin/run.sh fallback bash bin/fallback.sh` |
+| make the cache visible to renders | `bin/run.sh index bash bin/index.sh` |
 
-Each takes ids, levels or a bbox to narrow it; `--help` or the header comment
-says which.
+`index.sh` takes levels to narrow it, and `INDEX_DIR` to write somewhere other
+than `index/`. Each level is written to a temporary file and moved into place,
+so killing it leaves the previous index; a full run takes minutes.
 
-`refresh` is wanted when the source list gains or loses a dataset, when a raster
-is regenerated underneath, or when a deployed change alters how a value is
-derived. `check` says so; there is no reason to run it on a schedule, and none
-to fold it into a build, because it rewrites what `serve` reads for crediting
-and takes effect at the next restart.
+A change in the sources — a dataset added, removed or renumbered in the source
+list, or its raster rebuilt at another zoom — needs `refresh`, then `index.sh`,
+then `systemctl restart terrain`. `serve` reads `state/sources.json` and the elevation source list for
+crediting at startup, and refuses to start while a cached source is missing
+from the list, so restart only after `refresh`.
 
-A change in coverage needs all three, in order: `refresh`, then `build-all`,
-then `index.sh`. `build-all` rebuilds the footprints it filters against, so that
-is two commands rather than three, and both are resumable — finished tiles are
-skipped, so killing and restarting costs nothing.
-
-The sources themselves are not configured here. They come from
+The sources are not configured here. They come from
 [`elevation-sources`](https://github.com/FreemapSlovakia/elevation-sources),
-checked out on fm6, which names each dataset's raster, its credit, and whether
-the pyramid builds it. Everything else about a source is measured from the
-raster.
+checked out on fm6: every dataset marked `"pyramid": true` is in the pyramid,
+its directory's number is its priority (`010-sk` outranks `999-gedtm30`), its
+`source.json` credits it, and its `mercator.tif` link is the raster read — the
+one terrain-tiles serves. The id is the directory without its number:
+`100-es-30` is `es_30`. Everything else is measured from the raster, and
+`refresh` refuses one that is off the z8 pixel grid, in other units, or short
+of an overview.
 
-## Pilot results (tile 70_44, 2026-08-20)
-
-Tile 70_44 spans lon 16.875–19.6875, lat 47.04–48.92: southwestern Slovakia,
-northeastern Austria, northern Hungary.
-
-| source | level | build | size | valid % | ratio | B/px |
-|---|---|---|---|---|---|---|
-| sk | 14 | 33.5 min | 437.7 MB | 51.1 | 3.34× | 0.80 |
-| at | 14 | 2.0 min | 13.9 MB | 2.3 | 4.66× | 0.57 |
-| gedtm30 | 12 | 15 s | 83.1 MB | 100 | 2.15× | 1.24 |
-
-Ratio is stored bytes against the raw bytes of the *valid* pixels plus their
-overview chain; SPARSE_OK means nodata blocks are never written.
-
-At 0.80 B/px the national coverage projects to **~90 GB** (49.6 GB for
-se+fi+no at 63N, 40.8 GB for the rest at 46N — pixel count per km² of ground
-rises with latitude). This tile is lowland plus low hills; Alpine 1 m LiDAR
-will compress worse, so budget 90–150 GB.
-
-Verified:
-
-- **Priority** at a genuine sk/at overlap: sk 6388, at 6393, index returns
-  6388. SORT_FIELD resolves correctly.
-- **Fall-through** sk → at → gedtm30 at points where each is the first with
-  data.
-- **Sparse fine levels**: z14 returns nodata over Hungary while z12 returns
-  215.1 m from gedtm30 — the marcher's fallback case.
-- **Geometric alignment**: sk and at tiles have bit-identical geotransforms and
-  corners. Because every source is warped to the same `-te`/`-ts`, a
-  half-cell seam is impossible by construction.
-- **Vertical agreement**: sk − at = −0.129 m mean, sd 0.158 m over the overlap
-  (n=7 — the overlap strip is thin, so treat as an order of magnitude). That is
-  the expected decimetre-scale vertical datum difference, and it is 1/70 of a
-  pixel at 10 km. Not worth chasing.
-
-The visual seam check was **inconclusive**: the sk/at boundary here follows the
-Morava floodplain, whose paleochannel microrelief saturates a hillshade long
-before a 13 cm step becomes visible. Natural exaggeration showed no gross
-artefacts. A mountainous border (SK/PL Tatras) would be the better test.
+Vertical datums differ across sources (RH2000, IGN69, LN02, EGM2008 …).
+Offsets are decimetre-scale — invisible to the ray marcher, visible in a
+hillshade seam check.
 
 ## Panorama
 
@@ -239,24 +194,3 @@ start if a source it would serve has no credit, so a render can always say
 whose data answered it.
 
 Not yet done: sun path, caching/precomputation.
-
-## Known source hazards
-
-Re-measured 2026-08-20, all 23 sources.
-
-- **si** declares no nodata on the VRT *or* the underlying tiles, so it returns
-  0 over every uncovered part of a bbox that reaches into Italy, Austria and
-  Croatia. `rebuild_vrt` regenerates it with `gdalbuildvrt -vrtnodata -9999`.
-- **pl** uses 0 for out-of-coverage, colliding with genuine 0 m coastal terrain
-  (Żuławy). Healed with `gdal_fillnodata -md 5`.
-- **es_29** and **es_31** use `-32767`; **es_30** uses `-9999`. Same country.
-- **sk** and **gedtm30** use float-max (`3.4e38`) sentinels.
-- **no** uses `-32767`, **fr** and all DROM use `-99999`.
-- Vertical datums differ across sources (RH2000, IGN69, LN02, EGM2008 …).
-  Offsets are decimetre-scale — invisible to the ray marcher, visible in a
-  hillshade seam check. Don't chase them.
-
-Priority runs **higher wins**, and comes from the numeric prefix on the source
-list's directories, which ascend: `010-sk` outranks `999-gedtm30`. Note the two
-opposite conventions it sits between -- `freemap-v3-api` is first-wins,
-`gdalbuildvrt` is last-wins -- so the sign is flipped once, in `refresh`.

@@ -1,43 +1,29 @@
-//! Derive every source's build metadata from the data, once.
+//! Measure the rasters the pyramid reads, once.
 //!
-//! The elevation source list says which datasets exist and where their rasters
-//! are; everything else the build needs follows from the rasters themselves or
-//! from a rule over them. Measuring costs one header read per source -- about
-//! 24 s for the whole catalogue -- which is nothing once, and far too much per
-//! `warp-env` invocation, of which a build makes thousands. So it is measured
-//! here and cached.
+//! The elevation source list says which datasets the pyramid holds, in what
+//! order, and how each is credited, and links each one's `mercator.tif` --
+//! the raster terrain-tiles serves. Everything else follows from that raster.
+//! Measuring costs one header read per raster, so it is done here and cached
+//! rather than on every start.
 //!
 //! The cache is a build artifact, not configuration: it is regenerated rather
 //! than edited, and `check` fails when it no longer matches the data.
 
 use anyhow::{Context, Result, bail};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::config::{FootprintMode, Nodata, Source, ground_res};
+use crate::config::{Source, level_res};
 use crate::credit::Entry;
 use crate::gdal_cli;
-use gdal::spatial_ref::{AxisMappingStrategy, CoordTransform, SpatialRef};
+use crate::grid::{ORIGIN, TERRAIN_STEPS_PER_M, merc_to_lonlat};
+use gdal::spatial_ref::SpatialRef;
 
-/// Latitude the level/resolution table is quoted at. Central Europe, where
-/// most of the data is.
-const REF_LAT: f64 = 49.0;
+/// terrain-tiles' nodata, which the index's conversion leaves as 0.
+const TERRAIN_NODATA: f64 = -2_147_483_648.0;
 
-/// A source is never materialised into a level finer than its own data. The
-/// slack absorbs sources whose nominal resolution is a rounder number than
-/// their geotransform.
-const UPSAMPLE_SLACK: f64 = 0.75;
-
-/// Distance, in pixels, that `gdal_fillnodata` searches when healing speckle.
-/// Far enough to bridge single pixels lost to a sentinel that collides with
-/// real terrain, short enough to leave genuine coverage gaps alone.
-pub const FILL_NODATA_MD: u32 = 5;
-
-/// `010-sk` -> `sk`, `090-es-29` -> `es_29`.
-///
-/// The prefix is precedence and belongs in `priority`; the rest names the
-/// dataset. Dashes become underscores because the id is a path component for
-/// `norm/` and `footprints/`.
-fn id_of(dir: &str) -> String {
+/// `010-sk` -> `sk`, `090-es-29` -> `es_29`: the dataset without its
+/// precedence.
+pub(crate) fn id_of(dir: &str) -> String {
     dir.split_once('-')
         .map_or(dir, |(_, rest)| rest)
         .replace('-', "_")
@@ -55,64 +41,51 @@ fn priority_of(dir: &str) -> Result<i64> {
     Ok(-prefix)
 }
 
-/// The finest level this source can be materialised into without being
-/// upsampled.
-fn finest_level_of(native_res: f64, coarsest: u32, finest: u32) -> u32 {
-    (coarsest..=finest)
-        .rev()
-        .find(|&z| ground_res(z, REF_LAT) >= native_res * UPSAMPLE_SLACK)
-        .unwrap_or(coarsest)
+/// What the dataset directory's `mercator.tif` link points at, absolute: the
+/// index is opened from wherever `serve` runs, and a link repointed later
+/// shows in `check` as a changed path.
+fn raster_of(dir: &Path) -> Result<String> {
+    let link = dir.join("mercator.tif");
+    let abs = std::fs::canonicalize(&link)
+        .with_context(|| format!("{}: no raster behind it", link.display()))?;
+
+    abs.to_str()
+        .map(str::to_owned)
+        .with_context(|| format!("{}: not UTF-8", abs.display()))
 }
 
-/// Average whenever an output pixel covers more than one source pixel, which
-/// is every national source. When it covers less -- GEDTM30's 30 m read into
-/// z12's 25 m ground -- there is nothing to average, and averaging only blurs;
-/// bilinear interpolates instead, where cubicspline would overshoot ridges.
-fn resampling_of(native_res: f64, finest_level: u32) -> String {
-    if ground_res(finest_level, REF_LAT) < native_res {
-        "bilinear".to_owned()
-    } else {
-        "average".to_owned()
+/// The zoom whose pixel this is, if it is one.
+fn level_of(res: f64) -> Option<u32> {
+    let z = (level_res(0) / res).log2().round();
+    if !(0.0..=30.0).contains(&z) {
+        return None;
     }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let z = z as u32;
+    ((level_res(z) - res).abs() < 1e-6 * res).then_some(z)
 }
 
-/// `tiles` reads a VRT's source rectangles; there is nothing to read in a
-/// single raster, whose real edge its nodata resolves at warp time anyway.
-fn footprint_of(path: &str) -> FootprintMode {
-    if path.ends_with(".vrt") {
-        FootprintMode::Tiles
-    } else {
-        FootprintMode::Bbox
+/// A measured raster: its base zoom and its lon/lat box.
+struct Measured {
+    base_level: u32,
+    bbox: [f64; 4],
+}
+
+/// Held to everything the index's `vrt://` conversion assumes: EPSG:3857,
+/// Int32 in 2 mm steps with terrain-tiles' nodata, and an overview per zoom
+/// down to the coarsest level, each exactly half the last and on that zoom's
+/// pixel grid. A raster off any of these would be read silently wrong -- the
+/// GTI resamples a misaligned row onto its own grid -- not refused.
+fn measure(info: &serde_json::Value, path: &str, coarsest: u32) -> Result<Measured> {
+    let wkt = info["coordinateSystem"]["wkt"]
+        .as_str()
+        .with_context(|| format!("{path}: no coordinate system"))?;
+    let srs = SpatialRef::from_wkt(wkt).with_context(|| format!("{path}: unreadable CRS"))?;
+
+    if srs.auth_name().as_deref() != Some("EPSG") || srs.auth_code().ok() != Some(3857) {
+        bail!("{path}: not EPSG:3857");
     }
-}
 
-/// Only a sentinel that is itself a plausible elevation can collide with real
-/// terrain. Every other sentinel in the catalogue is far outside the range.
-fn fill_nodata_of(nodata: Option<f64>) -> Option<u32> {
-    (nodata == Some(0.0)).then_some(FILL_NODATA_MD)
-}
-
-/// How finely the raster is sampled when working out its lon/lat extent.
-/// 65x65 points, computed once per source, is not worth economising on.
-const EXTENT_STEPS: usize = 64;
-
-/// Degrees added to every side of the derived extent, to absorb what the
-/// sampling still misses between points.
-///
-/// Erring wide costs a read that finds nodata and falls through; erring narrow
-/// loses data silently. The bias is deliberate, and matches what the elevation
-/// API allows itself for the same derivation.
-const EXTENT_MARGIN_DEG: f64 = 0.01;
-
-/// The source's extent in lon/lat.
-///
-/// Not the four corners transformed: a projected edge bows away from the
-/// straight line between them -- a fifth of a degree for a UTM-width extent at
-/// high latitude, always outwards, so a corner hull clips it. An interior grid
-/// catches that, and also the case an edge walk would miss: a polar
-/// stereographic sheet containing the pole reaches 90 degrees at an interior
-/// pixel, on no edge at all.
-fn bbox_of(info: &serde_json::Value, path: &str) -> Result<[f64; 4]> {
     let gt: Vec<f64> = info["geoTransform"]
         .as_array()
         .with_context(|| format!("{path}: no geotransform"))?
@@ -120,166 +93,110 @@ fn bbox_of(info: &serde_json::Value, path: &str) -> Result<[f64; 4]> {
         .map(|v| v.as_f64().unwrap_or(f64::NAN))
         .collect();
 
-    if gt.len() != 6 || gt.iter().any(|v| !v.is_finite()) {
-        bail!("{path}: unusable geotransform");
+    if gt.len() != 6 || gt[2] != 0.0 || gt[4] != 0.0 || (gt[1] + gt[5]).abs() > 1e-9 * gt[1] {
+        bail!("{path}: not a north-up square-pixel grid");
     }
 
-    let size = |i: usize| -> Result<f64> {
-        info["size"][i]
-            .as_f64()
-            .filter(|v| *v > 0.0)
-            .with_context(|| format!("{path}: no raster size"))
+    let level =
+        level_of(gt[1]).with_context(|| format!("{path}: {} m is no zoom's pixel", gt[1]))?;
+
+    if level < coarsest {
+        bail!("{path}: z{level} is coarser than the pyramid");
+    }
+
+    let band = &info["bands"][0];
+
+    if band["type"].as_str() != Some("Int32")
+        || band["noDataValue"].as_f64() != Some(TERRAIN_NODATA)
+        || band["scale"].as_f64() != Some(1.0 / TERRAIN_STEPS_PER_M)
+        || band["offset"].as_f64().unwrap_or(0.0) != 0.0
+    {
+        bail!("{path}: not Int32 heights in 2 mm steps with nodata {TERRAIN_NODATA}");
+    }
+
+    // On the coarsest level's grid, so on every finer one too.
+    let coarse = level_res(coarsest);
+    let off = |v: f64| {
+        let r = v.rem_euclid(coarse);
+        r.min(coarse - r) > 1e-3 * gt[1]
     };
+    if off(gt[0] + ORIGIN) || off(ORIGIN - gt[3]) {
+        bail!("{path}: origin is off the z{coarsest} pixel grid");
+    }
 
-    let (width, height) = (size(0)?, size(1)?);
+    let size = |v: &serde_json::Value| -> Option<(u64, u64)> {
+        Some((v["size"][0].as_u64()?, v["size"][1].as_u64()?))
+    };
+    let (w, h) = size(info).with_context(|| format!("{path}: no raster size"))?;
 
-    let wkt = info["coordinateSystem"]["wkt"]
-        .as_str()
-        .with_context(|| format!("{path}: no coordinate system"))?;
+    let halvings = level - coarsest;
+    if w % (1 << halvings) != 0 || h % (1 << halvings) != 0 {
+        bail!("{path}: {w}x{h} does not halve evenly down to z{coarsest}");
+    }
 
-    let mut src = SpatialRef::from_wkt(wkt).with_context(|| format!("{path}: unreadable CRS"))?;
-    let mut dst = SpatialRef::from_epsg(4326)?;
+    let overviews = band["overviews"].as_array().map_or(&[][..], Vec::as_slice);
 
-    // Both, or EPSG:4326 hands back lat/lon and every box comes out transposed.
-    src.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
-    dst.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
-
-    let ct = CoordTransform::new(&src, &dst)?;
-
-    let n = EXTENT_STEPS + 1;
-    let mut xs = Vec::with_capacity(n * n);
-    let mut ys = Vec::with_capacity(n * n);
-
-    for i in 0..n {
-        for j in 0..n {
-            let px = width * (i as f64) / (EXTENT_STEPS as f64);
-            let py = height * (j as f64) / (EXTENT_STEPS as f64);
-
-            xs.push(gt[0] + px * gt[1] + py * gt[2]);
-            ys.push(gt[3] + px * gt[4] + py * gt[5]);
+    for k in 0..halvings {
+        let want = (w >> (k + 1), h >> (k + 1));
+        if overviews.get(k as usize).and_then(size) != Some(want) {
+            bail!(
+                "{path}: overview {k} should be {}x{} for z{}",
+                want.0,
+                want.1,
+                level - k - 1
+            );
         }
     }
 
-    // A point outside the projection's valid domain comes back non-finite and
-    // makes the whole call fail; it bounds nothing, so the survivors are what
-    // matter rather than the return.
-    drop(ct.transform_coords(&mut xs, &mut ys, &mut []));
+    #[allow(clippy::cast_precision_loss)]
+    let (x1, y0) = (gt[0] + w as f64 * gt[1], gt[3] + h as f64 * gt[5]);
+    let (west, south) = merc_to_lonlat(gt[0], y0);
+    let (east, north) = merc_to_lonlat(x1, gt[3]);
 
-    let (mut w, mut s, mut e, mut n_) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-    let mut held = 0usize;
-
-    for (lon, lat) in xs.iter().zip(&ys) {
-        if lon.is_finite() && lat.is_finite() && lat.abs() <= 90.0 {
-            w = w.min(*lon);
-            s = s.min(*lat);
-            e = e.max(*lon);
-            n_ = n_.max(*lat);
-            held += 1;
-        }
-    }
-
-    if held == 0 {
-        bail!("{path}: no sampled point has a lon/lat");
-    }
-
-    // A partial failure -- PROJ refusing points outside the projection's area
-    // of use -- clips the box inwards, which is the direction that loses data,
-    // by more than the margin covers. Refused rather than warned about: the
-    // cache would otherwise hold a short box that `check` re-measures to the
-    // same short box and calls agreement, and the source builds permanently
-    // shy of its own edge with nothing ever saying so.
-    if held < xs.len() {
-        bail!(
-            "{path}: {} of {} extent samples did not transform, so its box \
-             would be clipped",
-            xs.len() - held,
-            held + (xs.len() - held)
-        );
-    }
-
-    if w >= e || s >= n_ {
-        bail!("{path}: degenerate extent");
-    }
-
-    // A raster crossing the antimeridian samples near both -180 and +180 and
-    // yields a box the long way round the globe -- which reads here as the
-    // global fallback and is skipped by the build with a reassuring message.
-    // One lon/lat box has no way to say "wraps", so say so instead.
-    let mut lons: Vec<f64> = xs.iter().copied().filter(|v| v.is_finite()).collect();
-    lons.sort_by(f64::total_cmp);
-
-    let widest_gap = lons.windows(2).map(|p| p[1] - p[0]).fold(0.0_f64, f64::max);
-
-    if widest_gap > 180.0 {
-        bail!("{path}: crosses the antimeridian, which one lon/lat box cannot express");
-    }
-
-    Ok([
-        (w - EXTENT_MARGIN_DEG).max(-180.0),
-        (s - EXTENT_MARGIN_DEG).max(-90.0),
-        (e + EXTENT_MARGIN_DEG).min(180.0),
-        (n_ + EXTENT_MARGIN_DEG).min(90.0),
-    ])
+    Ok(Measured {
+        base_level: level,
+        bbox: [west, south, east, north],
+    })
 }
 
-/// Metres per pixel, whatever the CRS measures in.
-fn native_res_of(info: &serde_json::Value, path: &str) -> Result<f64> {
-    let res = info["geoTransform"][1]
-        .as_f64()
-        .with_context(|| format!("{path}: no geotransform"))?
-        .abs();
+/// Measure one dataset's raster.
+pub fn derive(entry: &Entry, coarsest: u32) -> Result<Source> {
+    let id = id_of(&entry.dir);
+    let path = raster_of(&entry.path)?;
 
-    // A geographic CRS quotes degrees; convert at the equator, which is how
-    // the declared figures were quoted.
-    Ok(if res < 0.01 { res * 111_320.0 } else { res })
-}
-
-/// Measure one source.
-pub fn derive(entry: &Entry, coarsest: u32, finest: u32) -> Result<Source> {
-    let info = gdal_cli::info_json(&entry.file)
-        .with_context(|| format!("{}: reading {}", entry.dir, entry.file))?;
-
-    let native_res = native_res_of(&info, &entry.file)?;
-    let finest_level = finest_level_of(native_res, coarsest, finest);
-    let declared = info["bands"][0]["noDataValue"].as_f64();
+    let info = gdal_cli::info_json(&path).with_context(|| format!("reading {path}"))?;
+    let m = measure(&info, &path, coarsest)?;
 
     Ok(Source {
-        id: id_of(&entry.dir),
+        id,
         dir: entry.dir.clone(),
         api_name: entry.name.clone(),
-        path: entry.file.clone(),
+        path,
         priority: priority_of(&entry.dir)?,
-        native_res,
-        nodata: match declared {
-            Some(_) => Nodata::Declared("declared".to_owned()),
-            None => bail!("{}: declares no nodata", entry.dir),
-        },
-        bbox: bbox_of(&info, &entry.file)?,
-        finest_level,
-        resampling: resampling_of(native_res, finest_level),
-        footprint: footprint_of(&entry.file),
-        fill_nodata_md: fill_nodata_of(declared),
+        base_level: m.base_level,
+        bbox: m.bbox,
     })
 }
 
 /// Where the cache lives. Under the data root rather than the checkout: it
 /// describes the data, is regenerated from it, and is never committed.
-pub fn cache_path(root: &Path) -> std::path::PathBuf {
+pub fn cache_path(root: &Path) -> PathBuf {
     root.join("state").join("sources.json")
 }
 
-/// Measure every dataset in the source list, reporting failures rather than
-/// stopping at the first.
-pub fn derive_all(entries: &[Entry], coarsest: u32, finest: u32) -> (Vec<Source>, usize) {
+/// Measure every dataset the source list marks for the pyramid, reporting
+/// failures rather than stopping at the first. The ids that failed come back
+/// with the rest.
+pub fn derive_all(entries: &[Entry], coarsest: u32) -> (Vec<Source>, Vec<String>) {
     let mut out = Vec::new();
-    let mut failed = 0usize;
+    let mut failed = Vec::new();
 
     for entry in entries.iter().filter(|e| e.pyramid) {
-        match derive(entry, coarsest, finest) {
+        match derive(entry, coarsest) {
             Ok(d) => out.push(d),
             Err(e) => {
                 println!("FAIL {}: {e:#}", entry.dir);
-                failed += 1;
+                failed.push(id_of(&entry.dir));
             }
         }
     }
@@ -292,7 +209,7 @@ pub fn derive_all(entries: &[Entry], coarsest: u32, finest: u32) -> (Vec<Source>
 pub fn write(path: &Path, derived: &[Source]) -> Result<()> {
     std::fs::create_dir_all(path.parent().context("no parent")?)?;
 
-    // Through a temp file: a half-written cache is a build against nothing.
+    // Through a temp file: a half-written cache is an index against nothing.
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_string_pretty(derived)? + "\n")?;
     std::fs::rename(&tmp, path)?;
@@ -308,13 +225,13 @@ mod tests {
     fn an_id_drops_the_prefix_and_keeps_the_rest() {
         assert_eq!(id_of("010-sk"), "sk");
         assert_eq!(id_of("090-es-29"), "es_29");
-        assert_eq!(id_of("250-sonny-de"), "sonny_de");
+        assert_eq!(id_of("245-de_by"), "de_by");
     }
 
     /// Ascending directories, descending priority.
     #[test]
     fn precedence_survives_the_reversal() {
-        let mut dirs = ["999-gedtm30", "010-sk", "240-be"];
+        let mut dirs = ["999-gedtm30", "010-sk", "240-be_vlg"];
         let mut by_priority = dirs;
         by_priority.sort_by_key(|d| -priority_of(d).unwrap());
         dirs.sort_unstable();
@@ -322,137 +239,97 @@ mod tests {
         assert_eq!(dirs, by_priority);
     }
 
-    /// A source is never blown up into a level finer than its own data.
     #[test]
-    fn no_source_is_upsampled_into_its_finest_level() {
-        for res in [0.5, 1.0, 2.0, 5.0, 20.0, 30.0] {
-            let z = finest_level_of(res, 8, 14);
-            assert!(
-                ground_res(z, REF_LAT) >= res * UPSAMPLE_SLACK,
-                "{res} m landed at z{z}"
-            );
-        }
+    fn the_raster_is_the_target_of_the_mercator_link() {
+        let base = std::env::temp_dir().join(format!("dem-tool-raster-of-{}", std::process::id()));
+        let (with, without) = (base.join("010-sk"), base.join("020-cz"));
+        std::fs::create_dir_all(&with).unwrap();
+        std::fs::create_dir_all(&without).unwrap();
+        std::fs::write(base.join("sk.tif"), "").unwrap();
+        std::os::unix::fs::symlink(base.join("sk.tif"), with.join("mercator.tif")).unwrap();
+
+        let target = std::fs::canonicalize(base.join("sk.tif")).unwrap();
+        assert_eq!(raster_of(&with).unwrap(), target.to_str().unwrap());
+        assert!(raster_of(&without).is_err());
+
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
-    fn the_levels_match_what_the_catalogue_used() {
-        // 1 m national data into z14, GEDTM30's 30 m into z12, Sonny's 20 m
-        // likewise -- z13 is 12.5 m ground, which would upsample both.
-        assert_eq!(finest_level_of(1.0, 8, 14), 14);
-        assert_eq!(finest_level_of(0.5, 8, 14), 14);
-        assert_eq!(finest_level_of(30.0, 8, 14), 12);
-        assert_eq!(finest_level_of(20.0, 8, 14), 12);
+    fn a_pixel_is_matched_to_its_zoom_exactly() {
+        assert_eq!(level_of(0.597_164_283_477_939), Some(18));
+        assert_eq!(level_of(19.109_257_071_294_063), Some(13));
+        assert_eq!(level_of(1.0), None);
     }
 
-    /// Average when an output pixel covers more than one source pixel.
-    #[test]
-    fn resampling_follows_the_ratio() {
-        // z14 is 6.27 m ground at 49N, z12 is 25.1 m.
-        assert_eq!(resampling_of(1.0, 14), "average");
-        assert_eq!(resampling_of(5.0, 14), "average");
-        assert_eq!(resampling_of(20.0, 12), "average");
-        assert_eq!(resampling_of(30.0, 12), "bilinear");
-    }
-
-    #[test]
-    fn only_a_sentinel_that_could_be_terrain_is_healed() {
-        assert_eq!(fill_nodata_of(Some(0.0)), Some(FILL_NODATA_MD));
-        assert_eq!(fill_nodata_of(Some(-9999.0)), None);
-        assert_eq!(fill_nodata_of(Some(3.4e38)), None);
-        assert_eq!(fill_nodata_of(None), None);
-    }
-
-    /// A gdalinfo-shaped value for a raster in one UTM zone, high enough for
-    /// the meridian convergence to matter.
-    fn utm_info(epsg: u32, origin: (f64, f64), res: f64, size: (u32, u32)) -> serde_json::Value {
-        let srs = SpatialRef::from_epsg(epsg).unwrap();
+    /// gdalinfo's JSON for sk.tif, trimmed to what is read.
+    fn sk_info() -> serde_json::Value {
+        let srs = SpatialRef::from_epsg(3857).unwrap();
+        let (w, h) = (1_572_864u64, 786_432u64);
+        let ovr: Vec<_> = (1..=10)
+            .map(|k| serde_json::json!({ "size": [w >> k, h >> k] }))
+            .collect();
 
         serde_json::json!({
-            "geoTransform": [origin.0, res, 0.0, origin.1, 0.0, -res],
-            "size": [size.0, size.1],
+            "geoTransform": [
+                1_721_973.373_208_452, level_res(18), 0.0,
+                6_418_264.391_049_679, 0.0, -level_res(18)
+            ],
+            "size": [w, h],
             "coordinateSystem": { "wkt": srs.to_wkt().unwrap() },
+            "bands": [{
+                "type": "Int32",
+                "noDataValue": TERRAIN_NODATA,
+                "scale": 0.002,
+                "offset": 0.0,
+                "overviews": ovr,
+            }],
         })
     }
 
-    /// Lon/lat extent of a raster's four corners alone, for comparison.
-    fn corner_hull(epsg: u32, origin: (f64, f64), res: f64, size: (u32, u32)) -> [f64; 4] {
-        let mut src = SpatialRef::from_epsg(epsg).unwrap();
-        let mut dst = SpatialRef::from_epsg(4326).unwrap();
-        src.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
-        dst.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
-        let ct = CoordTransform::new(&src, &dst).unwrap();
-
-        let (w, h) = (f64::from(size.0) * res, f64::from(size.1) * res);
-        let mut xs = vec![origin.0, origin.0 + w, origin.0, origin.0 + w];
-        let mut ys = vec![origin.1, origin.1, origin.1 - h, origin.1 - h];
-        ct.transform_coords(&mut xs, &mut ys, &mut []).unwrap();
-
-        [
-            xs.iter().copied().fold(f64::MAX, f64::min),
-            ys.iter().copied().fold(f64::MAX, f64::min),
-            xs.iter().copied().fold(f64::MIN, f64::max),
-            ys.iter().copied().fold(f64::MIN, f64::max),
-        ]
-    }
-
-    /// The corners of a projected rectangle do not bound it: its edges bow
-    /// outwards between them, and at high latitude by kilometres.
-    ///
-    /// Held against the corner hull *plus the margin*, because the corners are
-    /// themselves grid points -- comparing against the bare hull would pass on
-    /// the margin alone, and corner-only sampling would satisfy it.
     #[test]
-    fn the_extent_is_wider_than_its_corners() {
-        // UTM 33N, 400 km wide and 1000 km tall, reaching towards the pole,
-        // where the meridian convergence is sharpest.
-        let (epsg, origin, res, size) = (32633, (300_000.0, 7_800_000.0), 1000.0, (400, 1000));
+    fn sk_measures_at_z18_with_its_box() {
+        let m = measure(&sk_info(), "sk.tif", 8).unwrap();
+        assert_eq!(m.base_level, 18);
 
-        let [_, _, _, n] = bbox_of(&utm_info(epsg, origin, res, size), "synthetic").unwrap();
-        let [_, _, _, hull_n] = corner_hull(epsg, origin, res, size);
-
-        // The northern edge bows ~0.078 deg past its corners, well clear of
-        // the 0.01 deg margin, so this fails if the interior is not sampled.
+        let [w, s, e, n] = m.bbox;
         assert!(
-            n > hull_n + EXTENT_MARGIN_DEG,
-            "north edge {n} is within the margin of the corner hull {hull_n}"
+            (w - 15.46875).abs() < 1e-9 && (e - 23.90625).abs() < 1e-9,
+            "{:?}",
+            m.bbox
         );
+        assert!(s < 47.75 && n > 49.6 && s < n, "{:?}", m.bbox);
     }
 
-    /// Erring wide costs a nodata read; erring narrow loses data. Held against
-    /// the same box derived without the margin, so it fails if the margin
-    /// stops being applied.
+    /// One overview short of z8, and the coarsest level would be read from a
+    /// raster at the wrong resolution, resampled without a word.
     #[test]
-    fn the_extent_is_padded_outwards() {
-        let info = utm_info(32633, (300_000.0, 6_000_000.0), 100.0, (1000, 1000));
-        let [w, s, e, n] = bbox_of(&info, "synthetic").unwrap();
-        let [hw, hs, he, hn] = corner_hull(32633, (300_000.0, 6_000_000.0), 100.0, (1000, 1000));
-
-        // A 100 km square this far from the pole barely bows, so the corner
-        // hull is within a hair of the unpadded sample extent and the margin
-        // is what separates the two.
-        assert!(
-            w < hw && s < hs && e > he && n > hn,
-            "box not padded outwards"
-        );
-        assert!(
-            (hw - w) > EXTENT_MARGIN_DEG / 2.0,
-            "west padding {} is not the margin",
-            hw - w
-        );
+    fn an_overview_chain_short_of_the_coarsest_level_is_refused() {
+        let mut info = sk_info();
+        info["bands"][0]["overviews"].as_array_mut().unwrap().pop();
+        assert!(measure(&info, "sk.tif", 8).is_err());
     }
 
     #[test]
-    fn a_raster_with_no_size_says_so() {
-        let mut info = utm_info(32633, (300_000.0, 6_000_000.0), 100.0, (1000, 1000));
-        info["size"] = serde_json::json!([0, 0]);
+    fn heights_in_other_units_are_refused() {
+        let mut info = sk_info();
+        info["bands"][0]["scale"] = serde_json::json!(0.01);
+        assert!(measure(&info, "sk.tif", 8).is_err());
+    }
 
-        let err = bbox_of(&info, "synthetic").unwrap_err().to_string();
-        assert!(err.contains("no raster size"), "{err}");
+    /// On the z18 grid but one z18 pixel off z8's, so the z8 overview would sit
+    /// across the index's pixels.
+    #[test]
+    fn a_raster_off_the_coarsest_grid_is_refused() {
+        let mut info = sk_info();
+        info["geoTransform"][0] = serde_json::json!(1_721_973.373_208_452 + level_res(18));
+        assert!(measure(&info, "sk.tif", 8).is_err());
     }
 
     #[test]
-    fn footprint_mode_follows_the_file() {
-        assert_eq!(footprint_of("/dtm/pl/poland.vrt"), FootprintMode::Tiles);
-        assert_eq!(footprint_of("/dtm/sk.tif"), FootprintMode::Bbox);
+    fn a_raster_that_does_not_halve_evenly_is_refused() {
+        let mut info = sk_info();
+        info["size"][0] = serde_json::json!(1_572_864u64 - 256);
+        assert!(measure(&info, "sk.tif", 8).is_err());
     }
 }

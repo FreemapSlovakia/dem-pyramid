@@ -1,8 +1,8 @@
 //! Tooling for the Freemap elevation pyramid.
 //!
-//! Orchestration lives in bash calling the GDAL command line tools; this binary
-//! holds the parts that are actual logic -- config validation, drift checking
-//! against the real files, and footprint extraction.
+//! The pyramid indexes the rasters terrain-tiles serves. This binary measures
+//! them, checks the measurement against the real files, plans the index that
+//! `bin/index.sh` writes, and renders from it.
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -12,7 +12,6 @@ mod avif;
 mod check;
 mod config;
 mod credit;
-mod footprints;
 mod gdal_cli;
 mod gradient;
 mod grid;
@@ -33,19 +32,6 @@ struct Cli {
     #[arg(long, global = true)]
     sources: Option<PathBuf>,
 
-    /// Projection of the pyramid grid.
-    #[arg(long, global = true, default_value = "EPSG:3857")]
-    grid_crs: String,
-
-    /// Tile width at the finest level, pixels. 2^15 spans 313 km at z14, so
-    /// the in-file overview chain reaches z8.
-    #[arg(long, global = true, default_value_t = 32768)]
-    tile_px: u32,
-
-    /// COG block size, pixels.
-    #[arg(long, global = true, default_value_t = 512)]
-    block_px: u32,
-
     /// Finest and coarsest pyramid levels.
     #[arg(long, global = true, default_value_t = 14)]
     finest_level: u32,
@@ -65,54 +51,27 @@ struct Cli {
     command: Command,
 }
 
+// Parsed once per process, so the panorama flags' size costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Tabular overview of every source.
     List,
     /// Machine-readable dump with defaults resolved.
     Json,
-    /// Measure every source the elevation list marks for the pyramid, and
-    /// cache what the build needs.
+    /// Measure the raster of every dataset the elevation source list marks
+    /// for the pyramid, and cache what the index and crediting need.
     Refresh {
-        #[arg(long, env = "ELEVATION_SOURCES_DIR", default_value = credit::DEFAULT_DIR)]
-        elevation_sources: PathBuf,
-    },
-    /// Re-measure every source and fail if the cache has fallen behind.
-    Check {
         /// The elevation API's source list: a checkout of
         /// FreemapSlovakia/elevation-sources.
         #[arg(long, env = "ELEVATION_SOURCES_DIR", default_value = credit::DEFAULT_DIR)]
         elevation_sources: PathBuf,
     },
-    /// Build a coverage footprint per source.
-    Footprints {
-        /// Comma-separated source ids; default is all.
-        #[arg(long)]
-        only: Option<String>,
+    /// Re-measure every source and fail if the cache has fallen behind.
+    Check {
+        #[arg(long, env = "ELEVATION_SOURCES_DIR", default_value = credit::DEFAULT_DIR)]
+        elevation_sources: PathBuf,
     },
-    /// Print the tile grid constants.
-    GridInfo,
-    /// Extent and pixel size of one tile.
-    Tile {
-        tx: u32,
-        ty: u32,
-        #[arg(long)]
-        level: Option<u32>,
-    },
-    /// Tiles a source's bbox intersects.
-    Cover {
-        id: String,
-        /// Override the source's own bbox: lon0,lat0,lon1,lat1.
-        ///
-        /// Chiefly for the global fallback, which is better materialised once
-        /// over a generous region than in buffers around each country.
-        #[arg(long)]
-        bbox: Option<String>,
-    },
-    /// Shell-sourceable build variables for one (source, tile).
-    WarpEnv { id: String, tx: u32, ty: u32 },
-    /// Leaf files referenced by a source's VRT, one per line.
-    VrtSources { id: String },
     /// What contributes to one pyramid level, for the index builder.
     IndexPlan { level: u32 },
     /// Serve panoramas over HTTP.
@@ -278,24 +237,10 @@ enum Command {
     },
 }
 
-fn find<'a>(doc: &'a config::Doc, id: &str) -> anyhow::Result<&'a config::Source> {
-    doc.sources
-        .iter()
-        .find(|s| s.id == id)
-        .ok_or_else(|| anyhow::anyhow!("unknown source id: {id}"))
-}
-
-/// Longitude span at which a source stops being regional and starts being the
-/// global fallback.
-const GLOBAL_SPAN_DEG: f64 = 180.0;
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let grid = config::Grid {
-        crs: cli.grid_crs.clone(),
-        tile_px: cli.tile_px,
-        block_px: cli.block_px,
         finest_level: cli.finest_level,
         coarsest_level: cli.coarsest_level,
     };
@@ -317,24 +262,12 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::List => {
-            println!(
-                "{:14} {:>5} {:>6} {:>6} {:>12}  {:5} path",
-                "id", "prio", "res", "finest", "nodata", "fp"
-            );
-            println!("{}", "-".repeat(96));
+            println!("{:14} {:>5} {:>4}  path", "id", "prio", "z");
+            println!("{}", "-".repeat(72));
             for s in &doc.sources {
                 println!(
-                    "{:14} {:>5} {:>6} {:>6} {:>12}  {:5} {}",
-                    s.id,
-                    s.priority,
-                    s.native_res,
-                    s.finest_level,
-                    s.nodata.to_string(),
-                    match s.footprint {
-                        config::FootprintMode::Tiles => "tiles",
-                        config::FootprintMode::Bbox => "bbox",
-                    },
-                    s.path
+                    "{:14} {:>5} {:>4}  {}",
+                    s.id, s.priority, s.base_level, s.path
                 );
             }
         }
@@ -344,25 +277,24 @@ fn main() -> Result<()> {
         }
         Command::Refresh { elevation_sources } => {
             let entries = credit::load_entries(&elevation_sources)?;
-            let (derived, failed) =
-                refresh::derive_all(&entries, doc.grid.coarsest_level, doc.grid.finest_level);
+            let (derived, failed) = refresh::derive_all(&entries, doc.grid.coarsest_level);
 
             config::validate(&derived)?;
             credit::check_attributions(&derived, &entries)?;
 
-            // Written only once every dataset has been read. A cache silently
-            // missing a source that was merely unreadable for a moment builds a
-            // mosaic with a hole in it, and nothing downstream would say so.
-            if failed > 0 {
-                anyhow::bail!("{failed} dataset(s) could not be read");
+            // Written only once every raster has been read. A cache silently
+            // missing a source that was merely unreadable for a moment indexes
+            // a mosaic with a hole in it, and nothing downstream would say so.
+            if !failed.is_empty() {
+                anyhow::bail!("{} raster(s) could not be measured", failed.len());
             }
 
             refresh::write(&cache, &derived)?;
 
             for s in &derived {
                 println!(
-                    "ok   {:14} {:>8.2} m  z{:<3} {:9} {}",
-                    s.id, s.native_res, s.finest_level, s.resampling, s.path
+                    "ok   {:14} z{:<3} {:14} {}",
+                    s.id, s.base_level, s.dir, s.path
                 );
             }
 
@@ -374,83 +306,6 @@ fn main() -> Result<()> {
             );
         }
         Command::Check { elevation_sources } => check::run(&doc, &elevation_sources)?,
-        Command::Footprints { only } => {
-            footprints::run(&doc, &cli.root, only.as_deref())?;
-        }
-        Command::GridInfo => {
-            let g = &doc.grid;
-            println!("crs             {}", g.crs);
-            println!("levels          z{}..z{}", g.coarsest_level, g.finest_level);
-            println!("tile            {} px at z{}", g.tile_px, g.finest_level);
-            println!("block           {} px", g.block_px);
-            println!("tile span       {:.4} m (projected)", grid::tile_span(g));
-            println!("world           {0}x{0} tiles", grid::tiles_across(g));
-            for z in (g.coarsest_level..=g.finest_level).rev() {
-                println!(
-                    "  z{z:<3} {:>6} px/tile  {:>10.4} m projected  {:>8.2} m ground @49N",
-                    grid::tile_px_at(g, z)?,
-                    config::level_res(z),
-                    config::ground_res(z, 49.0)
-                );
-            }
-        }
-        Command::Tile { tx, ty, level } => {
-            let g = &doc.grid;
-            let level = level.unwrap_or(g.finest_level);
-            let [x0, y0, x1, y1] = grid::tile_extent(g, tx, ty);
-            let (lon0, lat0) = grid::merc_to_lonlat(x0, y0);
-            let (lon1, lat1) = grid::merc_to_lonlat(x1, y1);
-            println!("tile     {tx}_{ty} at z{level}");
-            println!("size     {0}x{0} px", grid::tile_px_at(g, level)?);
-            println!("extent   {x0:.4} {y0:.4} {x1:.4} {y1:.4}");
-            println!("lonlat   {lon0:.5} {lat0:.5} {lon1:.5} {lat1:.5}");
-        }
-        Command::Cover { id, bbox } => {
-            let s = find(&doc, &id)?;
-            let area = match bbox {
-                Some(spec) => {
-                    let v: Vec<f64> = spec
-                        .split(',')
-                        .map(|t| t.trim().parse::<f64>())
-                        .collect::<Result<_, _>>()
-                        .context("--bbox wants lon0,lat0,lon1,lat1")?;
-                    anyhow::ensure!(v.len() == 4, "--bbox wants four numbers");
-                    [v[0], v[1], v[2], v[3]]
-                }
-                None => {
-                    // A source spanning the globe is the fallback, and
-                    // materialising it over its own box is 11 000 tiles rather
-                    // than the 675 a region needs. Exit 3 rather than 1, so a
-                    // caller iterating sources can tell "this one wants a
-                    // region" from "this one is broken".
-                    if s.bbox[2] - s.bbox[0] >= GLOBAL_SPAN_DEG {
-                        eprintln!(
-                            "{id} spans the globe; give --bbox a region, as bin/fallback.sh does"
-                        );
-                        std::process::exit(3);
-                    }
-
-                    s.bbox
-                }
-            };
-            let tiles = grid::cover(&doc.grid, area);
-            println!("{} tiles for {id}", tiles.len());
-            for (tx, ty) in tiles {
-                println!("{tx} {ty}");
-            }
-        }
-        Command::WarpEnv { id, tx, ty } => {
-            let s = find(&doc, &id)?;
-            let root = cli.root.to_str().context("non-utf8 root")?;
-            print!("{}", grid::warp_env(&doc.grid, s, tx, ty, root)?);
-        }
-        Command::VrtSources { id } => {
-            let s = find(&doc, &id)?;
-            let vrt = footprints::parse_vrt(&s.path)?;
-            for f in vrt.files {
-                println!("{f}");
-            }
-        }
         Command::Panorama {
             lon,
             lat,
@@ -689,22 +544,18 @@ fn main() -> Result<()> {
             ))?;
         }
         Command::IndexPlan { level } => {
-            let root = cli.root.to_str().context("non-utf8 root")?;
+            // `refresh` checked overviews only down to the coarsest level.
+            anyhow::ensure!(
+                (doc.grid.coarsest_level..=doc.grid.finest_level).contains(&level),
+                "level {level} is outside the pyramid (z{}..z{})",
+                doc.grid.coarsest_level,
+                doc.grid.finest_level
+            );
             println!("RES\t{}", config::level_res(level));
-            println!("PX\t{}", grid::tile_px_at(&doc.grid, level)?);
             for s in &doc.sources {
-                // A source contributes to every level at or coarser than the
-                // one it was materialised at, via its overview chain. Finer
-                // levels are simply absent -- the marcher falls back.
-                if s.finest_level < level {
-                    continue;
+                if let Some(loc) = grid::location(&s.path, s.base_level, level) {
+                    println!("SRC\t{}\t{}\t{loc}", s.id, s.priority);
                 }
-                // -1 means the base image rather than an overview.
-                let ovr = s.finest_level as i64 - level as i64 - 1;
-                println!(
-                    "SRC\t{}\t{}\t{ovr}\t{root}/norm/{}/{}",
-                    s.id, s.priority, s.id, s.finest_level
-                );
             }
         }
     }

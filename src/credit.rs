@@ -6,16 +6,14 @@
 //! ground the render can see and naming every source whose box covers it.
 //!
 //! *Every* box, not the highest priority one, because priority does not decide
-//! alone: tiles are filtered against each source's footprint when the index is
-//! built, and nodata falls through at read time, so ground inside a national
-//! box is routinely served by whatever lies beneath. Naming only the top box
-//! would leave GEDTM30 credited nowhere -- it sits under all of them and
-//! answers most of the area their boxes overstate.
+//! alone: nodata falls through at read time, so ground inside a national box is
+//! routinely served by whatever lies beneath. Naming only the top box would
+//! leave GEDTM30 credited nowhere -- it sits under all of them and answers most
+//! of the area their boxes overstate.
 //!
-//! Sources are compared by their declared lon/lat box, which bounds where one
+//! Sources are compared by their measured lon/lat box, which bounds where one
 //! *could* contribute rather than where it has data, so the answer errs towards
-//! naming a model that contributed nothing. `footprints/` holds the exact
-//! outlines if that ever proves too loose.
+//! naming a model that contributed nothing.
 //!
 //! Each model is reported under its `api_name` carrying its own credit lines,
 //! so a client displays what it is given rather than keeping a copy of the
@@ -27,6 +25,7 @@
 
 use crate::config::{Doc, Source};
 use crate::panorama::destination;
+use crate::refresh::id_of;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -71,14 +70,9 @@ pub const DEFAULT_DIR: &str = "/fm/storage1/backend.freemap.sk-data/elevation-so
 #[derive(Deserialize)]
 struct SourceJson {
     name: String,
-    /// Absent only in a malformed entry; `check` reports it rather than
-    /// refusing to serve over it.
-    #[serde(default)]
-    file: String,
     #[serde(default)]
     attributions: Vec<Attribution>,
-    /// Whether the pyramid builds this dataset. The one thing about a dataset
-    /// that cannot be measured from it.
+    /// Whether the pyramid reads this dataset.
     #[serde(default)]
     pyramid: bool,
 }
@@ -89,12 +83,12 @@ pub struct Entry {
     /// first entry covering a point answers for it, so sorting by this sorts
     /// most authoritative first.
     pub dir: String,
+    /// The directory itself, which links the dataset's rasters.
+    pub path: std::path::PathBuf,
     /// The model this dataset belongs to; several entries share one.
     pub name: String,
-    /// The raster, absolute, as GDAL opens it.
-    pub file: String,
     pub attributions: Vec<Attribution>,
-    /// Whether the pyramid builds this dataset.
+    /// Whether the pyramid reads this dataset.
     pub pyramid: bool,
 }
 
@@ -129,8 +123,8 @@ pub fn load_entries(dir: &Path) -> Result<Vec<Entry>> {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned(),
+            path: subdir.clone(),
             name: parsed.name,
-            file: parsed.file,
             attributions: parsed.attributions,
             pyramid: parsed.pyramid,
         });
@@ -141,18 +135,21 @@ pub fn load_entries(dir: &Path) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
-/// Credit lines by `api_name`, for the datasets the pyramid builds. Several
-/// share a name -- Spain is four, France seven -- so their credits merge under
-/// it, deduped.
+/// Credit lines by `api_name`, for the datasets the pyramid indexes. Several
+/// share a name -- Spain is three, Germany sixteen -- so their credits merge
+/// under it, deduped.
 ///
-/// Only the ones it builds: a dataset the list carries but the pyramid does
+/// Only the ones it indexes: a dataset the list carries but the pyramid does
 /// not would otherwise lend its licence line to every render naming that
-/// model, which is the miscrediting `check_attributions` keys on the file to
-/// avoid.
-pub fn credits_of(entries: &[Entry]) -> Credits {
+/// model, which is the miscrediting `check_attributions` keys on the
+/// dataset to avoid.
+pub fn credits_of(sources: &[Source], entries: &[Entry]) -> Credits {
     let mut credits: Credits = HashMap::new();
 
-    for entry in entries.iter().filter(|e| e.pyramid) {
+    for entry in entries
+        .iter()
+        .filter(|e| e.pyramid && sources.iter().any(|s| s.id == id_of(&e.dir)))
+    {
         let into = credits.entry(entry.name.clone()).or_default();
 
         for attr in &entry.attributions {
@@ -165,24 +162,27 @@ pub fn credits_of(entries: &[Entry]) -> Credits {
     credits
 }
 
-/// Fails unless every source the pyramid serves is named in the elevation
+/// Fails unless every source the pyramid serves is still in the elevation
 /// API's list, under the model it is reported as, with a credit to show.
 ///
-/// Keyed on the file rather than the `api_name`, because a name is a model and
-/// several datasets share one: a new DTM added under a name that is already
-/// credited would otherwise inherit another dataset's licence line and be
-/// served confidently miscredited, which is worse than being uncredited.
+/// Keyed on the dataset rather than the `api_name`, because a name is a
+/// model and several datasets share one: a new DTM added under a name that is
+/// already credited would otherwise inherit another dataset's licence line and
+/// be served confidently miscredited, which is worse than being uncredited.
 pub fn check_attributions(sources: &[Source], entries: &[Entry]) -> Result<()> {
     for source in sources {
-        // `pyramid` too: `credits_of` folds only what the pyramid builds, so a
-        // dataset since unmarked upstream would pass here and then be served
-        // with an empty attribution list.
-        let Some(entry) = entries.iter().find(|e| e.pyramid && e.file == source.path) else {
+        // `pyramid` too: a dataset since unmarked upstream would otherwise go
+        // on being served on the strength of a cache that predates it.
+        // By id rather than directory, so a renumbered dataset is still credited
+        // until `refresh` picks up its new priority.
+        let Some(entry) = entries
+            .iter()
+            .find(|e| e.pyramid && id_of(&e.dir) == source.id)
+        else {
             bail!(
-                "{}: {} is in no source.json the pyramid builds, so nothing \
-                 says how to credit it",
-                source.id,
-                source.path
+                "{}: no longer marked for the pyramid in the elevation source \
+                 list, so nothing says how to credit it",
+                source.id
             );
         };
 
@@ -341,7 +341,7 @@ pub fn sources_seen(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{FootprintMode, Grid, Nodata};
+    use crate::config::Grid;
 
     fn source(id: &str, api_name: &str, priority: i64, bbox: [f64; 4]) -> Source {
         Source {
@@ -350,13 +350,8 @@ mod tests {
             api_name: api_name.into(),
             path: String::new(),
             priority,
-            native_res: 1.0,
+            base_level: 17,
             bbox,
-            nodata: Nodata::Declared("declared".into()),
-            finest_level: 14,
-            resampling: "bilinear".into(),
-            footprint: FootprintMode::Bbox,
-            fill_nodata_md: None,
         }
     }
 
@@ -366,9 +361,6 @@ mod tests {
 
         Doc {
             grid: Grid {
-                crs: "EPSG:3857".into(),
-                tile_px: 512,
-                block_px: 512,
                 finest_level: 14,
                 coarsest_level: 5,
             },
@@ -562,11 +554,11 @@ mod tests {
         assert!(sources_seen(&empty, &credits, 18.0, 48.0, 300_000.0, 0.0, 360.0).is_empty());
     }
 
-    fn entry(dir: &str, name: &str, file: &str, credited: bool) -> Entry {
+    fn entry(dir: &str, name: &str, credited: bool) -> Entry {
         Entry {
             dir: dir.into(),
+            path: dir.into(),
             name: name.into(),
-            file: file.into(),
             pyramid: true,
             attributions: if credited {
                 vec![Attribution {
@@ -585,25 +577,39 @@ mod tests {
         let doc = doc(vec![source("sk", "sk", 230, [16.8, 47.7, 22.6, 49.7])]);
 
         assert!(check_attributions(&doc.sources, &[]).is_err());
-        assert!(check_attributions(&doc.sources, &[entry("010-sk", "sk", "", false)]).is_err());
-        assert!(check_attributions(&doc.sources, &[entry("010-sk", "sk", "", true)]).is_ok());
+        assert!(check_attributions(&doc.sources, &[entry("100-sk", "sk", false)]).is_err());
+        assert!(check_attributions(&doc.sources, &[entry("100-sk", "sk", true)]).is_ok());
+
+        let mut unmarked = entry("100-sk", "sk", true);
+        unmarked.pyramid = false;
+        assert!(check_attributions(&doc.sources, &[unmarked]).is_err());
     }
 
     /// A new dataset under a name that is already credited must not inherit
-    /// the other dataset's licence line. Keyed on the file, so it does not.
+    /// the other dataset's licence line. Keyed on the directory, so it does
+    /// not.
     #[test]
     fn a_dataset_missing_from_the_list_is_refused_even_under_a_credited_name() {
-        let mut de_by = source("de_by", "de", 100, [9.0, 47.0, 14.0, 51.0]);
-        de_by.path = "/dtm/de_by/all.vrt".into();
+        let de_by = source("de_by", "de", 100, [9.0, 47.0, 14.0, 51.0]);
+        let de_nw = source("de_nw", "de", 99, [5.8, 50.3, 9.5, 52.6]);
 
-        let mut de_nw = source("de_nw", "de", 99, [5.8, 50.3, 9.5, 52.6]);
-        de_nw.path = "/dtm/de_nw/all.vrt".into();
-
-        let list = [entry("245-de_by", "de", "/dtm/de_by/all.vrt", true)];
+        let list = [entry("100-de_by", "de", true)];
 
         assert!(check_attributions(&doc(vec![de_by.clone()]).sources, &list).is_ok());
 
         // de_nw is not in the list, though "de" is credited because of de_by.
         assert!(check_attributions(&doc(vec![de_by, de_nw]).sources, &list).is_err());
+    }
+
+    /// The list's other datasets lend nothing to a name the pyramid serves.
+    #[test]
+    fn only_indexed_datasets_are_credited() {
+        let doc = doc(vec![source("es_30", "es", 100, [-8.0, 36.0, -2.0, 44.0])]);
+        let mut canary = entry("360-sonny-es-canary", "es", true);
+        canary.attributions[0].name = "Sonny".into();
+
+        let credits = credits_of(&doc.sources, &[entry("100-es_30", "es", true), canary]);
+
+        assert_eq!(credits["es"].len(), 1);
     }
 }

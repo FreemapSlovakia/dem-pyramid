@@ -957,10 +957,10 @@ fn shade_column(
 
         let first = lo.floor().max(0.0) as usize;
         let last = (hi.ceil() as usize).min(height);
-        for y in first..last {
+        for (y, v) in ink.iter_mut().enumerate().take(last).skip(first) {
             let overlap = hi.min((y + 1) as f64) - lo.max(y as f64);
             if overlap > 0.0 {
-                ink[y] += amount * overlap;
+                *v += amount * overlap;
             }
         }
     }

@@ -332,7 +332,7 @@ pub async fn serve(
 
     credit::check_attributions(&doc.sources, &entries)?;
 
-    let credits = credit::credits_of(&entries);
+    let credits = credit::credits_of(&doc.sources, &entries);
 
     let ctx = Ctx {
         root,
@@ -828,10 +828,10 @@ async fn panorama_route(
     // cancelled too, and once the client has hung up nothing after the await
     // runs, so this is the only place any of it can be observed.
     .inspect(|outcome| {
-        if let Err(e) = outcome {
-            if cancel.is_cancelled() {
-                eprintln!("render abandoned: client hung up ({e})");
-            }
+        if let Err(e) = outcome
+            && cancel.is_cancelled()
+        {
+            eprintln!("render abandoned: client hung up ({e})");
         }
     });
 
