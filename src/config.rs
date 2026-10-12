@@ -33,13 +33,11 @@ pub struct Grid {
 /// One dataset the pyramid reads, as `refresh` measured its raster.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Source {
-    /// The directory without its number, `es_30`, which is also the stem of
-    /// the raster terrain-tiles built for it.
+    /// The directory without its number, dashes as underscores: `es_30`.
     pub id: String,
     /// The directory in the elevation source list, so a complaint about a
     /// value can be traced to something a person can edit.
     pub dir: String,
-    pub api_name: String,
     /// The terrain-tiles raster.
     pub path: String,
     /// The directory's number, negated: higher wins.

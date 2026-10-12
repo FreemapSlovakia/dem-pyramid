@@ -542,32 +542,30 @@ from what you sent — and pinning the number it returns is how several renders
 are made to agree about colour. See [Ground gradient](#ground-gradient).
 
 `sources` names the terrain models behind this view, most authoritative first.
-`source` is the model, in the same vocabulary the elevation API reports a read's
-models in: a country code for a national model, the model's own id otherwise.
-`attributions` is what to display for it — the credit line verbatim as the
-licence asks for it, plus a URL where there is a page to link to. It is a list
-because one model can be several datasets under one name (`be` is Wallonia and
-Flanders). **Credit these rather than the whole catalogue**, and render what you
-are given rather than keeping a copy of the licence text.
+`source` is the dataset, named after its directory in the elevation source list
+without the number and spelled exactly as the directory is: `sk`, `es-29`,
+`de_by`, `gedtm30`. `attributions` is what
+to display for it — the credit line verbatim as the licence asks for it, plus a
+URL where there is a page to link to. It is a list because one dataset can merge
+several surveys, each with its own licence. **Credit these rather than the
+whole catalogue**, and render what you are given rather than keeping a copy of
+the licence text.
 
 They are derived from the *view*, not from the pixels: the mosaic keeps no
 record of where a sample came from, so the sector is swept and every model whose
 box covers a sample is named. Every one, not just the highest priority: nodata
 falls through, so ground inside a national box is routinely served by whatever
 lies beneath it -- GEDTM30 answers much of the area the national boxes
-overstate. Sources are compared by their measured lon/lat box, which bounds where one *could*
-contribute, so the list errs towards naming a model that contributed nothing.
+overstate. Sources are compared by their measured lon/lat box, which bounds
+where one *could* contribute, so the list errs towards naming a model that
+contributed nothing.
 
 The credit lines are not this service's. They are read at startup from the
 elevation API's own source list (`--elevation-sources`, default
-`/fm/storage1/backend.freemap.sk-data/elevation-sources`), whose `source.json`
-`name` is the `api_name` here — one model, one credit, written once, and a
-dataset gained there is credited here without a release. Several datasets share
-a name (Spain is four, France seven) and their credits merge under it. Serving
-refuses to start unless every source it serves is named in that list, under
-the model it is reported as, with a credit. Matched on the file rather than the
-name, so a dataset added under a name that is already credited cannot inherit
-another dataset's licence line.
+`/fm/storage1/backend.freemap.sk-data/elevation-sources`) — one credit per
+dataset, written once, and a dataset gained there is credited here without a
+release. Serving refuses to start unless every source it serves is still in
+that list with a credit.
 
 ### Peaks
 

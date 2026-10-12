@@ -21,12 +21,16 @@ use gdal::spatial_ref::SpatialRef;
 /// terrain-tiles' nodata, which the index's conversion leaves as 0.
 const TERRAIN_NODATA: f64 = -2_147_483_648.0;
 
-/// `010-sk` -> `sk`, `090-es-29` -> `es_29`: the dataset without its
-/// precedence.
+/// `010-sk` -> `sk`, `090-es-29` -> `es-29`: the dataset without its
+/// precedence, which is the name renders credit it under.
+pub(crate) fn model_of(dir: &str) -> &str {
+    dir.split_once('-').map_or(dir, |(_, rest)| rest)
+}
+
+/// `090-es-29` -> `es_29`: the model name spelled the way terrain-tiles names
+/// its rasters.
 pub(crate) fn id_of(dir: &str) -> String {
-    dir.split_once('-')
-        .map_or(dir, |(_, rest)| rest)
-        .replace('-', "_")
+    model_of(dir).replace('-', "_")
 }
 
 /// The two lists are precedence orders written in opposite directions: the
@@ -170,7 +174,6 @@ pub fn derive(entry: &Entry, coarsest: u32) -> Result<Source> {
     Ok(Source {
         id,
         dir: entry.dir.clone(),
-        api_name: entry.name.clone(),
         path,
         priority: priority_of(&entry.dir)?,
         base_level: m.base_level,
@@ -220,6 +223,13 @@ pub fn write(path: &Path, derived: &[Source]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_is_the_directory_without_its_number() {
+        assert_eq!(model_of("090-es-29"), "es-29");
+        assert_eq!(model_of("340-sonny-gb"), "sonny-gb");
+        assert_eq!(model_of("232-be_wal"), "be_wal");
+    }
 
     #[test]
     fn an_id_drops_the_prefix_and_keeps_the_rest() {

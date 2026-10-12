@@ -15,17 +15,16 @@
 //! *could* contribute rather than where it has data, so the answer errs towards
 //! naming a model that contributed nothing.
 //!
-//! Each model is reported under its `api_name` carrying its own credit lines,
-//! so a client displays what it is given rather than keeping a copy of the
-//! licence text that rots.
+//! Each dataset is reported as a model named after its directory without the
+//! number (`es-29`), carrying its own credit lines, so a client displays what
+//! it is given rather than keeping a copy of the licence text that rots.
 //!
 //! The credits are not ours: they are read from the elevation API's own source
-//! tree, whose `name` is the `api_name` here. One model, one credit, written
-//! once -- and a dataset gained there is credited here without a release.
+//! tree -- and a dataset gained there is credited here without a release.
 
 use crate::config::{Doc, Source};
 use crate::panorama::destination;
-use crate::refresh::id_of;
+use crate::refresh::{id_of, model_of};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -58,8 +57,8 @@ pub struct Attribution {
     pub url: Option<String>,
 }
 
-/// Credit lines by `api_name`.
-pub type Credits = HashMap<String, Vec<Attribution>>;
+/// What each source is reported as, by source id.
+pub type Credits = HashMap<String, Seen>;
 
 /// Where the elevation API keeps its source list. Both `serve` and `check`
 /// default to it, so they cannot end up reading different trees.
@@ -69,7 +68,6 @@ pub const DEFAULT_DIR: &str = "/fm/storage1/backend.freemap.sk-data/elevation-so
 /// API's business.
 #[derive(Deserialize)]
 struct SourceJson {
-    name: String,
     #[serde(default)]
     attributions: Vec<Attribution>,
 }
@@ -82,8 +80,6 @@ pub struct Entry {
     pub dir: String,
     /// The directory itself, which links the dataset's rasters.
     pub path: std::path::PathBuf,
-    /// The model this dataset belongs to; several entries share one.
-    pub name: String,
     pub attributions: Vec<Attribution>,
     /// Whether the directory links a `mercator.tif`, which is what puts a
     /// dataset in the pyramid. A dangling link counts, so `refresh` reports it
@@ -123,7 +119,6 @@ pub fn load_entries(dir: &Path) -> Result<Vec<Entry>> {
                 .to_string_lossy()
                 .into_owned(),
             path: subdir.clone(),
-            name: parsed.name,
             attributions: parsed.attributions,
             mercator: subdir.join("mercator.tif").symlink_metadata().is_ok(),
         });
@@ -134,66 +129,57 @@ pub fn load_entries(dir: &Path) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
-/// Credit lines by `api_name`, for the datasets the pyramid indexes. Several
-/// share a name -- Spain is three, Germany sixteen -- so their credits merge
-/// under it, deduped.
-///
-/// Only the ones it indexes: a dataset the list carries but the pyramid does
-/// not would otherwise lend its licence line to every render naming that
-/// model, which is the miscrediting `check_attributions` keys on the
-/// dataset to avoid.
-pub fn credits_of(sources: &[Source], entries: &[Entry]) -> Credits {
-    let mut credits: Credits = HashMap::new();
-
-    for entry in entries
+/// The list's entries for a cached source that still link a `mercator.tif`,
+/// matched by id rather than directory, so a renumbered dataset is still
+/// credited until `refresh` picks up its new priority. More than one is two
+/// directories spelling one id, and neither can be trusted to be the raster
+/// `refresh` measured.
+fn entries_of<'a>(source: &Source, entries: &'a [Entry]) -> Vec<&'a Entry> {
+    entries
         .iter()
-        .filter(|e| e.mercator && sources.iter().any(|s| s.id == id_of(&e.dir)))
-    {
-        let into = credits.entry(entry.name.clone()).or_default();
-
-        for attr in &entry.attributions {
-            if !into.contains(attr) {
-                into.push(attr.clone());
-            }
-        }
-    }
-
-    credits
+        .filter(|e| e.mercator && id_of(&e.dir) == source.id)
+        .collect()
 }
 
-/// Fails unless every source the pyramid serves is still in the elevation
-/// API's list, under the model it is reported as, with a credit to show.
-///
-/// Keyed on the dataset rather than the `api_name`, because a name is a
-/// model and several datasets share one: a new DTM added under a name that is
-/// already credited would otherwise inherit another dataset's licence line and
-/// be served confidently miscredited, which is worse than being uncredited.
+/// What each source is reported as: the name and credit of its entry, both
+/// from the list as it is now.
+pub fn credits_of(sources: &[Source], entries: &[Entry]) -> Credits {
+    sources
+        .iter()
+        .filter_map(|s| match entries_of(s, entries).as_slice() {
+            [e] => Some((
+                s.id.clone(),
+                Seen {
+                    source: model_of(&e.dir).to_owned(),
+                    attributions: e.attributions.clone(),
+                },
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Fails unless every source the pyramid serves is in the elevation API's list
+/// exactly once, with a credit to show.
 pub fn check_attributions(sources: &[Source], entries: &[Entry]) -> Result<()> {
     for source in sources {
-        // `mercator` too: a dataset whose raster was unlinked upstream would
-        // otherwise go on being served on the strength of a cache that
-        // predates it. By id rather than directory, so a renumbered dataset is
-        // still credited until `refresh` picks up its new priority.
-        let Some(entry) = entries
-            .iter()
-            .find(|e| e.mercator && id_of(&e.dir) == source.id)
-        else {
-            bail!(
+        let entry = match entries_of(source, entries).as_slice() {
+            [e] => *e,
+            [] => bail!(
                 "{}: no longer has a mercator.tif in the elevation source list, \
                  so nothing says how to credit it",
                 source.id
-            );
-        };
-
-        if entry.name != source.api_name {
-            bail!(
-                "{}: reported as {} here but named {} in {}",
+            ),
+            many => bail!(
+                "{}: several directories in the elevation source list are this \
+                 dataset: {}",
                 source.id,
-                source.api_name,
-                entry.name,
-                entry.dir
-            );
-        }
+                many.iter()
+                    .map(|e| e.dir.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
 
         if entry.attributions.is_empty() {
             bail!("{}: {} carries no attribution", source.id, entry.dir);
@@ -204,13 +190,12 @@ pub fn check_attributions(sources: &[Source], entries: &[Entry]) -> Result<()> {
 }
 
 /// One model behind a render, as `meta.sources` reports it.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Seen {
-    /// The `api_name`: a country code for a national model, the model's own id
-    /// for one that is not country-scoped.
+    /// The dataset's directory without its number: `sk`, `es-29`.
     pub source: String,
-    /// Plural because a model can be several datasets under one name -- `be` is
-    /// Wallonia and Flanders, each with its own licence.
+    /// Plural because one dataset can merge several surveys, each with its own
+    /// licence.
     pub attributions: Vec<Attribution>,
 }
 
@@ -320,21 +305,18 @@ pub fn sources_seen(
         }
     }
 
-    // By `api_name` rather than by id: several ids can be one model to a reader
-    // -- Spain is four -- and the credit is the same for all of them.
-    let mut seen: Vec<Seen> = Vec::new();
-
-    for (i, source) in doc.sources.iter().enumerate() {
-        if hit[i] && !seen.iter().any(|s| s.source == source.api_name) {
-            seen.push(Seen {
-                source: source.api_name.clone(),
-                // `check_credits` refuses to serve a source with none.
-                attributions: credits.get(&source.api_name).cloned().unwrap_or_default(),
-            });
-        }
-    }
-
-    seen
+    doc.sources
+        .iter()
+        .zip(hit)
+        .filter(|(_, hit)| *hit)
+        .map(|(source, _)| {
+            // `check_attributions` refuses to serve a source without one.
+            credits.get(&source.id).cloned().unwrap_or_else(|| Seen {
+                source: model_of(&source.dir).to_owned(),
+                attributions: Vec::new(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -342,11 +324,10 @@ mod tests {
     use super::*;
     use crate::config::Grid;
 
-    fn source(id: &str, api_name: &str, priority: i64, bbox: [f64; 4]) -> Source {
+    fn source(model: &str, priority: i64, bbox: [f64; 4]) -> Source {
         Source {
-            id: id.into(),
-            dir: format!("100-{id}"),
-            api_name: api_name.into(),
+            id: model.replace('-', "_"),
+            dir: format!("100-{model}"),
             path: String::new(),
             priority,
             base_level: 17,
@@ -377,18 +358,8 @@ mod tests {
     #[test]
     fn a_source_is_credited_through_the_box_above_it() {
         let doc = doc(vec![
-            source(
-                "fr",
-                "fr",
-                175,
-                [-5.539817, 41.269923, 10.708437, 51.094491],
-            ),
-            source(
-                "gedtm30",
-                "gedtm30",
-                0,
-                [-180.00125, -65.00125, 180.00125, 85.00125],
-            ),
+            source("fr", 175, [-5.539817, 41.269923, 10.708437, 51.094491]),
+            source("gedtm30", 0, [-180.00125, -65.00125, 180.00125, 85.00125]),
         ]);
 
         // Deep inside France, so every sample lands in `fr`'s box too.
@@ -397,34 +368,19 @@ mod tests {
         assert_eq!(names(&seen), ["fr", "gedtm30"]);
     }
 
-    /// Most authoritative first, and one entry per model however many datasets
-    /// carry its name.
+    /// Most authoritative first, one entry per dataset, named after its
+    /// directory.
     #[test]
-    fn datasets_sharing_a_name_are_one_credit_in_priority_order() {
+    fn each_dataset_is_its_own_model_in_priority_order() {
         let doc = doc(vec![
-            source(
-                "es_29",
-                "es",
-                190,
-                [-9.380774, 36.058592, -5.458629, 43.863392],
-            ),
-            source(
-                "es_30",
-                "es",
-                189,
-                [-6.926858, 35.180057, 0.24331, 43.736066],
-            ),
-            source(
-                "gedtm30",
-                "gedtm30",
-                0,
-                [-180.00125, -65.00125, 180.00125, 85.00125],
-            ),
+            source("es-29", 190, [-9.380774, 36.058592, -5.458629, 43.863392]),
+            source("es-30", 189, [-6.926858, 35.180057, 0.24331, 43.736066]),
+            source("gedtm30", 0, [-180.00125, -65.00125, 180.00125, 85.00125]),
         ]);
 
         let seen = sources_seen(&doc, &Credits::new(), -6.0, 40.0, 50_000.0, 0.0, 360.0);
 
-        assert_eq!(names(&seen), ["es", "gedtm30"]);
+        assert_eq!(names(&seen), ["es-29", "es-30", "gedtm30"]);
     }
 
     /// The sweep is sized from the smallest box in the catalogue, so a source
@@ -434,13 +390,8 @@ mod tests {
         // 8 km deep, lying between 190 and 198 km due north -- inside the gap
         // a fixed 24-ring sweep of a 300 km range leaves between 187.5 and 200.
         let doc = doc(vec![
-            source("tiny", "tiny", 100, [2.0, 50.7067, 2.15, 50.7786]),
-            source(
-                "gedtm30",
-                "gedtm30",
-                0,
-                [-180.00125, -65.00125, 180.00125, 85.00125],
-            ),
+            source("tiny", 100, [2.0, 50.7067, 2.15, 50.7786]),
+            source("gedtm30", 0, [-180.00125, -65.00125, 180.00125, 85.00125]),
         ]);
 
         let seen = sources_seen(&doc, &Credits::new(), 2.075, 49.0, 300_000.0, 0.0, 360.0);
@@ -453,12 +404,7 @@ mod tests {
     /// wrapped back into range.
     #[test]
     fn a_sweep_across_the_antimeridian_reaches_the_far_side() {
-        let doc = doc(vec![source(
-            "across",
-            "across",
-            100,
-            [-179.5, -1.0, -177.0, 1.0],
-        )]);
+        let doc = doc(vec![source("across", 100, [-179.5, -1.0, -177.0, 1.0])]);
 
         // Due east from just west of the line; 300 km is ~2.7 deg at the
         // equator, so the far samples land beyond +180 before wrapping.
@@ -473,8 +419,8 @@ mod tests {
     #[test]
     fn a_narrow_slice_leaves_out_what_it_cannot_see() {
         let doc = doc(vec![
-            source("north", "north", 100, [-1.0, 50.0, 1.0, 52.0]),
-            source("south", "south", 90, [-1.0, 44.0, 1.0, 46.0]),
+            source("north", 100, [-1.0, 50.0, 1.0, 52.0]),
+            source("south", 90, [-1.0, 44.0, 1.0, 46.0]),
         ]);
         let credits = Credits::new();
 
@@ -514,7 +460,6 @@ mod tests {
 
                 let doc = doc(vec![source(
                     "square",
-                    "square",
                     100,
                     [clon - half_lon, s, clon + half_lon, n],
                 )]);
@@ -532,7 +477,7 @@ mod tests {
     /// the division stay harmless if one ever gets through.
     #[test]
     fn degenerate_sweeps_do_not_panic() {
-        let catalogue = doc(vec![source("sk", "sk", 230, [16.8, 47.7, 22.6, 49.7])]);
+        let catalogue = doc(vec![source("sk", 230, [16.8, 47.7, 22.6, 49.7])]);
         let empty = doc(vec![]);
         let credits = Credits::new();
 
@@ -553,11 +498,10 @@ mod tests {
         assert!(sources_seen(&empty, &credits, 18.0, 48.0, 300_000.0, 0.0, 360.0).is_empty());
     }
 
-    fn entry(dir: &str, name: &str, credited: bool) -> Entry {
+    fn entry(dir: &str, credited: bool) -> Entry {
         Entry {
             dir: dir.into(),
             path: dir.into(),
-            name: name.into(),
             mercator: true,
             attributions: if credited {
                 vec![Attribution {
@@ -573,42 +517,66 @@ mod tests {
     /// A model with nothing to credit it with must not be served.
     #[test]
     fn a_source_with_no_credit_refuses_to_serve() {
-        let doc = doc(vec![source("sk", "sk", 230, [16.8, 47.7, 22.6, 49.7])]);
+        let doc = doc(vec![source("sk", 230, [16.8, 47.7, 22.6, 49.7])]);
 
         assert!(check_attributions(&doc.sources, &[]).is_err());
-        assert!(check_attributions(&doc.sources, &[entry("100-sk", "sk", false)]).is_err());
-        assert!(check_attributions(&doc.sources, &[entry("100-sk", "sk", true)]).is_ok());
+        assert!(check_attributions(&doc.sources, &[entry("100-sk", false)]).is_err());
+        assert!(check_attributions(&doc.sources, &[entry("100-sk", true)]).is_ok());
 
-        let mut unlinked = entry("100-sk", "sk", true);
+        let mut unlinked = entry("100-sk", true);
         unlinked.mercator = false;
         assert!(check_attributions(&doc.sources, &[unlinked]).is_err());
     }
 
-    /// A new dataset under a name that is already credited must not inherit
-    /// the other dataset's licence line. Keyed on the directory, so it does
-    /// not.
+    /// A cached dataset missing from the list is refused, whatever else the
+    /// list credits.
     #[test]
-    fn a_dataset_missing_from_the_list_is_refused_even_under_a_credited_name() {
-        let de_by = source("de_by", "de", 100, [9.0, 47.0, 14.0, 51.0]);
-        let de_nw = source("de_nw", "de", 99, [5.8, 50.3, 9.5, 52.6]);
+    fn a_dataset_missing_from_the_list_is_refused() {
+        let de_by = source("de_by", 100, [9.0, 47.0, 14.0, 51.0]);
+        let de_nw = source("de_nw", 99, [5.8, 50.3, 9.5, 52.6]);
 
-        let list = [entry("100-de_by", "de", true)];
+        let list = [entry("100-de_by", true)];
 
         assert!(check_attributions(&doc(vec![de_by.clone()]).sources, &list).is_ok());
-
-        // de_nw is not in the list, though "de" is credited because of de_by.
         assert!(check_attributions(&doc(vec![de_by, de_nw]).sources, &list).is_err());
     }
 
-    /// The list's other datasets lend nothing to a name the pyramid serves.
+    /// A directory respelt between `-` and `_` upstream is still the same
+    /// source, and is credited from its new entry rather than left with none.
+    #[test]
+    fn a_respelt_directory_keeps_its_credit() {
+        let doc = doc(vec![source("es_29", 190, [-9.4, 36.0, -5.4, 43.9])]);
+        let list = [entry("090-es-29", true)];
+
+        assert!(check_attributions(&doc.sources, &list).is_ok());
+
+        let credits = credits_of(&doc.sources, &list);
+        let seen = sources_seen(&doc, &credits, -7.0, 40.0, 20_000.0, 0.0, 360.0);
+        assert!(!seen[0].attributions.is_empty(), "{seen:?}");
+        // Named as the list spells it now, not as the cache last saw it.
+        assert_eq!(seen[0].source, "es-29");
+    }
+
+    /// Two directories that are one dataset leave nothing to say which raster
+    /// was measured, so serving refuses rather than picking one.
+    #[test]
+    fn a_dataset_in_two_directories_is_refused() {
+        let doc = doc(vec![source("es_29", 190, [-9.4, 36.0, -5.4, 43.9])]);
+        let list = [entry("090-es-29", true), entry("100-es_29", true)];
+
+        assert!(check_attributions(&doc.sources, &list).is_err());
+    }
+
+    /// The list's other datasets lend nothing to a render.
     #[test]
     fn only_indexed_datasets_are_credited() {
-        let doc = doc(vec![source("es_30", "es", 100, [-8.0, 36.0, -2.0, 44.0])]);
-        let mut canary = entry("360-sonny-es-canary", "es", true);
-        canary.attributions[0].name = "Sonny".into();
+        let doc = doc(vec![source("es-30", 100, [-8.0, 36.0, -2.0, 44.0])]);
 
-        let credits = credits_of(&doc.sources, &[entry("100-es_30", "es", true), canary]);
+        let credits = credits_of(
+            &doc.sources,
+            &[entry("100-es-30", true), entry("360-sonny-es-canary", true)],
+        );
 
-        assert_eq!(credits["es"].len(), 1);
+        assert_eq!(credits.keys().collect::<Vec<_>>(), ["es_30"]);
     }
 }

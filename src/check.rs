@@ -25,7 +25,6 @@ fn differences(was: &Source, now: &Source) -> Vec<String> {
     };
 
     note("dir", was.dir.clone(), now.dir.clone());
-    note("api_name", was.api_name.clone(), now.api_name.clone());
     note("path", was.path.clone(), now.path.clone());
     note(
         "priority",
@@ -126,7 +125,6 @@ mod tests {
         Source {
             id: id.into(),
             dir: format!("010-{id}"),
-            api_name: id.into(),
             path: format!("/terrain/{id}.tif"),
             priority: -1,
             base_level: 18,
@@ -157,7 +155,6 @@ mod tests {
 
         for mutate in [
             (|s: &mut Source| s.dir = "020-other".into()) as fn(&mut Source),
-            |s| s.api_name = "other".into(),
             |s| s.path = "/elsewhere/sk.tif".into(),
             |s| s.priority = -2,
             |s| s.base_level = 17,
