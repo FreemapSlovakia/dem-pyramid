@@ -351,6 +351,7 @@ pub async fn serve(
         .route("/viewshed", post(viewshed_route))
         .route("/progress/{token}", axum::routing::get(progress_route))
         .route("/peak/{osm_id}", axum::routing::get(peak_route))
+        .route("/saddle/{osm_id}", axum::routing::get(saddle_route))
         .route("/health", axum::routing::get(|| async { "ok" }))
         .with_state(ctx);
 
@@ -399,6 +400,23 @@ async fn peak_route(
     State(ctx): State<Ctx>,
     axum::extract::Path(osm_id): axum::extract::Path<String>,
 ) -> Response {
+    lookup(&ctx, &osm_id, "peak", peaks::by_osm_id).await
+}
+
+/// One saddle from the peaks file, by its OSM node id.
+async fn saddle_route(
+    State(ctx): State<Ctx>,
+    axum::extract::Path(osm_id): axum::extract::Path<String>,
+) -> Response {
+    lookup(&ctx, &osm_id, "saddle", peaks::saddle_by_osm_id).await
+}
+
+async fn lookup(
+    ctx: &Ctx,
+    osm_id: &str,
+    what: &'static str,
+    read: fn(&std::path::Path, i64) -> Result<Option<serde_json::Value>>,
+) -> Response {
     let Ok(osm_id) = osm_id.parse::<i64>() else {
         return bad("osm_id is not a number");
     };
@@ -411,16 +429,20 @@ async fn peak_route(
     let Ok(_permit) = LOOKUPS.acquire().await else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match tokio::task::spawn_blocking(move || peaks::by_osm_id(&file, osm_id)).await {
+    match tokio::task::spawn_blocking(move || read(&file, osm_id)).await {
         Ok(Ok(Some(f))) => (
             [(header::CONTENT_TYPE, "application/geo+json")],
             f.to_string(),
         )
             .into_response(),
-        Ok(Ok(None)) => (StatusCode::NOT_FOUND, "no such peak").into_response(),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, format!("no such {what}")).into_response(),
         failed => {
-            eprintln!("peak {osm_id}: {failed:?}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "peak lookup failed").into_response()
+            eprintln!("{what} {osm_id}: {failed:?}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{what} lookup failed"),
+            )
+                .into_response()
         }
     }
 }

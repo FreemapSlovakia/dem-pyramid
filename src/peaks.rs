@@ -300,11 +300,24 @@ pub fn load(path: &Path, lon: f64, lat: f64, range: f64) -> Result<Vec<Peak>> {
 /// The peak with this OSM node id, as a GeoJSON feature with every column
 /// the peaks file has, and its route over the key col where it has one.
 pub fn by_osm_id(path: &Path, osm_id: i64) -> Result<Option<serde_json::Value>> {
+    feature(path, "peaks", osm_id)
+}
+
+/// The saddle with this OSM node id, as a GeoJSON feature with every column
+/// the peaks file's `saddles` layer has.
+pub fn saddle_by_osm_id(path: &Path, osm_id: i64) -> Result<Option<serde_json::Value>> {
+    feature(path, "saddles", osm_id)
+}
+
+fn feature(path: &Path, layer_name: &str, osm_id: i64) -> Result<Option<serde_json::Value>> {
     use gdal::vector::{FieldValue, LayerAccess};
     use serde_json::{Map, Value, json};
 
     let ds = gdal::Dataset::open(path).with_context(|| format!("{}", path.display()))?;
-    let mut layer = ds.layer_by_name("peaks")?;
+    // Not every peaks file has saddles.
+    let Ok(mut layer) = ds.layer_by_name(layer_name) else {
+        return Ok(None);
+    };
     layer.set_attribute_filter(&format!("osm_id = {osm_id}"))?;
     let Some(f) = layer.features().next() else {
         return Ok(None);
@@ -326,6 +339,14 @@ pub fn by_osm_id(path: &Path, osm_id: i64) -> Result<Option<serde_json::Value>> 
         let (lon, lat, _) = g.get_point(0);
         json!({"type": "Point", "coordinates": [lon, lat]})
     });
+    // Routes are a peak's; a node can be a peak and a saddle both.
+    if layer_name != "peaks" {
+        return Ok(Some(json!({
+            "type": "Feature",
+            "geometry": geometry,
+            "properties": properties,
+        })));
+    }
     // Not every peaks file has routes.
     let route = ds.layer_by_name("routes").ok().and_then(|mut routes| {
         routes

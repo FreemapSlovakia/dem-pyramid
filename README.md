@@ -72,7 +72,7 @@ when the index lags the source list.
 | find out whether anything is wrong | `./target/release/dem-tool check` |
 | index what the source list holds now | `bin/run.sh index bash bin/index.sh` |
 | fetch the current OSM peaks into `peaks-osm.gpkg` | `bin/run.sh peaks bash bin/peaks.sh` |
-| measure their prominence into `peaks.gpkg` | `./target/release/dem-tool prominence --input $DEM_ROOT/peaks-osm.gpkg --output $DEM_ROOT/peaks.gpkg` |
+| measure their prominence, and the saddles, into `peaks.gpkg` | `./target/release/dem-tool prominence --input $DEM_ROOT/peaks-osm.gpkg --output $DEM_ROOT/peaks.gpkg` |
 
 `index.sh` takes levels to narrow it. Each level is written to a temporary file and moved into place,
 so killing it leaves the previous index; a full run takes minutes.

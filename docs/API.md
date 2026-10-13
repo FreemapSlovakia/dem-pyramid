@@ -1254,7 +1254,7 @@ national data, else the OSM node. Fields as for a panorama's
 | `osm_lon`, `osm_lat` | the OSM node's position |
 | `col_ele`, `col_lon`, `col_lat` | the key col: its height and the centre of the cell it was found on, `prom_res_m` across. Null without a prominence, and for an island, whose col is the sea |
 | `ele_source`, `prominence_sources`, `isolation_sources` | the datasets each value was computed from, comma-separated; see [Prominence](#prominence) |
-| `col_osm_id`, `col_name` | the OSM `natural=saddle` or `mountain_pass=yes` node nearest the key col, within 200 m or twice `prom_res_m`, whichever is more. Null where none is |
+| `col_osm_id`, `col_name` | the OSM `natural=saddle` or `mountain_pass=yes` node nearest the key col, within 200 m or twice `prom_res_m`, whichever is more — by where the DTM puts the saddle (see [`GET /saddle`](#get-saddleosm_id)). Null where none is |
 
 `route` — beside the feature's properties, `null` where there is no
 prominence — is the way from the summit over the key col to the first ground
@@ -1265,6 +1265,47 @@ crosses the Moravian Gate to the Alps.
 
 `404` for an id the peaks file does not hold, or when the service runs without
 one; `400` for an id that is not a number.
+
+## `GET /saddle/{osm_id}`
+
+One OSM saddle — a `natural=saddle` or `mountain_pass=yes` node — moved onto
+the saddle point the DTM shows near it, as a GeoJSON feature.
+
+```json
+{
+  "type": "Feature",
+  "geometry": { "type": "Point", "coordinates": [20.089668, 49.176133] },
+  "properties": {
+    "osm_id": 11453832095, "name": "sedlo Váha", "ele_osm": "2337",
+    "ele": 2336.4, "depth_m": 66.1, "res_m": 6.0, "saddle": "found",
+    "dist_m": 19.4, "osm_lon": 20.0898676, "osm_lat": 49.1760172,
+    "ele_source": "sk",
+    "key_col_of_osm_id": 1862536196, "key_col_of_name": "Rysy"
+  }
+}
+```
+
+A saddle is where two higher areas join as the level drops. Within 150 m of
+the node on national data, 300 m where only GEDTM30 covers it, every such
+point is a candidate, and its **depth** is how far it lies below the lower of
+the two areas it joins. The node's saddle is the nearest candidate at least
+2 m deep — on a ridge of notches the deepest within reach is often a
+neighbour's — and is then found again on the full-resolution raster around
+it.
+
+| field | meaning |
+|---|---|
+| `ele` | the saddle point's elevation on the full-resolution raster |
+| `depth_m` | metres below the lower of the two areas it joins, within the search: where the ground rises on past it, the real depth is more |
+| `res_m` | ground size of the cells it was found on |
+| `saddle` | `found`; `weak`, under 2 m deep; `edge`, no saddle within the search, or one on its rim — the node is on a slope; `shared`, a nearer node owns the same saddle point; `none`, no data |
+| `dist_m` | metres from the OSM node to the saddle point |
+| `osm_lon`, `osm_lat` | the OSM node's position; `lon`/`lat` are the saddle point's where a `found` saddle is on national data, else the node's |
+| `ele_source` | the dataset `ele` was read from |
+| `key_col_of_osm_id`, `key_col_of_name` | the most prominent peak whose key col this saddle is — the peak's `col_osm_id` names it back |
+
+`404` for an id the peaks file does not hold, `400` for one that is not a
+number.
 
 ## `GET /progress/{token}` — live progress
 

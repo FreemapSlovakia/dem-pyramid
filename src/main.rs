@@ -24,6 +24,7 @@ mod progress;
 mod prominence;
 mod queue;
 mod rank;
+mod saddles;
 mod server;
 mod viewshed;
 

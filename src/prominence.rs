@@ -20,6 +20,7 @@ use crate::config::{Doc, Source, ground_res, level_res};
 use crate::credit::{Credits, holds};
 use crate::grid::lonlat_to_merc;
 use crate::panorama::{Pyramid, great_circle};
+use crate::saddles;
 
 /// Levels a flood moves through, and the cells it may visit on each before
 /// moving on; then the pyramid's coarsest level, where it may visit up to
@@ -39,7 +40,7 @@ const SNAP_COARSE_M: f64 = 250.0;
 
 /// The finest level GEDTM30 alone reaches; a summit found no finer than this
 /// has no national data under it.
-const GEDTM30_LEVEL: u32 = 13;
+pub(crate) const GEDTM30_LEVEL: u32 = 13;
 
 /// What a cell of one level holds.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -58,10 +59,10 @@ pub trait Cells {
     fn cell(&mut self, x: i64, y: i64) -> Cell;
 }
 
-struct Level<'a> {
-    pyr: &'a mut Pyramid,
-    z: u32,
-    coarsest: u32,
+pub(crate) struct Level<'a> {
+    pub pyr: &'a mut Pyramid,
+    pub z: u32,
+    pub coarsest: u32,
 }
 
 impl Cells for Level<'_> {
@@ -124,7 +125,7 @@ pub enum Flood {
     Edge,
 }
 
-const STEPS: [(i64, i64); 8] = [
+pub(crate) const STEPS: [(i64, i64); 8] = [
     (-1, -1),
     (0, -1),
     (1, -1),
@@ -321,7 +322,7 @@ const MIN_PROMINENCE: f64 = 5.0;
 
 /// What the DTM shows at a node.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Quality {
+pub(crate) enum Quality {
     /// A summit near the node, standing out on its own.
     Found,
     /// A top near the node, rising less than `MIN_PROMINENCE` from its
@@ -337,7 +338,7 @@ enum Quality {
 }
 
 impl Quality {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::Found => "found",
             Self::Weak => "weak",
@@ -623,16 +624,41 @@ fn disc((x, y): (f64, f64), radius: f64) -> Pixels {
     out
 }
 
-/// The summit's elevation and Web Mercator position, and the source it was
-/// read from: the highest valid pixel within `radius` Web Mercator metres of
-/// (`x`, `y`) on the highest priority raster with data there, the one the
-/// mosaic takes the summit from.
+/// Full-resolution heights around a point, as read from one raster.
+pub(crate) struct Window {
+    /// Metres, NaN where the raster has no data; row by row.
+    pub h: Vec<f64>,
+    pub w: usize,
+    /// Web Mercator centre of the first pixel, and the step to the next.
+    x0: f64,
+    y0: f64,
+    dx: f64,
+    dy: f64,
+    /// Index into `Datasets` of the raster read.
+    pub source: usize,
+}
+
+impl Window {
+    #[allow(clippy::cast_precision_loss)]
+    pub fn centre(&self, i: usize) -> (f64, f64) {
+        (
+            self.x0 + (i % self.w) as f64 * self.dx,
+            self.y0 + (i / self.w) as f64 * self.dy,
+        )
+    }
+}
+
+/// The pixels within `radius` Web Mercator metres of (`x`, `y`) on the
+/// highest priority raster with data there -- the one the mosaic takes the
+/// point from.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-fn summit_ele(datasets: &Datasets, x: f64, y: f64, radius: f64) -> Option<(f64, f64, f64, usize)> {
+pub(crate) fn full_window(datasets: &Datasets, x: f64, y: f64, radius: f64) -> Option<Window> {
+    // A point placed on coarse cells would otherwise read millions of pixels.
+    let radius = radius.min(60.0);
     let lonlat = crate::grid::merc_to_lonlat(x, y);
     for (si, s) in datasets.sources.iter().enumerate() {
         if !holds(s, lonlat, (x, y)) {
@@ -666,25 +692,46 @@ fn summit_ele(datasets: &Datasets, x: f64, y: f64, radius: f64) -> Option<(f64, 
             continue;
         };
         // terrain-tiles' nodata, and its 2 mm steps.
-        let w = c1 - c0;
-        if let Some((i, top)) = buf
+        let h: Vec<f64> = buf
             .data()
             .iter()
-            .copied()
-            .enumerate()
-            .filter(|&(_, v)| v != i32::MIN)
-            .max_by_key(|&(_, v)| v)
-        {
-            let (px, py) = ((c0 + i % w) as f64 + 0.5, (r0 + i / w) as f64 + 0.5);
-            return Some((
-                f64::from(top) * 0.002,
-                gt[0] + px * gt[1],
-                gt[3] + py * gt[5],
-                si,
-            ));
+            .map(|&v| {
+                if v == i32::MIN {
+                    f64::NAN
+                } else {
+                    f64::from(v) * 0.002
+                }
+            })
+            .collect();
+        if h.iter().all(|v| v.is_nan()) {
+            continue;
         }
+        return Some(Window {
+            h,
+            w: c1 - c0,
+            x0: gt[0] + (c0 as f64 + 0.5) * gt[1],
+            y0: gt[3] + (r0 as f64 + 0.5) * gt[5],
+            dx: gt[1],
+            dy: gt[5],
+            source: si,
+        });
     }
     None
+}
+
+/// The summit's elevation and Web Mercator position, and the source it was
+/// read from: the highest pixel within `radius` of (`x`, `y`).
+fn summit_ele(datasets: &Datasets, x: f64, y: f64, radius: f64) -> Option<(f64, f64, f64, usize)> {
+    let win = full_window(datasets, x, y, radius)?;
+    let (i, top) = win
+        .h
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, v)| !v.is_nan())
+        .max_by(|a, b| a.1.total_cmp(&b.1))?;
+    let (px, py) = win.centre(i);
+    Some((top, px, py, win.source))
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -828,29 +875,21 @@ fn measure(pyr: &mut Pyramid, ds: &Datasets, n: &Node, finest: u32, coarsest: u3
     }
 }
 
-/// An OSM saddle or mountain pass node.
-struct Saddle {
-    osm_id: i64,
-    name: Option<String>,
-    lon: f64,
-    lat: f64,
-}
-
 /// How far from a col an OSM saddle may lie and still be taken for it, at
 /// least: the col is a cell's centre, the saddle a hand-placed node.
 const SADDLE_M: f64 = 200.0;
 
-/// The nearest saddle within reach of each col.
+/// The nearest saddle within reach of each col, by where the DTM puts it.
 #[allow(clippy::cast_possible_truncation)]
-fn match_saddles(measured: &mut [Measured], saddles: &[Saddle]) {
+fn match_saddles(measured: &mut [Measured], at: &[(f64, f64)]) {
     const BUCKET: f64 = 2_000.0;
     let bucket = |lon: f64, lat: f64| {
         let (x, y) = lonlat_to_merc(lon, lat);
         ((x / BUCKET).floor() as i64, (y / BUCKET).floor() as i64)
     };
     let mut by_bucket: FxHashMap<(i64, i64), Vec<usize>> = FxHashMap::default();
-    for (i, s) in saddles.iter().enumerate() {
-        by_bucket.entry(bucket(s.lon, s.lat)).or_default().push(i);
+    for (i, &(lon, lat)) in at.iter().enumerate() {
+        by_bucket.entry(bucket(lon, lat)).or_default().push(i);
     }
     for m in measured.iter_mut() {
         let (Some((_, lon, lat)), Some(res)) = (m.col, m.prom_res_m) else {
@@ -864,40 +903,11 @@ fn match_saddles(measured: &mut [Measured], saddles: &[Saddle]) {
             .flat_map(|dy| (-span..=span).map(move |dx| (bx + dx, by + dy)))
             .filter_map(|b| by_bucket.get(&b))
             .flatten()
-            .map(|&i| (i, great_circle(lon, lat, saddles[i].lon, saddles[i].lat)))
+            .map(|&i| (i, great_circle(lon, lat, at[i].0, at[i].1)))
             .filter(|&(_, d)| d <= reach)
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(i, _)| i);
     }
-}
-
-/// The saddles in the input's `saddles` layer, if it has one.
-fn read_saddles(path: &Path) -> Result<Vec<Saddle>> {
-    let ds = Dataset::open(path).with_context(|| format!("{}", path.display()))?;
-    let Ok(mut layer) = ds.layer_by_name("saddles") else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::new();
-    for f in layer.features() {
-        let (Some(g), Ok(Some(osm_id))) = (
-            f.geometry(),
-            f.field_index("osm_id")
-                .and_then(|i| f.field_as_integer64(i)),
-        ) else {
-            continue;
-        };
-        let (lon, lat, _) = g.get_point(0);
-        out.push(Saddle {
-            osm_id,
-            name: f
-                .field_index("name")
-                .ok()
-                .and_then(|i| f.field_as_string(i).ok().flatten()),
-            lon,
-            lat,
-        });
-    }
-    Ok(out)
 }
 
 /// A key col: its height, the level it was found on and its lon/lat -- none
@@ -1067,7 +1077,8 @@ fn write(
     path: &Path,
     ds_names: &Datasets,
     nodes: &[Node],
-    saddles: &[Saddle],
+    saddles: &[saddles::Saddle],
+    saddle_measured: &[saddles::Measured],
     measured: &[Measured],
 ) -> Result<()> {
     let tmp = path.with_extension("tmp.gpkg");
@@ -1164,6 +1175,81 @@ fn write(
             f.create(&layer)?;
         }
 
+        // Each OSM saddle, moved onto the DTM's saddle point, and the most
+        // prominent peak whose key col it is.
+        let mut col_of: Vec<Option<usize>> = vec![None; saddles.len()];
+        for (i, m) in measured.iter().enumerate() {
+            if let Some(si) = m.saddle {
+                let p = |j: usize| measured[j].prominence.unwrap_or(f64::MAX);
+                if col_of[si].is_none_or(|j| p(i) > p(j)) {
+                    col_of[si] = Some(i);
+                }
+            }
+        }
+        let layer = txn.create_layer(LayerOptions {
+            name: "saddles",
+            srs: Some(&srs),
+            ty: gdal::vector::OGRwkbGeometryType::wkbPoint,
+            options: None,
+        })?;
+        for (name, ty) in [
+            ("osm_id", OGRFieldType::OFTInteger64),
+            ("name", OGRFieldType::OFTString),
+            ("ele_osm", OGRFieldType::OFTString),
+            ("ele", OGRFieldType::OFTReal),
+            ("depth_m", OGRFieldType::OFTReal),
+            ("res_m", OGRFieldType::OFTReal),
+            ("saddle", OGRFieldType::OFTString),
+            ("dist_m", OGRFieldType::OFTReal),
+            ("osm_lon", OGRFieldType::OFTReal),
+            ("osm_lat", OGRFieldType::OFTReal),
+            ("ele_source", OGRFieldType::OFTString),
+            ("key_col_of_osm_id", OGRFieldType::OFTInteger64),
+            ("key_col_of_name", OGRFieldType::OFTString),
+        ] {
+            FieldDefn::new(name, ty)?.add_to_layer(&layer)?;
+        }
+        for ((s, m), of) in saddles.iter().zip(saddle_measured).zip(&col_of) {
+            let mut f = Feature::new(layer.defn())?;
+            f.set_field_integer64(0, s.osm_id)?;
+            for (i, v) in [(1, &s.name), (2, &s.ele_osm)] {
+                if let Some(v) = v {
+                    f.set_field_string(i, v)?;
+                }
+            }
+            for (i, v) in [
+                (3, m.ele.map(tenth)),
+                (4, m.depth_m.map(tenth)),
+                (5, m.res_m),
+                (7, m.dist_m.map(tenth)),
+            ] {
+                if let Some(v) = v {
+                    f.set_field_double(i, v)?;
+                }
+            }
+            f.set_field_string(6, m.quality.name())?;
+            f.set_field_double(8, s.lon)?;
+            f.set_field_double(9, s.lat)?;
+            if let Some(names) = m.ele_source.and_then(|e| ds_names.names(&[e])) {
+                f.set_field_string(10, &names)?;
+            }
+            if let Some(&j) = of.as_ref() {
+                f.set_field_integer64(11, nodes[j].osm_id)?;
+                if let Some(name) = &nodes[j].name {
+                    f.set_field_string(12, name)?;
+                }
+            }
+            // Moved only onto national data, as summits are.
+            let (lon, lat) = match (m.quality, m.pos, m.z) {
+                (Quality::Found, Some(p), Some(z)) if z > GEDTM30_LEVEL => p,
+                _ => (s.lon, s.lat),
+            };
+            let mut g = Geometry::empty(gdal::vector::OGRwkbGeometryType::wkbPoint)?;
+            g.add_point_2d((lon, lat));
+            f.set_geometry(g)?;
+            f.create(&layer)?;
+        }
+
         // Each prominence's route, from the summit over the key col to
         // higher ground.
         let routes = txn.create_layer(LayerOptions {
@@ -1188,10 +1274,11 @@ fn write(
         }
         txn.commit()?;
     }
-    // For `GET /peak/{osm_id}`.
+    // For `GET /peak/{osm_id}` and `GET /saddle/{osm_id}`.
     for sql in [
         "CREATE UNIQUE INDEX peaks_osm_id ON peaks(osm_id)",
         "CREATE UNIQUE INDEX routes_osm_id ON routes(osm_id)",
+        "CREATE UNIQUE INDEX saddles_osm_id ON saddles(osm_id)",
     ] {
         ds.execute_sql(sql, None, gdal::vector::sql::Dialect::DEFAULT)?;
     }
@@ -1281,10 +1368,78 @@ pub fn run(
         }
     }
 
-    let saddles = read_saddles(input)?;
-    match_saddles(&mut measured, &saddles);
+    let mut saddles: Vec<saddles::Saddle> = saddles::read(input)?
+        .into_iter()
+        .filter(|p| {
+            bbox.is_none_or(|[w, s, e, n]| p.lon >= w && p.lon <= e && p.lat >= s && p.lat <= n)
+        })
+        .collect();
+    saddles.sort_by_key(|p| {
+        let (x, y) = lonlat_to_merc(p.lon, p.lat);
+        ((y / 20_000.0) as i64, (x / 20_000.0) as i64)
+    });
+    let mut saddle_measured: Vec<saddles::Measured> = saddles
+        .par_chunks(64)
+        .map_init(
+            || Pyramid::open(root, doc),
+            |pyr, chunk| -> Result<Vec<saddles::Measured>> {
+                let pyr = pyr.as_mut().map_err(|e| anyhow::anyhow!("{e:#}"))?;
+                Ok(chunk
+                    .iter()
+                    .map(|s| saddles::measure(pyr, &datasets, s, finest, coarsest))
+                    .collect())
+            },
+        )
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    // As for summits: of the nodes on one saddle point, the nearest keeps it.
+    let mut nearest: HashMap<(u64, u64), (usize, f64)> = HashMap::new();
+    for (i, m) in saddle_measured.iter().enumerate() {
+        if let (Some(s), Some(d)) = (m.pos.map(|(a, b)| (a.to_bits(), b.to_bits())), m.dist_m) {
+            let e = nearest.entry(s).or_insert((i, d));
+            if d < e.1 {
+                *e = (i, d);
+            }
+        }
+    }
+    for (i, m) in saddle_measured.iter_mut().enumerate() {
+        if m.pos
+            .is_some_and(|(a, b)| nearest[&(a.to_bits(), b.to_bits())].0 != i)
+        {
+            *m = saddles::Measured::only(Quality::Shared);
+        }
+    }
+    let at: Vec<(f64, f64)> = saddles
+        .iter()
+        .zip(&saddle_measured)
+        .map(|(s, m)| match m.quality {
+            Quality::Found | Quality::Weak => m.pos.unwrap_or((s.lon, s.lat)),
+            _ => (s.lon, s.lat),
+        })
+        .collect();
+    match_saddles(&mut measured, &at);
 
-    write(output, &datasets, &nodes, &saddles, &measured)?;
+    write(
+        output,
+        &datasets,
+        &nodes,
+        &saddles,
+        &saddle_measured,
+        &measured,
+    )?;
+
+    let saddle_count = |q: Quality| saddle_measured.iter().filter(|m| m.quality == q).count();
+    println!(
+        "{} saddles: {} found, {} weak, {} on a slope, {} sharing a saddle point, {} without data",
+        saddles.len(),
+        saddle_count(Quality::Found),
+        saddle_count(Quality::Weak),
+        saddle_count(Quality::Edge),
+        saddle_count(Quality::Shared),
+        saddle_count(Quality::None),
+    );
 
     let count = |q: Quality| measured.iter().filter(|m| m.quality == q).count();
     println!(
