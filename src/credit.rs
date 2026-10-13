@@ -194,7 +194,7 @@ pub struct Seen {
 
 /// Whether a source has data at a point, given in lon/lat and projected:
 /// inside its box, and where coverage is attached, on a cell that holds data.
-fn holds(source: &Source, (lon, lat): (f64, f64), (x, y): (f64, f64)) -> bool {
+pub(crate) fn holds(source: &Source, (lon, lat): (f64, f64), (x, y): (f64, f64)) -> bool {
     let [w, s, e, n] = source.bbox;
 
     lon >= w

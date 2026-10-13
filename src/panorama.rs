@@ -468,6 +468,46 @@ impl Pyramid {
         self.levels.iter().map(|l| l.reads).sum()
     }
 
+    fn level(&self, z: u32) -> Option<usize> {
+        self.levels.iter().position(|l| l.z == z)
+    }
+
+    /// Height of cell (`px`, `py`) at level `z`, or `None` for nodata, off
+    /// the level, or a level the pyramid lacks.
+    pub(crate) fn cell(&mut self, z: u32, px: i64, py: i64) -> Option<f64> {
+        let i = self.level(z)?;
+        let (px, py) = (usize::try_from(px).ok()?, usize::try_from(py).ok()?);
+        self.levels[i].value_at(px, py)
+    }
+
+    /// Whether cell (`px`, `py`) lies within level `z`'s raster.
+    pub(crate) fn contains(&self, z: u32, px: i64, py: i64) -> bool {
+        self.level(z).is_some_and(|i| {
+            let l = &self.levels[i];
+            usize::try_from(px).is_ok_and(|x| x < l.w) && usize::try_from(py).is_ok_and(|y| y < l.h)
+        })
+    }
+
+    /// The cell at level `z` holding a Web Mercator point.
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn cell_of(&self, z: u32, x: f64, y: f64) -> Option<(i64, i64)> {
+        let l = &self.levels[self.level(z)?];
+        Some((
+            ((x - l.gt[0]) / l.gt[1]).floor() as i64,
+            ((y - l.gt[3]) / l.gt[5]).floor() as i64,
+        ))
+    }
+
+    /// The Web Mercator centre of cell (`px`, `py`) at level `z`.
+    #[allow(clippy::cast_precision_loss)]
+    pub(crate) fn cell_centre(&self, z: u32, px: i64, py: i64) -> Option<(f64, f64)> {
+        let l = &self.levels[self.level(z)?];
+        Some((
+            l.gt[0] + (px as f64 + 0.5) * l.gt[1],
+            l.gt[3] + (py as f64 + 0.5) * l.gt[5],
+        ))
+    }
+
     /// Finest available elevation at a point, for the eye position.
     pub(crate) fn sample_finest(&mut self, x: f64, y: f64) -> Option<f64> {
         let top = self.levels.last().map(|l| l.z)?;
@@ -1387,9 +1427,10 @@ pub fn render(
             // of thousands of scattered peaks each pull their own z14 block,
             // where coarse levels cover enough ground to share them.
             let z = level_for(pk.distance, p.lat, coarsest, finest);
-            pk.ele = pyr.sample(z, mx, my);
+            pk.sampled = pyr.sample(z, mx, my);
+            pk.ele = pk.summit_ele.or(pk.sampled);
 
-            let h = pk.ele.unwrap_or(f64::NEG_INFINITY);
+            let h = pk.sampled.unwrap_or(f64::NEG_INFINITY);
             let drop = curvature_drop(pk.distance);
             pk.altitude = ((h - eye - drop) / pk.distance).atan().to_degrees();
 
@@ -1407,7 +1448,8 @@ pub fn render(
             // guarantees pk.x < out_w.
             let sub = (off / az_step).floor();
             let sub_cols = (out_w * ssx as usize) as f64;
-            pk.column = (sub >= 0.0 && sub < sub_cols && pk.ele.is_some()).then_some(sub as usize);
+            pk.column =
+                (sub >= 0.0 && sub < sub_cols && pk.sampled.is_some()).then_some(sub as usize);
         }
         eye
     };
@@ -1741,7 +1783,7 @@ pub fn render(
     // this one.
     peaks.par_iter_mut().try_for_each(|pk| -> Result<()> {
         cancel.check()?;
-        pk.dominance = match (pk.column, pk.ele) {
+        pk.dominance = match (pk.column, pk.sampled) {
             (Some(column), Some(ele)) if pk.visible => {
                 // Both the column and the window are on the profile's grid, so
                 // the sweep covers the same bearings and the same span of

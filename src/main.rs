@@ -21,6 +21,7 @@ mod measure;
 mod panorama;
 mod peaks;
 mod progress;
+mod prominence;
 mod queue;
 mod rank;
 mod server;
@@ -71,6 +72,22 @@ enum Command {
     /// Measure the source list's rasters and print every level's index rows,
     /// for `bin/index.sh`.
     IndexPlan {
+        #[arg(long, env = "ELEVATION_SOURCES_DIR", default_value = credit::DEFAULT_DIR)]
+        elevation_sources: PathBuf,
+    },
+    /// Measure the topographic prominence of OSM peaks on the pyramid, and
+    /// write them as `serve` reads peaks.
+    Prominence {
+        /// The OSM peaks, as `bin/peaks.sh` fetches them.
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        /// Only peaks inside lon0,lat0,lon1,lat1.
+        #[arg(long)]
+        bbox: Option<String>,
+        /// The elevation API's source tree, which names the datasets each
+        /// value was computed from.
         #[arg(long, env = "ELEVATION_SOURCES_DIR", default_value = credit::DEFAULT_DIR)]
         elevation_sources: PathBuf,
     },
@@ -502,6 +519,37 @@ fn main() -> Result<()> {
                 peaks_file,
                 &listen,
             ))?;
+        }
+        Command::Prominence {
+            input,
+            output,
+            bbox,
+            elevation_sources,
+        } => {
+            let bbox = match bbox {
+                Some(spec) => {
+                    let v: Vec<f64> = spec
+                        .split(',')
+                        .map(|t| t.trim().parse::<f64>())
+                        .collect::<Result<_, _>>()
+                        .context("--bbox wants lon0,lat0,lon1,lat1")?;
+                    anyhow::ensure!(
+                        v.len() == 4
+                            && v.iter().all(|x| x.is_finite())
+                            && v[0] < v[2]
+                            && v[1] < v[3],
+                        "--bbox wants lon0,lat0,lon1,lat1, west and south first"
+                    );
+                    Some([v[0], v[1], v[2], v[3]])
+                }
+                None => None,
+            };
+            let mut doc = index(grid)?;
+            // To tell where each dataset has data.
+            coverage::attach(&mut doc);
+            let entries = credit::load_entries(&elevation_sources)?;
+            let credits = credit::credits_of(&doc.sources, &entries);
+            prominence::run(&cli.root, &doc, &credits, &input, &output, bbox)?;
         }
         Command::IndexPlan { elevation_sources } => {
             let entries = credit::load_entries(&elevation_sources)?;

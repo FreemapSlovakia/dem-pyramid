@@ -350,6 +350,7 @@ pub async fn serve(
         .route("/panorama", post(panorama_route))
         .route("/viewshed", post(viewshed_route))
         .route("/progress/{token}", axum::routing::get(progress_route))
+        .route("/peak/{osm_id}", axum::routing::get(peak_route))
         .route("/health", axum::routing::get(|| async { "ok" }))
         .with_state(ctx);
 
@@ -390,6 +391,37 @@ fn content_type(filename: &str) -> &'static str {
         Some("png") => "image/png",
         Some("gz") => "application/gzip",
         _ => "application/octet-stream",
+    }
+}
+
+/// One peak from the peaks file, by its OSM node id.
+async fn peak_route(
+    State(ctx): State<Ctx>,
+    axum::extract::Path(osm_id): axum::extract::Path<String>,
+) -> Response {
+    let Ok(osm_id) = osm_id.parse::<i64>() else {
+        return bad("osm_id is not a number");
+    };
+    let Some(file) = ctx.peaks_file.clone() else {
+        return (StatusCode::NOT_FOUND, "no peaks file").into_response();
+    };
+    // A lookup is a millisecond's read; this only keeps a burst from taking
+    // every blocking thread.
+    static LOOKUPS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+    let Ok(_permit) = LOOKUPS.acquire().await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match tokio::task::spawn_blocking(move || peaks::by_osm_id(&file, osm_id)).await {
+        Ok(Ok(Some(f))) => (
+            [(header::CONTENT_TYPE, "application/geo+json")],
+            f.to_string(),
+        )
+            .into_response(),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, "no such peak").into_response(),
+        failed => {
+            eprintln!("peak {osm_id}: {failed:?}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "peak lookup failed").into_response()
+        }
     }
 }
 

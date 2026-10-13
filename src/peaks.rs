@@ -127,9 +127,19 @@ pub struct Peak {
     #[serde(serialize_with = "round::d6")]
     pub lat: f64,
 
-    /// Elevation from the DTM, which is what the geometry uses.
+    /// Elevation of the summit: the highest point of the full-resolution DTM
+    /// near the OSM node, as `dem-tool prominence` measured it, or else the
+    /// pyramid at the node.
     #[serde(serialize_with = "round::opt_d1")]
     pub ele: Option<f64>,
+    /// The summit elevation from the peaks file, where it has one.
+    #[serde(skip)]
+    pub summit_ele: Option<f64>,
+    /// The pyramid at the node on the level the render read there, which is
+    /// what places the peak on the drawn skyline. Lower than the summit: the
+    /// level averages it.
+    #[serde(skip)]
+    pub sampled: Option<f64>,
     #[serde(serialize_with = "round::d1")]
     pub distance: f64,
     #[serde(serialize_with = "round::d3")]
@@ -171,17 +181,16 @@ pub struct Peak {
     /// it.
     ///
     /// **`null` means the formula produced nothing usable for this peak** --
-    /// a null, a NaN or an infinity -- and it was sorted last. With
-    /// `peak_rank: ["get", "prominence"]` that is two thirds of them, since
-    /// most have no prominence. It is not "unranked": every returned peak was
-    /// ranked, and this one scored bottom.
+    /// a null, a NaN or an infinity -- and it was sorted last: with
+    /// `peak_rank: ["get", "prominence"]`, every peak without one. It is not
+    /// "unranked": every returned peak was ranked, and this one scored bottom.
     #[serde(serialize_with = "round::opt_sig")]
     pub rank: Option<f64>,
 
     /// True topographic prominence, metres, or `null` where none is known.
     ///
-    /// Precomputed from GEDTM30 over the whole continent and stored with the
-    /// peak, so unlike `dominance` it is the same from every viewpoint. That
+    /// Precomputed by `dem-tool prominence` and stored with the peak, so
+    /// unlike `dominance` it is the same from every viewpoint. That
     /// is the point of it: measured across two Slovak viewpoints, 20% of the
     /// summits visible from both flipped the sign of their dominance and 40%
     /// of those earning a label from one were dropped by the other. Prominence
@@ -193,16 +202,23 @@ pub struct Peak {
     /// own ridge really is unremarkable from there, and saying so is correct.
     #[serde(serialize_with = "round::opt_d1")]
     pub prominence: Option<f64>,
-    /// How far the DEM summit this came from sat from the OSM node, metres.
-    ///
-    /// Every match is a guess of some size, because 30 m data places a summit
-    /// up to ~75 m from where the LiDAR and OSM agree it is. 42% land within
-    /// 25 m and 74% within 50 m; treat anything past 100 m as suspect. Where
-    /// two real summits sit inside the radius only the nearest keeps a value
-    /// and the others come back `null`, so a missing prominence never means
-    /// "not a mountain" -- only that nothing could be matched to it.
+    /// Metres from the OSM node to the DTM summit the values were measured
+    /// at, or `null` where none was found near it -- which never means "not
+    /// a mountain": a nearer node may own the summit, or the node sits on a
+    /// slope.
     #[serde(serialize_with = "round::opt_d1")]
     pub prom_dist_m: Option<f64>,
+    /// Ground metres to the nearest ground higher than the summit.
+    #[serde(serialize_with = "round::opt_d1")]
+    pub isolation_m: Option<f64>,
+    /// Ground size of the cells the key col was found on: how far to trust a
+    /// large prominence, whose col is that level's averaged height.
+    #[serde(serialize_with = "round::opt_d1")]
+    pub prom_res_m: Option<f64>,
+    /// What the DTM shows at the node: `found`, `weak`, `edge`, `shared` or
+    /// `none`; see docs/API.md.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summit: Option<String>,
 
     /// Sub-column the peak's bearing falls in -- a ray index, not an output
     /// column. `None` when it is out of frame or has no elevation, which is
@@ -265,16 +281,69 @@ pub fn load(path: &Path, lon: f64, lat: f64, range: f64) -> Result<Vec<Peak>> {
             visible: false,
             revealed: false,
             dominance: 0.0,
-            // Absent rather than zero where the column does not exist: a
-            // peaks file without prominence has six fields, not eight, and
-            // "no prominence known" is not "prominence 0".
+            // Absent rather than zero where the column does not exist or
+            // is empty: "no prominence known" is not "prominence 0".
             prominence: f.get(6).and_then(|s| s.parse().ok()),
             prom_dist_m: f.get(7).and_then(|s| s.parse().ok()),
+            summit_ele: f.get(8).and_then(|s| s.parse().ok()),
+            isolation_m: f.get(9).and_then(|s| s.parse().ok()),
+            prom_res_m: f.get(10).and_then(|s| s.parse().ok()),
+            summit: f.get(11).filter(|s| !s.is_empty()).cloned(),
+            sampled: None,
             rank: None,
             column: None,
         });
     }
     Ok(out)
+}
+
+/// The peak with this OSM node id, as a GeoJSON feature with every column
+/// the peaks file has, and its route over the key col where it has one.
+pub fn by_osm_id(path: &Path, osm_id: i64) -> Result<Option<serde_json::Value>> {
+    use gdal::vector::{FieldValue, LayerAccess};
+    use serde_json::{Map, Value, json};
+
+    let ds = gdal::Dataset::open(path).with_context(|| format!("{}", path.display()))?;
+    let mut layer = ds.layer_by_name("peaks")?;
+    layer.set_attribute_filter(&format!("osm_id = {osm_id}"))?;
+    let Some(f) = layer.features().next() else {
+        return Ok(None);
+    };
+    let properties: Map<String, Value> = f
+        .fields()
+        .map(|(name, v)| {
+            let v = match v {
+                Some(FieldValue::IntegerValue(i)) => json!(i),
+                Some(FieldValue::Integer64Value(i)) => json!(i),
+                Some(FieldValue::RealValue(r)) => json!(r),
+                Some(FieldValue::StringValue(s)) => json!(s),
+                _ => Value::Null,
+            };
+            (name, v)
+        })
+        .collect();
+    let geometry = f.geometry().map_or(Value::Null, |g| {
+        let (lon, lat, _) = g.get_point(0);
+        json!({"type": "Point", "coordinates": [lon, lat]})
+    });
+    // Not every peaks file has routes.
+    let route = ds.layer_by_name("routes").ok().and_then(|mut routes| {
+        routes
+            .set_attribute_filter(&format!("osm_id = {osm_id}"))
+            .ok()?;
+        let f = routes.features().next()?;
+        let g = f.geometry()?;
+        let mut points = Vec::new();
+        g.get_points(&mut points);
+        let points: Vec<[f64; 2]> = points.into_iter().map(|(lon, lat, _)| [lon, lat]).collect();
+        Some(json!({"type": "LineString", "coordinates": points}))
+    });
+    Ok(Some(json!({
+        "type": "Feature",
+        "geometry": geometry,
+        "properties": properties,
+        "route": route,
+    })))
 }
 
 /// Minimal CSV split honouring double quotes, which peak names need -- plenty
@@ -386,6 +455,7 @@ fn vars(k: &Peak) -> crate::rank::Vars {
         revealed: k.revealed,
         prominence: k.prominence,
         prom_dist: k.prom_dist_m,
+        isolation: k.isolation_m,
     }
 }
 
@@ -457,6 +527,8 @@ mod tests {
             lon: 20.0,
             lat: 49.0,
             ele: Some(1000.0),
+            summit_ele: None,
+            sampled: Some(1000.0),
             distance: 10_000.0,
             azimuth: 0.0,
             altitude: 0.0,
@@ -467,6 +539,9 @@ mod tests {
             dominance,
             prominence: None,
             prom_dist_m: None,
+            isolation_m: None,
+            prom_res_m: None,
+            summit: None,
             rank: None,
             column,
         }

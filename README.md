@@ -30,7 +30,7 @@ On fm6:
   build/                this repo
   index/z{14..8}.gti.gpkg   one GTI per level: a row per dataset, its id and priority
   peaks.gpkg            the peaks `serve` labels
-  peaks-osm.gpkg        the OSM peaks `bin/peaks.sh` fetched, which nothing serves yet
+  peaks-osm.gpkg        the OSM peaks and saddles `bin/peaks.sh` fetched
   logs/ state/ tmp/      step logs, step exit codes and the deploy marker, scratch
 ```
 
@@ -72,6 +72,7 @@ when the index lags the source list.
 | find out whether anything is wrong | `./target/release/dem-tool check` |
 | index what the source list holds now | `bin/run.sh index bash bin/index.sh` |
 | fetch the current OSM peaks into `peaks-osm.gpkg` | `bin/run.sh peaks bash bin/peaks.sh` |
+| measure their prominence into `peaks.gpkg` | `./target/release/dem-tool prominence --input $DEM_ROOT/peaks-osm.gpkg --output $DEM_ROOT/peaks.gpkg` |
 
 `index.sh` takes levels to narrow it. Each level is written to a temporary file and moved into place,
 so killing it leaves the previous index; a full run takes minutes.

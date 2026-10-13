@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Fetch the OSM peaks from fm5's database into $DEM_ROOT/peaks-osm.gpkg.
+# Fetch the OSM peaks, and the saddles their key cols are named by, from fm5's
+# database into $DEM_ROOT/peaks-osm.gpkg.
 #
 # The key can run only freemap-osm-api's scripts/peaks-dump.sh as `osm` on
 # fm5, which writes the GeoPackage to stdout; see that repo's README, "Peaks
@@ -26,9 +27,9 @@ flock -n 9 || {
   exit 1
 }
 
-# Empty where the file has no readable `peaks` layer.
+# Empty where the file has no readable such layer, `peaks` by default.
 count() {
-  ogrinfo -q "$1" -sql "SELECT COUNT(*) AS n FROM peaks" |
+  ogrinfo -q "$1" -sql "SELECT COUNT(*) AS n FROM ${2:-peaks}" |
     sed -n 's/.*n (Integer[0-9]*) = //p' || true
 }
 
@@ -43,10 +44,18 @@ if [ -z "$n" ] || [ "$n" -eq 0 ]; then
   exit 1
 fi
 
-# `serve` reads the columns by position.
+# `prominence` carries these through to peaks.gpkg, which `serve` reads by
+# position.
 fields=$(ogrinfo -so "$tmp" peaks | sed -n 's/^\([a-z_]*\): .*/\1/p' | paste -sd,)
 if [ "$fields" != "osm_id,name,type,ele_osm" ]; then
   echo "peaks: the dump's columns are $fields, $OUT not replaced" >&2
+  exit 1
+fi
+
+# Without them every key col would quietly go unnamed.
+saddles=$(count "$tmp" saddles)
+if [ -z "$saddles" ] || [ "$saddles" -eq 0 ]; then
+  echo "peaks: the dump has no saddles, $OUT not replaced" >&2
   exit 1
 fi
 

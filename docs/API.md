@@ -627,19 +627,17 @@ At one 360° viewpoint that takes 3032 peaks to 210, and it keeps Gerlachovský
 štít — whose `dominance` of 148 m from 31 km would never have earned it.
 
 > **A filter that yields null drops the peak.** Null is not a yes — the same
-> rule `case` uses for its conditions — and `prominence` and `prom_dist_m` are
-> null for about two thirds of peaks. So a filter that touches either one
+> rule `case` uses for its conditions — and `prominence`, `prom_dist_m` and
+> `isolation_m` are null for some peaks. So a filter that touches one
 > silently removes all of them unless you say what an absence should count as.
 >
-> Measured on one 90° view of 542 visible peaks:
->
-> | filter | peaks |
+> | filter | a peak without prominence |
 > |---|---|
-> | `["<", ["get","prominence"], 100]` | **138** |
-> | `["<", ["coalesce", ["get","prominence"], 0], 100]` | **475** |
+> | `["<", ["get","prominence"], 100]` | dropped |
+> | `["<", ["coalesce", ["get","prominence"], 0], 100]` | kept |
 >
-> Same intent, 337 peaks apart. The first asks "is its prominence under 100?"
-> and gets *no answer* for every unmatched peak, so they all go; the second
+> Same intent, different peaks. The first asks "is its prominence under 100?"
+> and gets *no answer* for every peak without one, so they all go; the second
 > says "treat an absence as 0", and they all stay.
 >
 > Note that `coalesce` is not a formality that always changes something —
@@ -714,11 +712,15 @@ reaches is a `400` now rather than a surprise at whichever viewpoint first
 takes that path.
 
 **Properties.** `dominance` `distance` `altitude` `ele` `x` `y` `revealed`
-`prominence` `prom_dist_m`. Spelled exactly as the payload spells them.
+`prominence` `prom_dist_m` `isolation_m`. Spelled exactly as the payload spells
+them.
 `revealed` is 0 or 1, so weight it arithmetically.
 
-**Nulls are real.** `prominence` and `prom_dist_m` are null for two thirds of
-peaks, and null propagates through every operator — `["*", 0, ["get",
+**Nulls are real.** `prominence`, `prom_dist_m` and `isolation_m` are null
+wherever no summit was found near the peak's node (see `summit`), and
+`prominence` and `isolation_m` also where the measurement could not finish
+(see [Prominence](#prominence)); null
+propagates through every operator — `["*", 0, ["get",
 "prominence"]]` is null, not 0. Only `coalesce` stops it. A formula that
 forgets ranks those peaks **last**, which is loud; treating a missing
 prominence as 0 would rank real mountains as flat, which is not.
@@ -777,15 +779,18 @@ and with `max_peaks: 0` it decides nothing at all.
 |---|---|
 | `osm_id` | OSM node id — resolve names, `name:*`, wikidata etc. from OSM |
 | `name`, `ele_osm` | as imported; `ele_osm` is the raw tag, unparsed |
-| `ele` | elevation from the DTM — **prefer this**, OSM's `ele` is unreliable |
+| `ele` | elevation of the summit: the highest point of the full-resolution DTM near the OSM node — **prefer this**, OSM's `ele` is unreliable. Where the peaks file has none, the pyramid at the node, which reads lower: the level averages the summit |
+| `isolation_m` | ground metres to the nearest ground higher than the summit |
+| `prom_res_m` | ground size of the cells the key col was found on: a few metres where national data reaches it, tens where only GEDTM30 does; see [Prominence](#prominence) |
+| `summit` | what the DTM shows at the OSM node: `found` (a summit near it — `lon`/`lat` are the summit's where national data found it, the node's where only GEDTM30 did), `weak` (a top rising under 5 m — the node's position, values kept), `edge` (the highest ground near it is on a slope, rising past the search — the node's position, no values), `shared` (a nearer node owns the same summit — no values), `none` (no data) |
 | `distance` | metres, great-circle |
 | `azimuth` | degrees clockwise from north |
 | `altitude` | degrees above horizontal from the eye, including curvature and refraction — the true angle, unaffected by `depth_lift` |
 | `x`, `y` | position in the image, **output pixels**, origin top-left — `y` *does* follow `depth_lift`, so place labels by this, not by `altitude` |
 | `revealed` | `true` where `depth_lift` is what brought the summit into view: it is drawn and labelled, but the eye could not see it from here. Always `false` without a lift |
 | `dominance` | **metres** the summit stands above the terrain around it, **signed**, measured from this viewpoint |
-| `prominence` | **metres** of true topographic prominence, precomputed and viewpoint-independent, or **`null` where no DEM summit could be matched** — which means "unknown", never "prominence 0". Null for about two thirds of peaks; see [Prominence](#prominence) |
-| `prom_dist_m` | **metres** between the OSM node and the DEM summit the prominence came from, or `null` alongside it. The match's own error bar — see the table under [Prominence](#prominence) for what each distance is worth |
+| `prominence` | **metres** of topographic prominence, precomputed and viewpoint-independent, or **`null`** where it is unknown — never "prominence 0"; see [Prominence](#prominence) |
+| `prom_dist_m` | **metres** between the OSM node and the DTM summit the values were measured at, or `null` where no summit was found near the node |
 | `rank` | the value this peak was ordered by — whatever `peak_rank` computed, or the built-in criterion where none was given. Returned so an ordering can be **inspected rather than inferred**: send a formula and read back what it produced for each peak. A client that re-ranks can reuse it instead of recomputing. Peaks are sorted by it, descending |
 
 This is what makes a summit worth a label: one standing clear of its
@@ -919,92 +924,76 @@ Prominence does not move, which is why it can name Gerlachovský štít from
 100 km away when dominance — measured within 3 km — can only report that it
 does not stand out from its neighbours at that range.
 
-It is precomputed: a continental divide-tree run over GEDTM30 at 1 arc-second,
-25°W–45°E and 34–72°N, matched onto the OSM nodes once and stored. Nothing is
-computed per request.
+It is precomputed by `dem-tool prominence`, from the same pyramid the
+panoramas are rendered from; nothing is computed per request.
 
-#### How far to trust a value
+#### How it is measured
 
-Every value is attached to its peak by a spatial match, and **`prom_dist_m` is
-that match's error bar**. A 30 m DEM places a summit up to ~75 m from where
-LiDAR and OSM agree it is, so the radius has to be generous or it misses
-exactly the sharp summits that matter. Measured over 153 274 matched peaks
-carrying an `ele` tag, comparing the matched DEM summit's elevation against
-OSM's:
+Each OSM peak is moved to the highest ground within 100 m of its node on the
+national DTM, or within 250 m where only GEDTM30 covers it — or where the
+national data ends within 100 m of it, at a border or a coast. From there a flood
+spreads, always into the highest cell beside it, until it first reaches ground
+higher than the summit; the lowest height it passed on the way is the **key
+col**, and prominence is the summit's full-resolution elevation less the col.
+That is the definition, not an approximation of it: by the time a flood
+reaches higher ground it has seen every cell above the col, so no other route
+can have a higher one. An island's col is the sea.
 
-| `prom_dist_m` | peaks | mean elevation disagreement | share off by >50 m |
+A flood starts on the finest level and moves to coarser ones as it grows: a
+major summit's col may be hundreds of kilometres away, past what a flood on
+6 m cells can cover. A col found on coarse cells is then looked for again on
+the finer levels the floods use — about 100 m, 25 m and 6 m cells — in turn, flooding only along the route the coarser flood
+took and a couple of its cells either side — averaging blurs a narrow pass,
+and on 400 m cells the lowest point of a route can lie tens of kilometres from
+the real one. The search stops refining where that corridor runs out of data
+on a level. **`prom_res_m` is the size of the cells the col was last found
+on**: a few metres on national data, tens on GEDTM30.
+
+Cut terrain counts: the DTMs are bare earth, so a railway or motorway cutting
+through a pass lowers it. Gerlachovský štít's col, in the Moravian Gate north
+of Bělotín, comes out at 295.7 m where maps give about 300 m.
+
+`isolation_m` is found much the same way: rings outwards from the summit to
+the nearest ground higher than it, in ground metres, each level carrying on
+from where the finer one stopped.
+
+#### Which data a value comes from
+
+Each peak names the datasets its values were computed from, as
+[`meta.sources`](#meta) names them:
+
+- `ele_source` — the dataset the summit's elevation was read from
+- `prominence_sources` — the summit's dataset, and the datasets under every
+  cell the floods looked at: a different height anywhere among them could have
+  moved the col. For a major summit that is half a continent
+- `isolation_sources` — the datasets within `isolation_m` of the summit
+
+They are told apart on the same ~1 km coverage cells crediting uses, so a
+dataset just across a border from the ground read can be named too.
+
+#### When a value is missing
+
+`summit` says what the DTM shows at the node, and with it why a value may be
+absent:
+
+| `summit` | meaning | `lon`/`lat` | values |
 |---|---|---|---|
-| 0–25 | 66 068 | 8.9 m | **0.9%** |
-| 25–50 | 49 035 | 9.9 m | 1.7% |
-| 50–75 | 19 679 | 11.2 m | 3.5% |
-| 75–100 | 9 454 | 12.2 m | 4.6% |
-| 100–150 | 9 034 | 12.8 m | **5.4%** |
+| `found` | a summit near the node | the summit's, where national data found it | all |
+| `weak` | a top rising less than 5 m from its surroundings | the node's | kept |
+| `edge` | the highest ground near the node lies on the edge of the search: the node is on a slope or a shoulder, not a summit | the node's | none |
+| `shared` | a nearer node owns the same summit — of several nodes named on one top, one carries it | the node's | none |
+| `none` | no data around the node | the node's | none |
 
-**A cutoff at 50 m is the sensible default** — it keeps 75% of matches with
-1.7% badly wrong. Past 100 m the bad-match rate triples.
+A `found` summit can still lack a prominence: when its flood reaches the edge
+of the data before finding higher ground, the col lies outside what this
+service knows, and **no value is better than a guess**. The same holds where
+a flood would outgrow the largest one allowed: 50 million cells of about
+300–600 m.
 
-Two caveats that no cutoff removes. Even in the closest band **0.9% are off by
-more than 50 m**, and the worst case in *every* band exceeds 1600 m — those are
-matches onto an entirely different summit. And a close match is not a correct
-one: Lomnický štít comes back at 46 m of prominence from a summit 94 m away,
-which is wrong, while Gerlach at 2304 m from 20 m away is very nearly right.
-
-#### How accurate the values are
-
-Against published figures:
-
-| peak | ours | published | error |
-|---|---|---|---|
-| Mulhacén | 3279 | 3285 | −6 |
-| Aneto | 2777 | 2812 | −35 |
-| Gerlachovský štít | 2304 | 2355 | −51 |
-| Rysy | 269 | 331 | −62 |
-| Mont Blanc | 4779 | 4696 | +83 |
-| Chopok | 255 | 155 | +100 |
-| Ďumbier | 1170 | 1050 | +120 |
-| Kráľova hoľa | 755 | 486 | +269 |
-
-**Reliable for ranking above ~300 m, noise below ~150 m.** The errors are not
-summit smoothing but the col: a 30 m grid can miss a narrow ridge crest and
-route the divide through a lower saddle, which inflates the difference. That is
-worst exactly where terrain is sharpest. **Do not threshold on it** — a
-"prominence ≥ 100 m" cut would be arbitrary at this accuracy. Weigh it.
-
-Peaks whose prominence equals their elevation are **lower bounds**, not values:
-that is the convention for a landmass high point, and it is correct for an
-island (Etna really does have 3357 m) but merely means "the col is outside the
-window" for Elbrus, whose chain runs into Asia.
-
-#### Coverage, and why it is what it is
-
-**180 271 of 488 232 peaks carry a prominence** — nearer half at a mountainous
-viewpoint, since the unmatched skew to minor tops.
-
-Matches are made two ways. Within **150 m**, position alone is enough. Between
-150 m and **400 m**, a summit is accepted only if its elevation also agrees
-with the OSM tag within 50 m — position *and* height agreeing at 400 m is a
-stronger claim than position alone at half that. The second rule accounts for
-13 218 of the total, and they are disproportionately peaks that had nothing:
-Κέρκης on Samos, Mali i Dejës, Ameringkogel.
-
-Of the peaks still without one:
-
-| | count | share |
-|---|---|---|
-| no DEM summit within 400 m at all | 281 252 | 88% |
-| nearest summit 150–400 m away | 36 848 | 11% |
-| a closer peak claimed the same summit | 3 079 | 1% |
-
-So neither the 150 m radius nor the one-summit-one-peak rule is the constraint.
-**The constraint is the 30 m prominence floor the run used**: summits below it
-do not exist in the output at all. Lowering it to 5 m yields ten times as many
-summits — 5 832 against 59 057 in a 2°×2° test box.
-
-`null` therefore means "no match", which is not the same as "not a mountain"
-and definitely not "prominence 0". Where two real summits sit inside the match
-radius only the nearest keeps a value: Rysy has three named tops within 130 m,
-all called "Rysy", and GEDTM30 resolves one of them, so two of the three come
-back `null` rather than all three sharing one answer.
+`isolation_m` is missing likewise where unknown ground lies nearer than any
+higher ground found, and where no higher ground lies within several hundred
+kilometres — about 900 km at 45°N, 570 km in southern Norway: the search goes
+no farther.
 
 ## Depth
 
@@ -1228,6 +1217,54 @@ can see more than you can, sometimes much more.
 **It is only as good as the DEM** — 1 m LiDAR in the surveyed countries, 30 m
 GEDTM30 elsewhere. The [coverage](#where-it-runs) applies here as it does to
 panoramas.
+
+## `GET /peak/{osm_id}`
+
+One peak from the peaks file by its OSM node id, as a GeoJSON feature with
+every value measured for it — the panorama's peaks carry only those a label
+needs — and its route.
+
+```json
+{
+  "type": "Feature",
+  "geometry": { "type": "Point", "coordinates": [20.134026, 49.164029] },
+  "properties": {
+    "osm_id": 26862937, "name": "Gerlachovský štít", "type": "peak",
+    "ele_osm": "2655", "ele": 2654.7, "summit": "found",
+    "prominence": 2359.0, "prom_dist_m": 2.4, "prom_res_m": 6.0,
+    "isolation_m": 515591.0,
+    "osm_lon": 20.1340595, "osm_lat": 49.1640319,
+    "col_ele": 295.7, "col_lon": 17.765021, "col_lat": 49.584869,
+    "ele_source": "sk",
+    "prominence_sources": "sk,pl,ch,at,de_bw,de_by,de_sn,de_th,cz,gedtm30",
+    "isolation_sources": "sk,pl,hr,si,at,it,de_bb,de_by,de_sn,cz,gedtm30",
+    "col_osm_id": null, "col_name": null
+  },
+  "route": { "type": "LineString", "coordinates": [[20.134026, 49.164029], "…"] }
+}
+```
+
+The point is where `lon`/`lat` put the peak in a panorama: the summit found on
+national data, else the OSM node. Fields as for a panorama's
+[peaks](#peaks), and:
+
+| field | meaning |
+|---|---|
+| `type` | the OSM `natural` tag: `peak` or `volcano` |
+| `osm_lon`, `osm_lat` | the OSM node's position |
+| `col_ele`, `col_lon`, `col_lat` | the key col: its height and the centre of the cell it was found on, `prom_res_m` across. Null without a prominence, and for an island, whose col is the sea |
+| `ele_source`, `prominence_sources`, `isolation_sources` | the datasets each value was computed from, comma-separated; see [Prominence](#prominence) |
+| `col_osm_id`, `col_name` | the OSM `natural=saddle` or `mountain_pass=yes` node nearest the key col, within 200 m or twice `prom_res_m`, whichever is more. Null where none is |
+
+`route` — beside the feature's properties, `null` where there is no
+prominence — is the way from the summit over the key col to the first ground
+higher than the summit: the line the flood took, which keeps to the highest
+ground it can, so mostly to ridges. It is simplified to within a cell of
+`prom_res_m`. A major summit's runs to another range: Gerlachovský štít's
+crosses the Moravian Gate to the Alps.
+
+`404` for an id the peaks file does not hold, or when the service runs without
+one; `400` for an id that is not a number.
 
 ## `GET /progress/{token}` — live progress
 

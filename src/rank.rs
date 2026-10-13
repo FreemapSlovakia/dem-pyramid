@@ -50,6 +50,7 @@ pub enum Var {
     Revealed,
     Prominence,
     PromDist,
+    Isolation,
 }
 
 impl Var {
@@ -67,6 +68,7 @@ impl Var {
             // field is how a client ends up learning the schema by dumping
             // keys from a response.
             "prom_dist_m" => Var::PromDist,
+            "isolation_m" => Var::Isolation,
             _ => return None,
         })
     }
@@ -74,15 +76,16 @@ impl Var {
     /// For the error message, so a typo is answered with the alternatives
     /// rather than with a shrug.
     pub const NAMES: &'static str = "dominance, distance, altitude, ele, x, y, \
-                                     revealed, prominence, prom_dist_m";
+                                     revealed, prominence, prom_dist_m, isolation_m";
 }
 
 /// What one peak looks like to a formula.
 ///
-/// `prominence` and `prom_dist` are the only fields that can be absent, and
-/// they are absent together: 321 179 of 488 232 peaks have no match. Absence
-/// is null rather than zero because the two rank very differently -- zero says
-/// "flat", and a mountain nobody could match to a DEM summit is not flat.
+/// `prominence`, `prom_dist` and `isolation` can be absent wherever the peaks
+/// file has no value: no summit at the node, or a measurement that reached
+/// the edge of the data. Absence is null rather than zero because the two
+/// rank very differently -- zero says "flat", and an unmeasured mountain is
+/// not flat.
 pub struct Vars {
     pub dominance: f64,
     pub distance: f64,
@@ -96,6 +99,7 @@ pub struct Vars {
     pub revealed: bool,
     pub prominence: Option<f64>,
     pub prom_dist: Option<f64>,
+    pub isolation: Option<f64>,
 }
 
 impl Vars {
@@ -110,6 +114,7 @@ impl Vars {
             Var::Revealed => Some(f64::from(u8::from(self.revealed))),
             Var::Prominence => self.prominence,
             Var::PromDist => self.prom_dist,
+            Var::Isolation => self.isolation,
         }
     }
 }
@@ -332,9 +337,8 @@ impl Program {
     ///
     /// Null is not a yes, the same rule `case` uses for its conditions. So
     /// `[">", ["get","prominence"], 100]` drops every peak with no prominence
-    /// -- two thirds of them -- rather than keeping them on the grounds that
-    /// nothing disproved the test. `coalesce` is how a caller says what an
-    /// absence should count as.
+    /// rather than keeping them on the grounds that nothing disproved the
+    /// test. `coalesce` is how a caller says what an absence should count as.
     pub fn keeps(&self, v: &Vars) -> bool {
         truthy(self.eval(v))
     }
@@ -612,6 +616,7 @@ mod tests {
             revealed: false,
             prominence: None,
             prom_dist: None,
+            isolation: None,
         }
     }
 
