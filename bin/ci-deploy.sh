@@ -166,9 +166,10 @@ install_unit() {
 # The restart drains the render in flight, so it can sit for minutes; by the
 # time it returns the new process is up or systemd has given up on it. Asking
 # anyway, because a binary that starts and immediately fails leaves
-# `Restart=on-failure` looping and the unit briefly looking fine.
+# `Restart=on-failure` looping and the unit briefly looking fine. Startup reads
+# every dataset's coverage, 30-40 s while fm6's disks are busy.
 healthy() {
-	for _ in $(seq 30); do
+	for _ in $(seq 120); do
 		if curl --silent --fail --max-time 2 "$HEALTH" >/dev/null; then
 			return 0
 		fi
