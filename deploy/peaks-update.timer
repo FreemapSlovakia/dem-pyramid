@@ -1,0 +1,11 @@
+# Weekly, at night: OSM peaks change slowly, and a Europe run takes hours.
+[Unit]
+Description=Weekly refresh of peaks.gpkg
+
+[Timer]
+OnCalendar=Sun *-*-* 02:00:00
+# A run missed while fm6 was down is made up at the next boot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

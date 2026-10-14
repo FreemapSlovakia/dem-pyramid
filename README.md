@@ -72,7 +72,15 @@ when the index lags the source list.
 | find out whether anything is wrong | `./target/release/dem-tool check` |
 | index what the source list holds now | `bin/run.sh index bash bin/index.sh` |
 | fetch the current OSM peaks into `peaks-osm.gpkg` | `bin/run.sh peaks bash bin/peaks.sh` |
-| measure their prominence, and the saddles, into `peaks.gpkg` | `./target/release/dem-tool prominence --input $DEM_ROOT/peaks-osm.gpkg --output $DEM_ROOT/peaks.gpkg` |
+| measure their prominence, and the saddles, into `peaks.gpkg` | `bin/run.sh prominence bash bin/prominence.sh` |
+
+`peaks-update.timer` runs both every Sunday at 02:00 (`deploy/peaks-update*`,
+installed by hand as their header says) and mails the outcome through Mailgun
+to `PEAKS_UPDATE_NOTIFY_EMAIL` in `/etc/freemap.conf`, or to the Wikimedia
+import's recipient. `prominence.sh` fills what a run
+cannot measure from `data/peak-overrides.csv` — published values, each with
+its source — only where the run left a value null, and replaces `peaks.gpkg`
+by a rename, which `serve` picks up without a restart.
 
 `index.sh` takes levels to narrow it. Each level is written to a temporary file and moved into place,
 so killing it leaves the previous index; a full run takes minutes.

@@ -1,0 +1,11 @@
+# Mails how peaks-update.service went; %i is "succeeded" or "failed". The only
+# unit that reads /etc/freemap.conf, for Mailgun.
+[Unit]
+Description=Mail the peaks update's outcome (%i)
+
+[Service]
+Type=oneshot
+User=martin
+WorkingDirectory=/fm/storage2/dem/build
+EnvironmentFile=/etc/freemap.conf
+ExecStart=/fm/storage2/dem/build/bin/notify.sh %i

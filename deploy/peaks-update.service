@@ -1,0 +1,28 @@
+# Refresh the OSM peaks and saddles from fm5, then measure them into
+# peaks.gpkg, which serve reads per request: no restart follows. Started by
+# peaks-update.timer.
+#
+# Installed by hand, with the timer and the mail:
+#   sudo cp deploy/peaks-update.{service,timer} deploy/peaks-update-notify@.service \
+#     /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now peaks-update.timer
+[Unit]
+Description=Refresh the OSM peaks and saddles and measure their prominence
+After=network-online.target
+Wants=network-online.target
+OnSuccess=peaks-update-notify@succeeded.service
+OnFailure=peaks-update-notify@failed.service
+
+[Service]
+Type=oneshot
+User=martin
+WorkingDirectory=/fm/storage2/dem/build
+# Run in turn; a failed fetch leaves the last peaks.gpkg in place.
+ExecStart=/fm/storage2/dem/build/bin/run.sh peaks bash bin/peaks.sh
+ExecStart=/fm/storage2/dem/build/bin/run.sh prominence bash bin/prominence.sh
+Environment=GDAL_CACHEMAX=1024
+# Fewer malloc arenas: a Europe run's threads otherwise grow memory they free.
+Environment=MALLOC_ARENA_MAX=4
+# A Europe run peaks near 13 GB, beside a terrain service allowed 14 GB.
+MemoryHigh=18G
+MemoryMax=24G

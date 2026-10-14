@@ -1,0 +1,17 @@
+osm_id,field,value,source,name
+8870212,isolation_m,738620,https://www.wikidata.org/wiki/Q104674#P2659,Ben Nevis
+26862903,isolation_m,1568300,https://www.wikidata.org/wiki/Q203942#P2659,Galdhøpiggen
+26863232,isolation_m,439940,https://www.wikidata.org/wiki/Q83659#P2659,Mount Ida
+26864261,isolation_m,527900,https://www.wikidata.org/wiki/Q209528#P2659,Mulhacén
+130065410,isolation_m,379290,https://www.wikidata.org/wiki/Q72303#P2659,Mount Ararat
+274078063,isolation_m,42300,https://www.wikidata.org/wiki/Q1140684#P2659,Vihren
+274078231,isolation_m,810800,https://www.wikidata.org/wiki/Q209341#P2659,Musala
+281399025,isolation_m,2812000,https://www.wikidata.org/wiki/Q583#P2659,Mont Blanc
+281936304,isolation_m,2473000,https://www.wikidata.org/wiki/Q43105#P2659,Mount Elbrus
+427975406,isolation_m,113600,https://www.wikidata.org/wiki/Q207680#P2659,Mount Kazbek
+497547264,isolation_m,245760,https://www.wikidata.org/wiki/Q1434038#P2659,Uludoruk
+510337358,isolation_m,757000,https://www.wikidata.org/wiki/Q214011#P2659,Kebnekaise
+1110343685,isolation_m,596440,https://www.wikidata.org/wiki/Q814113#P2659,Beerenberg
+2143279229,isolation_m,62000,https://www.wikidata.org/wiki/Q596485#P2659,Sarektjåkkå
+281399025,prominence,4696,https://en.wikipedia.org/wiki/Mont_Blanc,Mont Blanc
+281936304,prominence,4741,https://en.wikipedia.org/wiki/Mount_Elbrus,Elbrus
