@@ -1222,7 +1222,7 @@ panoramas.
 
 One peak from the peaks file by its OSM node id, as a GeoJSON feature with
 every value measured for it — the panorama's peaks carry only those a label
-needs — and its route.
+needs. Its route is [asked for apart](#get-peakosm_idroute).
 
 ```json
 {
@@ -1239,8 +1239,7 @@ needs — and its route.
     "prominence_sources": "sk,pl,ch,at,de_bw,de_by,de_sn,de_th,cz,gedtm30",
     "isolation_sources": "sk,pl,hr,si,at,it,de_bb,de_by,de_sn,cz,gedtm30",
     "col_osm_id": null, "col_name": null
-  },
-  "route": { "type": "LineString", "coordinates": [[20.134026, 49.164029], "…"] }
+  }
 }
 ```
 
@@ -1256,15 +1255,40 @@ national data, else the OSM node. Fields as for a panorama's
 | `ele_source`, `prominence_sources`, `isolation_sources` | the datasets each value was computed from, comma-separated; see [Prominence](#prominence) |
 | `col_osm_id`, `col_name` | the OSM `natural=saddle` or `mountain_pass=yes` node nearest the key col, within 200 m or twice `prom_res_m`, whichever is more — by where the DTM puts the saddle (see [`GET /saddle`](#get-saddleosm_id)). Null where none is |
 
-`route` — beside the feature's properties, `null` where there is no
-prominence — is the way from the summit over the key col to the first ground
-higher than the summit: the line the flood took, which keeps to the highest
-ground it can, so mostly to ridges. It is simplified to within a cell of
-`prom_res_m`. A major summit's runs to another range: Gerlachovský štít's
-crosses the Moravian Gate to the Alps.
-
 `404` for an id the peaks file does not hold, or when the service runs without
 one; `400` for an id that is not a number.
+
+## `GET /peak/{osm_id}/route`
+
+The peak's route: the way from the summit over the key col to the first
+ground higher than the summit, as a GeoJSON LineString feature. It is the line
+the flood took, which keeps to the highest ground it can, so mostly to
+ridges, and is stored to within a cell of `prom_res_m`.
+
+```json
+{
+  "type": "Feature",
+  "geometry": { "type": "LineString", "coordinates": [[20.134034, 49.163999], "…"] },
+  "properties": { "osm_id": 26862937 }
+}
+```
+
+A major summit's runs to another range, so it is asked for apart from the
+peak, and only when it is drawn: Gerlachovský štít's crosses the Moravian Gate
+to the Alps, 61,090 points. `?simplify=<metres>` returns it within that many
+ground metres instead:
+
+| `simplify` | points | bytes | gzipped |
+|---|---|---|---|
+| — | 61,090 | 1.3 MB | 366 KB |
+| `10` | 37,057 | 798 KB | 238 KB |
+| `50` | 7,722 | 166 KB | 58 KB |
+| `200` | 2,306 | 50 KB | 19 KB |
+| `1000` | 475 | 10 KB | 4 KB |
+
+A minor top's is a few hundred bytes whatever is asked. `404` where the peak
+has no route — no prominence, or an island's, whose col is the sea; `400` for
+an id that is not a number or a `simplify` outside 0–100000.
 
 ## `GET /saddle/{osm_id}`
 

@@ -994,7 +994,7 @@ fn between(a: (i64, i64), b: (i64, i64)) -> impl Iterator<Item = (i64, i64)> {
 
 /// Douglas-Peucker: the points of `line` it cannot do without to stay within
 /// `tolerance` of it.
-fn simplify(line: &[(f64, f64)], tolerance: f64) -> Vec<(f64, f64)> {
+pub(crate) fn simplify(line: &[(f64, f64)], tolerance: f64) -> Vec<(f64, f64)> {
     if line.len() < 3 {
         return line.to_vec();
     }

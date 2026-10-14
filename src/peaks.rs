@@ -298,7 +298,7 @@ pub fn load(path: &Path, lon: f64, lat: f64, range: f64) -> Result<Vec<Peak>> {
 }
 
 /// The peak with this OSM node id, as a GeoJSON feature with every column
-/// the peaks file has, and its route over the key col where it has one.
+/// the peaks file has.
 pub fn by_osm_id(path: &Path, osm_id: i64) -> Result<Option<serde_json::Value>> {
     feature(path, "peaks", osm_id)
 }
@@ -337,34 +337,70 @@ fn feature(path: &Path, layer_name: &str, osm_id: i64) -> Result<Option<serde_js
         .collect();
     let geometry = f.geometry().map_or(Value::Null, |g| {
         let (lon, lat, _) = g.get_point(0);
-        json!({"type": "Point", "coordinates": [lon, lat]})
-    });
-    // Routes are a peak's; a node can be a peak and a saddle both.
-    if layer_name != "peaks" {
-        return Ok(Some(json!({
-            "type": "Feature",
-            "geometry": geometry,
-            "properties": properties,
-        })));
-    }
-    // Not every peaks file has routes.
-    let route = ds.layer_by_name("routes").ok().and_then(|mut routes| {
-        routes
-            .set_attribute_filter(&format!("osm_id = {osm_id}"))
-            .ok()?;
-        let f = routes.features().next()?;
-        let g = f.geometry()?;
-        let mut points = Vec::new();
-        g.get_points(&mut points);
-        let points: Vec<[f64; 2]> = points.into_iter().map(|(lon, lat, _)| [lon, lat]).collect();
-        Some(json!({"type": "LineString", "coordinates": points}))
+        json!({"type": "Point", "coordinates": [deg(lon), deg(lat)]})
     });
     Ok(Some(json!({
         "type": "Feature",
         "geometry": geometry,
         "properties": properties,
-        "route": route,
     })))
+}
+
+/// The route of the peak with this OSM node id, from its summit over the key
+/// col to higher ground, as a GeoJSON feature: a major summit's runs to
+/// another range, hundreds of kilobytes, so it is asked for on its own.
+/// Simplified to within `simplify` ground metres, where that is positive.
+pub fn route_by_osm_id(
+    path: &Path,
+    osm_id: i64,
+    simplify: f64,
+) -> Result<Option<serde_json::Value>> {
+    use gdal::vector::LayerAccess;
+    use serde_json::json;
+
+    let ds = gdal::Dataset::open(path).with_context(|| format!("{}", path.display()))?;
+    // Not every peaks file has routes.
+    let Ok(mut routes) = ds.layer_by_name("routes") else {
+        return Ok(None);
+    };
+    routes.set_attribute_filter(&format!("osm_id = {osm_id}"))?;
+    let Some(f) = routes.features().next() else {
+        return Ok(None);
+    };
+    let Some(g) = f.geometry() else {
+        return Ok(None);
+    };
+    let mut points = Vec::new();
+    g.get_points(&mut points);
+    let mut line: Vec<(f64, f64)> = points.into_iter().map(|(lon, lat, _)| (lon, lat)).collect();
+    if simplify > 0.0 && line.len() > 2 {
+        let merc: Vec<(f64, f64)> = line
+            .iter()
+            .map(|&(lon, lat)| crate::grid::lonlat_to_merc(lon, lat))
+            .collect();
+        // Web Mercator stretches ground by 1/cos(lat): the poleward end's,
+        // so nowhere strays further than asked.
+        let lat = line.iter().map(|p| p.1.abs()).fold(0.0, f64::max).min(85.0);
+        line = crate::prominence::simplify(&merc, simplify / lat.to_radians().cos())
+            .into_iter()
+            .map(|(x, y)| crate::grid::merc_to_lonlat(x, y))
+            .collect();
+    }
+    let coordinates: Vec<[f64; 2]> = line
+        .into_iter()
+        .map(|(lon, lat)| [deg(lon), deg(lat)])
+        .collect();
+    Ok(Some(json!({
+        "type": "Feature",
+        "geometry": {"type": "LineString", "coordinates": coordinates},
+        "properties": {"osm_id": osm_id},
+    })))
+}
+
+/// Six decimals, 11 cm: every digit past them is noise, and a route has
+/// tens of thousands of points.
+fn deg(v: f64) -> f64 {
+    (v * 1e6).round() / 1e6
 }
 
 /// Minimal CSV split honouring double quotes, which peak names need -- plenty
