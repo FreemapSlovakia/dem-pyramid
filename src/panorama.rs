@@ -706,8 +706,8 @@ fn bracketing(sub_pos: f64, sub_cols: usize, wraps: bool) -> ([Option<usize>; 2]
 /// March one ray and fill its column.
 ///
 /// `probe_d` holds distances, ascending, at which the caller wants the horizon
-/// -- the highest elevation angle reached by terrain strictly nearer than
-/// that. `probe_h` receives one angle per probe. This is how peaks are
+/// -- the highest elevation angle reached by terrain more than two cells
+/// nearer than that. `probe_h` receives one angle per probe. This is how peaks are
 /// answered: the marcher is already computing the running maximum that decides
 /// what the image shows, so asking it directly is both cheaper and impossible
 /// to disagree with. Reading it back out of the finished column instead made
@@ -768,12 +768,12 @@ fn march_ray(
         let z = level_for(d, p.lat, coarsest, finest);
         let step = ground_res(z, p.lat);
 
-        // Answer probes before sampling, and one step early: the interval that
-        // brackets a summit contains the summit's own ground, and a broad top
-        // read at its near lip would occlude itself. Skipping that interval is
-        // a geometric statement, where the old distance comparison needed a
-        // fudge factor -- which was wrong three times over.
-        while probe_i < probe_d.len() && probe_d[probe_i] <= d + step {
+        // Answer probes before sampling, and two steps early: a bilinear
+        // sample within two cells of the summit reads some of the summit's
+        // own cells, so it is the summit's ground, not something in front of
+        // it. Seen from steeply below, a top read at its near lip would
+        // occlude itself.
+        while probe_i < probe_d.len() && probe_d[probe_i] <= d + 2.0 * step {
             probe_h[probe_i] = Horizon {
                 drawn: max_alpha,
                 real: max_real,
